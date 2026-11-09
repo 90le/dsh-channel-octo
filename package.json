@@ -1,0 +1,21 @@
+{
+  "name": "dsh-channel-octo",
+  "version": "0.1.0",
+  "description": "Octo direct messages as a native DeepSeek Harness Web channel",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": "^24.0.0 || ^26.0.0",
+    "dsh": "0.2.1-rc.5"
+  },
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["src", "cordis.patch.yml", "README.md", "PLAN.md"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": { "test": "node --test", "smoke:web": "node scripts/smoke-web.mjs" }
+}

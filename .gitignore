@@ -1,0 +1,10 @@
+node_modules/
+*.tgz
+.env
+.env.*
+!.env.example
+.dsh/
+state/
+*.sqlite*
+*.log
+coverage/

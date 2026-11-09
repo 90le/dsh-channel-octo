@@ -1,0 +1,10 @@
+- insert:
+    - id: dsh-channel-octo-text
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: octo-text
+        plugins: []
+    - id: dsh-channel-octo
+      name: dsh-channel-octo
+      config:
+        enabled: false
