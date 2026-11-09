@@ -92,7 +92,7 @@ test('cross-route boundaries reject before writes', async t => {
     ['no confirmation', () => {}, { ...args, confirm_send: false }, dm, 'human', 'explicit_confirmation_required'],
     ['blank', () => {}, { ...args, text: '  ' }, dm, 'human', 'invalid_arguments'],
     ['identity override', () => {}, { ...args, on_behalf_of: 'owner' }, dm, 'human', 'invalid_arguments'],
-    ['DM target', () => {}, { ...args, target: { channel_id: 'someone', channel_type: 1 } }, dm, 'human', 'invalid_arguments'],
+    ['unsupported channel type', () => {}, { ...args, target: { channel_id: 'someone', channel_type: 3 } }, dm, 'human', 'invalid_arguments'],
     ['other space', f => { f.state.groups[0].space_id = 'elsewhere' }, args, dm, 'human', 'group_access_denied'],
     ['duplicate group metadata', f => { f.state.groups.push({ ...f.state.groups[0] }) }, args, dm, 'human', 'group_access_denied'],
     ['human left', f => { f.state.members = f.state.members.slice(1) }, args, dm, 'human', 'requester_not_member'],

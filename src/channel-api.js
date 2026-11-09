@@ -19,6 +19,8 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const shortID = { type: 'string', pattern: '^[0-9]{15,20}$' }
 const messageID = { type: 'string', pattern: '^[1-9][0-9]{0,18}$' }
 const uid = { type: 'string', pattern: '^[A-Za-z0-9_.:@-]{1,128}$' }
+const personUid = value => validUid(value) && !/[:@]/.test(value) && !value.includes('____')
+  && !['.', '..', 'all', 'all_bots', '-1', '-2', '-3'].includes(value.toLowerCase())
 const memberTargets = { type: 'array', items: uid, minItems: 1, maxItems: 10, uniqueItems: true }
 const text = { type: 'string', minLength: 1, maxLength: 4000 }
 const limit = { type: 'integer', minimum: 1, maximum: MAX_ROWS }
@@ -70,11 +72,12 @@ const freeze = value => {
 const displayEditParameters = displayCardParameters()
 displayEditParameters.properties = { message_id: messageID, ...displayEditParameters.properties }
 displayEditParameters.required = ['message_id', ...displayEditParameters.required]
-const proactiveTarget = schema({ channel_id: uid, channel_type: { type: 'integer', enum: [2, 5] } }, ['channel_id', 'channel_type'])
+const proactiveTarget = schema({ channel_id: uid, channel_type: { type: 'integer', enum: [1, 2, 5] } }, ['channel_id', 'channel_type'])
 const displayTargetParameters = displayCardParameters()
 displayTargetParameters.properties = { target: proactiveTarget, confirm_send: { type: 'boolean', const: true }, ...displayTargetParameters.properties }
 displayTargetParameters.required = ['target', 'confirm_send', ...displayTargetParameters.required]
-const proactiveOperations = new Set(['messages.resolve_targets', 'messages.send_target', 'messages.send_target_file', 'messages.send_target_card'])
+const proactiveReads = new Set(['messages.resolve_targets', 'messages.resolve_people'])
+const proactiveOperations = new Set([...proactiveReads, 'messages.send_target', 'messages.send_target_file', 'messages.send_target_card'])
 const richtextBlocks = { type: 'array', minItems: 1, maxItems: 20, items: { oneOf: [
   schema({ type: { const: 'text' }, text }, ['type', 'text']),
   schema({ type: { const: 'image' }, url: { type: 'string', minLength: 1, maxLength: 2048, pattern: '^https://' },
@@ -111,13 +114,16 @@ export const CHANNEL_API_OPERATIONS = freeze([
   { ...spec('messages.resolve_targets', 'In your own private conversation, resolve an explicitly named group/topic that you and this Bot currently belong to in the configured Space and route policy. Returns live names, not message content. If multiple candidates match, ask the user to choose; a truncated result is not exhaustive. Never guess IDs from names.',
     schema({ name: { type: 'string', minLength: 1, maxLength: 100 }, kind: { type: 'string', enum: ['all', 'group', 'thread'] },
       limit: { type: 'integer', minimum: 1, maximum: 5 } }, ['name'])), privateOnly: true },
-  { ...spec('messages.send_target', 'Only on an explicit user request in their own private conversation: send text/Markdown as this Bot to one precisely identified group or topic. Resolve names first and ask on ambiguity. Both requester and Bot must currently be members. confirm_send=true affirms the user requested this exact target and text; never automatically forward private content. Optional native mentions use verified member UIDs; all=true requires requester admin. No fabricated reply/quote, user impersonation, bulk send or automatic retry after an unconfirmed delivery.',
-    schema({ target: schema({ channel_id: uid, channel_type: { type: 'integer', enum: [2, 5] } }, ['channel_id', 'channel_type']),
+  { ...spec('messages.resolve_people', 'In your own private conversation, find an explicitly named human recipient in the configured Space for a requested Bot DM. Returns a bounded directory page, not messages or proof of friendship. Use exact returned channel_id with channel_type=1; ask the user when names are ambiguous and inspect further pages when more=true. Actual send checks Bot friendship. Never use a name or a group/topic address as a person UID.',
+    schema({ name: { type: 'string', minLength: 1, maxLength: 80 },
+      limit: { type: 'integer', minimum: 1, maximum: 5 }, page: { type: 'integer', minimum: 1, maximum: 100 } }, ['name'])), privateOnly: true },
+  { ...spec('messages.send_target', 'Only on an explicit user request in their own private conversation: send text/Markdown as this Bot to one precisely identified person (type1), group (type2) or topic (type5). Resolve names first and ask on ambiguity. Humans must belong to the configured Space; group/topic requires requester and Bot membership, DM requires Bot friendship at actual send. confirm_send=true affirms the user requested this exact target and text; never automatically forward private content. Optional native mentions are group/topic-only and use verified member UIDs; all=true requires requester admin. No fabricated reply/quote, user impersonation, bulk send or automatic retry after an unconfirmed delivery.',
+    schema({ target: proactiveTarget,
       text, uids: memberTargets, all: { type: 'boolean' }, confirm_send: { type: 'boolean', const: true } }, ['target', 'text', 'confirm_send']), true), privateOnly: true },
-  { ...spec('messages.send_target_file', 'Only on an explicit request in the user\'s own private conversation: send ONE workspace file/image as this Bot to one identified group/topic. Resolve named destinations and ask on ambiguity. path must be relative to this account workspace; files outside it, credentials and links are rejected. Requires workspace tool access and attachments enabled. confirm_send=true affirms the exact destination and file were requested; never forward private files automatically. Optional caption is sent in full as a separate text/Markdown message after the native file/image. Inspect the receipt: partial delivery MUST NOT be retried as a whole. No automatic retry after an unconfirmed send. This is delivery, not a final answer; summarize the actual outcome to the user. Use DSH present instead for delivery to the current conversation.',
+  { ...spec('messages.send_target_file', 'Only on an explicit request in the user\'s own private conversation: send ONE workspace file/image as this Bot to one identified person/group/topic (type1/2/5). Resolve named destinations and ask on ambiguity. A person must be a current human in this Space; the server checks Bot friendship at send. path must be relative to this account workspace; files outside it, credentials and links are rejected. Requires workspace tool access and attachments enabled. confirm_send=true affirms the exact destination and file were requested; never forward private files automatically. Optional caption is sent in full as a separate text/Markdown message after the native file/image. Inspect the receipt: partial delivery MUST NOT be retried as a whole. No automatic retry after an unconfirmed send. This is delivery, not a final answer; summarize the actual outcome to the user. Use DSH present instead for delivery to the current conversation.',
     schema({ target: proactiveTarget, path: { type: 'string', minLength: 1, maxLength: 1024 }, caption: text,
       confirm_send: { type: 'boolean', const: true } }, ['target', 'path', 'confirm_send']), true), privateOnly: true, requiresFiles: true },
-  { ...spec('messages.send_target_card', 'Only on an explicit request in the user\'s own private conversation: send a structured DISPLAY card as this Bot to one identified group/topic. Resolve names and ask on ambiguity; confirm_send=true affirms this destination and content were requested. Uses the same bounded display blocks as octo_display_card. No callback buttons, raw payloads, user impersonation or automatic retry. Returns a receipt; still give a short final summary to the requester.',
+  { ...spec('messages.send_target_card', 'Only on an explicit request in the user\'s own private conversation: send a structured DISPLAY card as this Bot to one identified person/group/topic (type1/2/5). A person must be a current human in this Space; the server checks Bot friendship at send. Resolve names and ask on ambiguity; confirm_send=true affirms this destination and content were requested. Uses the same bounded display blocks as octo_display_card. No callback buttons, raw payloads, user impersonation or automatic retry. Returns a receipt; still give a short final summary to the requester.',
     displayTargetParameters, true), privateOnly: true },
   ...authorizedSearchSpecs({ spec, schema, uid, searchPage, searchKeyword, searchFilters }),
   spec('inspect', 'Inspect the current channel and its parent group permissions.'),
@@ -468,7 +474,7 @@ export class ChannelApi {
 
   revoke() { this.#revoked = true; this.#searchContinuations.clear() }
 
-  async #call(path, body, signal, method = body === undefined ? 'GET' : 'POST') {
+  async #call(path, body, signal, method = body === undefined ? 'GET' : 'POST', retainSendReceipt = false) {
     if (this.#revoked) fail('account_configuration_changed')
     if (signal?.aborted) fail('aborted')
     let result
@@ -479,8 +485,16 @@ export class ChannelApi {
       // a static local hint; never expose translated upstream messages/details.
       fail(apiErrorCode(error))
     }
-    if (signal?.aborted) fail('aborted')
-    if (this.#revoked) fail('account_configuration_changed')
+    if (signal?.aborted || this.#revoked) {
+      // Acknowledged sends cannot be undone by a concurrent settings change.
+      // Preserve only the receipt, never stale target names or response fields.
+      if (retainSendReceipt && object(result) && id(result.message_id) && result.error == null && result.ok !== false
+        && (result.status === undefined || [0, 1, 2, 3, 200].includes(result.status))) {
+        return { message_id: id(result.message_id), authority_changed: true }
+      }
+      if (signal?.aborted) fail('aborted')
+      fail('account_configuration_changed')
+    }
     // Never expose a transport exception, HTTP body, nested error, or credentials.
     if (Number.isInteger(result?.status) && result.status >= 400) fail(statusError(result.status))
     if (object(result) && (result.error != null || result.ok === false
@@ -735,7 +749,7 @@ export class ChannelApi {
   }
 
   async #mutation(path, body, signal, method = 'POST') {
-    try { return await this.#call(path, body, signal, method) } catch (error) {
+    try { return await this.#call(path, body, signal, method, path === '/v1/bot/sendMessage') } catch (error) {
       if (['api_invalid_request', 'api_authentication_failed', 'api_permission_denied', 'api_not_found',
         'api_method_not_allowed', 'api_conflict', 'api_rate_limited', 'api_disabled', 'api_unsupported'].includes(error?.code)) throw error
       fail('mutation_unconfirmed')
@@ -973,6 +987,23 @@ export class ChannelApi {
 
   async #targetAccess(target, sender, signal) {
     const scope = this.#scope(target)
+    if (scope.route.channel_type === 1) {
+      const person = scope.route.channel_id
+      if (!personUid(person)) fail('invalid_route')
+      if (await this.#principal(sender, signal) !== 'human'
+        || await this.#principal(this.#config.botUid, signal) !== 'user_bot'
+        || await this.#principal(person, signal) !== 'human') fail('human_member_required')
+      const raw = await this.#call('/v1/bot/user/info?' + new URLSearchParams({ uid: person }), undefined, signal)
+      if (!object(raw) || raw.uid !== person) fail('invalid_identity_response')
+      const name = identityName(raw.name)
+      // Do not read a third party's DM history as a send preflight. The actual
+      // send handler atomically checks the bot-to-peer friendship. Exact Space
+      // principals are refreshed after metadata; directory names grant no access.
+      for (const principal of new Set([sender, person])) {
+        if (await this.#principal(principal, signal) !== 'human') fail('human_member_required')
+      }
+      return { scope, access: { actor: { uid: sender }, rows: [] }, target: { ...scope.route, name } }
+    }
     if (!scope.group || !/^[a-fA-F0-9]{32}$/.test(scope.group)) fail('invalid_route')
     const access = await this.#access(scope, sender, true, signal)
     let topic
@@ -994,6 +1025,41 @@ export class ChannelApi {
   async #proactive(scope, sender, operation, args, signal, prepared, runtime) {
     if (scope.route.channel_type !== 1 || scope.route.channel_id !== sender) fail('private_operation_required')
     if (await this.#principal(sender, signal) !== 'human' || await this.#principal(this.#config.botUid, signal) !== 'user_bot') fail('requester_not_allowed')
+    if (operation === 'messages.resolve_people') {
+      const size = args.limit ?? 5, page = args.page ?? 1
+      const raw = await this.#call('/v1/bot/space/members?' + new URLSearchParams({ space_id: this.#config.spaceId,
+        keyword: webhookName(args.name), limit: size, page }), undefined, signal)
+      const rows = list(raw, size), seen = new Set(), candidates = []
+      for (const row of rows) {
+        if (!personUid(row?.uid)
+          || ![0, 1].includes(row.robot) || seen.has(row.uid)) fail('invalid_member_response')
+        seen.add(row.uid)
+        if (row.robot !== 0 || row.uid === this.#config.botUid) continue
+        const name = identityName(row.name)
+        try {
+          if (await this.#principal(row.uid, signal) === 'human') candidates.push({ channel_id: row.uid, channel_type: 1, name })
+        } catch (error) {
+          if (!['api_not_found', 'api_permission_denied'].includes(error?.code)) throw error
+        }
+      }
+      await this.#access(scope, sender, false, signal, true)
+      if (await this.#principal(sender, signal) !== 'human' || await this.#principal(this.#config.botUid, signal) !== 'user_bot') fail('requester_not_allowed')
+      const verified = []
+      for (const candidate of candidates) {
+        try {
+          if (await this.#principal(candidate.channel_id, signal) === 'human') verified.push(candidate)
+        } catch (error) {
+          if (!['api_not_found', 'api_permission_denied'].includes(error?.code)) throw error
+        }
+      }
+      // The principal endpoint deliberately conflates a missing recipient with
+      // inactive Space/caller membership. A skipped 404 must not publish earlier
+      // candidates after the whole directory's authorization was withdrawn.
+      if (await this.#principal(sender, signal) !== 'human' || await this.#principal(this.#config.botUid, signal) !== 'user_bot') fail('requester_not_allowed')
+      const more = rows.length === size
+      return { candidates: verified, page, more, scope: 'configured_space_humans', friendship_checked: false,
+        needs_choice: verified.length !== 1 || more || page !== 1 }
+    }
     if (operation === 'messages.resolve_targets') {
       const kind = args.kind ?? 'all', limit = args.limit ?? 5
       const raw = await this.#call('/v1/bot/resolve/targets?' + new URLSearchParams({ name: webhookName(args.name), kind, limit: 20 }), undefined, signal)
@@ -1061,6 +1127,10 @@ export class ChannelApi {
     payload ??= notificationPayload(args.text, uids, fresh.access.rows, args.all)
     const raw = await this.#mutation('/v1/bot/sendMessage', { ...fresh.scope.route, payload }, signal)
     if (!id(raw?.message_id)) fail('mutation_unconfirmed')
+    if (raw.authority_changed) return { ok: operation !== 'messages.send_target_file' || args.caption === undefined,
+      message_id: id(raw.message_id), sent_as: 'bot', authority_changed: true, requiresFinalSummary: true,
+      ...(operation === 'messages.send_target_file' && args.caption !== undefined
+        && { partial: true, caption_status: 'not_sent', retry_whole_delivery: false }) }
     if (operation === 'messages.send_target_card') return { ok: true, message_id: id(raw.message_id), ...fresh.target,
       sent_as: 'bot', format: 'display_card', fallbackBlocks, requiresFinalSummary: true }
     if (operation === 'messages.send_target_file') {
@@ -1075,6 +1145,8 @@ export class ChannelApi {
         const caption = await this.#mutation('/v1/bot/sendMessage', { ...fresh.scope.route,
           payload: notificationPayload(args.caption, [], [], false) }, signal)
         if (!id(caption?.message_id)) fail('mutation_unconfirmed')
+        if (caption.authority_changed) return { ok: true, message_id: receipt.message_id,
+          caption_message_id: id(caption.message_id), sent_as: 'bot', authority_changed: true, requiresFinalSummary: true }
         return { ok: true, ...receipt, caption_message_id: id(caption.message_id), caption: args.caption }
       } catch (error) {
         return { ok: false, ...receipt, partial: true,
@@ -1100,10 +1172,11 @@ export class ChannelApi {
     if (scopedRead || webhookWrites.has(operation) || clearRevisions || delegatedSearch || proactive && !targetCard) args = readArguments(args, definition.parameters)
     if (operation === 'webhooks.test' && args.confirm_send !== true
       || clearRevisions && args.confirm_clear !== true
-      || proactive && !targetCard && operation !== 'messages.resolve_targets' && args.confirm_send !== true) fail('explicit_confirmation_required')
-    if (proactive && (operation === 'messages.resolve_targets' ? !webhookName(args.name)
+      || proactive && !targetCard && !proactiveReads.has(operation) && args.confirm_send !== true) fail('explicit_confirmation_required')
+    if (proactive && (proactiveReads.has(operation) ? !webhookName(args.name)
       : operation === 'messages.send_target' ? !args.text.trim() || args.all && args.uids?.length
         : operation === 'messages.send_target_file' && (!args.path.trim() || args.caption !== undefined && !args.caption.trim()))) fail('invalid_arguments')
+    if (proactive && !targetCard && !proactiveReads.has(operation) && args.target?.channel_type === 1 && (args.all || args.uids?.length)) fail('invalid_arguments')
     if (operation === 'webhooks.update') {
       if (args.name !== undefined) args.name = webhookName(args.name)
       if (Object.keys(args).length < 2 || args.name !== undefined && (!args.name || Buffer.byteLength(args.name, 'utf8') > 64)) fail('invalid_arguments')

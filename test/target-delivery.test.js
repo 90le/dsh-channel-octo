@@ -287,7 +287,7 @@ test('confirmation, malformed arguments and raw route/card injections fail befor
       ['confirmation missing', input => { delete input.confirm_send }, 'invalid_arguments'],
       ['confirmation false', input => { input.confirm_send = false }, 'explicit_confirmation_required'],
       ['confirmation string', input => { input.confirm_send = 'true' }, 'invalid_arguments'],
-      ['DM target', input => { input.target = { ...dm } }, 'invalid_arguments'],
+      ['unsupported channel type', input => { input.target.channel_type = 3 }, 'invalid_arguments'],
       ['target type', input => { input.target.channel_type = '2' }, 'invalid_arguments'],
       ['target extra', input => { input.target.name = 'Untrusted name' }, 'invalid_arguments'],
     ]
@@ -462,7 +462,7 @@ test('ambiguous or rejected initial sends never retry or start a caption', async
   })
 })
 
-test('source/target/account changes during an in-flight initial send never produce an unverified success or retry', async t => {
+test('in-flight initial send preserves a confirmed receipt after cancellation but never invents success or retries', async t => {
   for (const op of [fileOp, cardOp]) for (const kind of ['source', 'human', 'bot', 'revoke', 'abort']) {
     await t.test(`${op}/${kind}`, async t => {
       const f = fixture(t)
@@ -477,7 +477,12 @@ test('source/target/account changes during an in-flight initial send never produ
       }
       const input = inputFor(op)
       if (op === fileOp) input.caption = 'No follow-up after failure.'
-      await denied(f.run(input, op), ['revoke', 'abort'].includes(kind) ? 'mutation_unconfirmed' : 'api_permission_denied')
+      if (['revoke', 'abort'].includes(kind)) {
+        const result = await f.run(input, op)
+        assert.deepEqual(result, { ok: op !== fileOp, message_id: firstId, sent_as: 'bot', authority_changed: true,
+          requiresFinalSummary: true, ...(op === fileOp && { partial: true, caption_status: 'not_sent', retry_whole_delivery: false }) })
+        noLeaks(result)
+      } else await denied(f.run(input, op), 'api_permission_denied')
       assert.equal(f.writes.length, 1)
     })
   }
@@ -532,7 +537,7 @@ test('loss of authorization between confirmed media and caption returns known pa
   })
 })
 
-test('account revocation or cancellation during caption send preserves the file receipt with unconfirmed status', async t => {
+test('account revocation or cancellation during caption send preserves both confirmed receipts without stale content', async t => {
   for (const kind of ['revoke', 'abort']) await t.test(kind, async t => {
     const f = fixture(t)
     f.state.send = async (_, number) => {
@@ -542,7 +547,10 @@ test('account revocation or cancellation during caption send preserves the file 
       else f.controller.abort()
       return { message_id: captionId }
     }
-    assertPartial(await f.run({ ...fileArgs(), caption: 'Caption' }), target, 'unconfirmed')
+    const result = await f.run({ ...fileArgs(), caption: 'Caption' })
+    assert.deepEqual(result, { ok: true, message_id: firstId, caption_message_id: captionId, sent_as: 'bot',
+      authority_changed: true, requiresFinalSummary: true })
+    noLeaks(result)
     assert.equal(f.writes.length, 2)
     assert.equal(f.uploads.length, 1)
   })

@@ -479,13 +479,25 @@ export function apply(ctx) {
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   if (!output.includes('FIXTURE_RICH_IMAGE_DOWNLOADED') || output.includes('FIXTURE_SYNC_SCOPE_WRONG')) throw new Error('Missing scoped rich media/history')
   if (delegatedSmoke) {
-    if ([1, 2, 3, 4, 5, 6, 7, 8, 9].some(step => !output.includes('FIXTURE_DELEGATED_TOOL_OK=' + step))
+    const markers = new Set(output.match(/FIXTURE_[A-Z_]+(?:=\d+)?/g) ?? [])
+    if (Array.from({ length: 13 }, (_, i) => i + 1).some(step => !markers.has('FIXTURE_DELEGATED_TOOL_OK=' + step))
       || [2, 5].some(type => !output.includes('FIXTURE_PROACTIVE_SENT=' + type))
       || ['FILE', 'CAPTION', 'CARD'].some(kind => !output.includes('FIXTURE_TARGET_' + kind + '_SENT'))
       || output.includes('FIXTURE_DELEGATED_SCOPE_MISMATCH')) throw new Error('Delegated search native roundtrip failed')
+    const personMarkers = ['FIXTURE_PERSON_TOOL_SCHEMA_OK', 'FIXTURE_PERSON_DIRECTORY_OK', 'FIXTURE_PERSON_FILE_UPLOADED',
+      'FIXTURE_PERSON_TEXT_SENT=783', 'FIXTURE_PERSON_FILE_SENT=784', 'FIXTURE_PERSON_CAPTION_SENT=785',
+      'FIXTURE_PERSON_CARD_SENT=786', 'FIXTURE_PERSON_FINAL_OK',
+      ...[10, 11, 12, 13].flatMap(step => ['HOST_TOOL', 'PRINCIPALS', 'TOOL_RESULT'].map(kind => 'FIXTURE_PERSON_' + kind + '_OK=' + step)),
+      ...[3, 4, 5].map(round => 'FIXTURE_PERSON_PRIVATE_SCOPE_OK=' + round)]
+    if (personMarkers.some(marker => !markers.has(marker))
+      || /FIXTURE_PERSON_[^\r\n]*(?:MISMATCH|FORBIDDEN|BEFORE_TOOLS)/.test(output)) {
+      throw new Error('Third-party DM host tool/payload/result/final roundtrip failed: '
+        + (output.match(/FIXTURE_PERSON_[^\r\n]*/g) ?? []).join('\n'))
+    }
     console.log('PASS: native private delegated message/file/group searches and bound continuation, without raw cursors or attachments.')
     console.log('PASS: native target discovery and explicit group/topic sends with member mentions, without impersonation or empty quotes.')
     console.log('PASS: native target file upload, full Markdown caption and topic display card with confirmed receipts and final summary.')
+    console.log('PASS: 13 delegated host tool steps; bounded human directory resolution and Bot DM text, file plus full caption, display card, receipts and final summary; fixed-Space principals, private-only tools, no target history/sync or OBO.')
   }
   if (ownerSmoke) {
     if (groupToolsSmoke && (readFileSync(join(home, 'group-tool-fixture.txt'), 'utf8') !== 'group native tools executed'

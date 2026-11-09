@@ -3,6 +3,7 @@ import { existsSync, readdirSync, renameSync } from 'node:fs'
 import { basename, join, resolve, relative, isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
+import { isDeepStrictEqual } from 'node:util'
 
 let received = 0
 let sent = 0
@@ -12,6 +13,20 @@ const delegatedSmoke = process.env.DSH_OCTO_FIXTURE_DELEGATED_SEARCH === '1'
 let delegatedStep = 0
 const ownerCaption = 'fixture response 1\n\n文件：<fixture_summary.md>\n\n**摘要结构**\n\n- 第一项：文件已生成。\n- 第二项：说明随文件完整交付。\n\n可继续修改 ✅'
 const targetCaption = 'EXPLICIT-TARGET-CAPTION\n\n' + ownerCaption
+const person = { channel_id: 'fixture-recipient', channel_type: 1, name: 'Fixture Recipient' }
+const personText = 'PERSON-TEXT-FIXTURE\n\n**指定人员私聊**：由 Bot 发送。'
+const personCaption = 'PERSON-FILE-CAPTION\n\n' + ownerCaption
+const personCardTitle = 'PERSON-DISPLAY-CARD'
+const personCardText = '指定人员的文件和完整说明已交付。'
+const personOperations = ['octo_messages_resolve_people', 'octo_messages_send_target',
+  'octo_messages_send_target_file', 'octo_messages_send_target_card']
+const personPrincipals = new Set(), personMetadataSteps = new Set()
+const personDeliveries = new Set(), personResults = new Set(), personCalls = new Map()
+let personDirectoryRead = false, personUploaded = false, personFinalReady = false, resolvedPerson
+const personAuthorized = step => ['fixture-user', 'fixture-bot', person.channel_id]
+  .every(uid => personPrincipals.has(step + ':' + uid))
+const delegatedFinal = 'fixture response 2\n\n已完成授权检索及群/子区发送：文本 778、779；文件 780、完整说明 781、展示卡 782。'
+  + '\n已由 Bot 向 Fixture Recipient 发送私聊文本 783、文件 784、完整 Markdown 说明 785、展示卡 786。'
 const deleteSmoke = process.env.DSH_OCTO_FIXTURE_DELETE === '1'
 let ownerStep = 0, uploaded = false, questionAnswered = false
 let questionIndex = 0
@@ -92,7 +107,8 @@ function nextMessage() {
         content: [{ type: 'text', text: 'fixture prompt ' + received }, { type: 'image', url: '/api/v1/file/preview/chat/fixture/test.png' }],
         mention: { entities: [{ uid: 'fixture-bot', offset: 0, length: 3 }] },
       } : {
-      type: 1, content: 'fixture prompt ' + received,
+      type: 1, content: 'fixture prompt ' + received + (delegatedSmoke && received === 2
+        ? '\n请完成指定群和子区的检索、文本、文件及展示卡交付，再查找 Fixture Recipient；向唯一匹配的人发送指定私聊文本、octo-tool-fixture.txt 及完整说明、展示卡，并汇总回执。' : ''),
       ...(!peer ? { mention: { uids: ['fixture-bot'] } } : {}),
       ...(received === 4 && { reply: { message_id: '605' } }),
     },
@@ -108,9 +124,28 @@ globalThis.fetch = async (input, init) => {
   const json = value => Response.json(value)
   if (ownerSmoke && url.hostname === 'storage-fixture.invalid') {
     uploaded = init.method === 'PUT' && Buffer.from(init.body).toString() === 'written by native DSH'
+    if (delegatedSmoke && received === 2 && delegatedStep === 12 && uploaded) {
+      personUploaded = true
+      console.log('FIXTURE_PERSON_FILE_UPLOADED')
+    }
     return new Response(null, { status: uploaded ? 200 : 400 })
   }
   if (url.hostname === 'octo-fixture.invalid') {
+    if (delegatedSmoke) {
+      const requestText = String(init?.body ?? '')
+      if ([decodeURIComponent(url.pathname), url.search, requestText].some(value => value.includes(person.channel_id))
+        && !['/api/v1/bot/sendMessage', '/api/v1/bot/user/info',
+          '/api/v1/bot/space/principals/' + person.channel_id].includes(url.pathname)) {
+        // No third-party history/sync/read preflight, including a limit=1 probe.
+        console.error('FIXTURE_PERSON_FORBIDDEN_REQUEST')
+        return new Response(null, { status: 403 })
+      }
+      if (received === 2 && delegatedStep >= 10
+        && (url.searchParams.has('on_behalf_of') || /"on_behalf_of"\s*:/.test(requestText))) {
+        console.error('FIXTURE_PERSON_OBO_FORBIDDEN')
+        return new Response(null, { status: 403 })
+      }
+    }
     if (url.pathname.endsWith('/verify-bot')) {
       const { bot_token: token } = JSON.parse(init.body)
       if (token === 'bf_fixture_second' || token === 'bf_fixture_second_rotated') return json({ bot_uid: 'fixture-bot-second', space_id: 'fixture-space' })
@@ -158,8 +193,33 @@ globalThis.fetch = async (input, init) => {
     }
     if (delegatedSmoke && url.pathname.includes('/v1/bot/space/principals/')) {
       const uid = url.pathname.split('/').at(-1)
-      if (!['fixture-user', 'fixture-bot'].includes(uid) || url.searchParams.get('space_id') !== 'fixture-space') return new Response(null, { status: 403 })
-      return json({ uid, principal_type: uid === 'fixture-user' ? 'human' : 'user_bot' })
+      if (!['fixture-user', 'fixture-bot', person.channel_id].includes(uid) || init.method !== 'GET'
+        || url.searchParams.get('space_id') !== 'fixture-space' || url.searchParams.size !== 1) {
+        console.error('FIXTURE_PERSON_PRINCIPAL_SCOPE_MISMATCH')
+        return new Response(null, { status: 403 })
+      }
+      if (received === 2 && delegatedStep >= 10) personPrincipals.add(delegatedStep + ':' + uid)
+      return json({ uid, principal_type: uid === 'fixture-bot' ? 'user_bot' : 'human' })
+    }
+    if (delegatedSmoke && url.pathname === '/api/v1/bot/space/members') {
+      if (received !== 2 || delegatedStep !== 10 || init.method !== 'GET'
+        || url.searchParams.get('space_id') !== 'fixture-space' || url.searchParams.get('keyword') !== person.name
+        || url.searchParams.get('limit') !== '5' || url.searchParams.get('page') !== '1' || url.searchParams.size !== 4) {
+        console.error('FIXTURE_PERSON_DIRECTORY_MISMATCH')
+        return new Response(null, { status: 400 })
+      }
+      personDirectoryRead = true
+      console.log('FIXTURE_PERSON_DIRECTORY_OK')
+      return json([{ uid: person.channel_id, name: person.name, robot: 0, email: 'NEVER_RETURN_WIRE_DIRECTORY' }])
+    }
+    if (delegatedSmoke && url.pathname === '/api/v1/bot/user/info') {
+      if (received !== 2 || ![11, 12, 13].includes(delegatedStep) || init.method !== 'GET'
+        || url.searchParams.get('uid') !== person.channel_id || url.searchParams.size !== 1) {
+        console.error('FIXTURE_PERSON_IDENTITY_MISMATCH')
+        return new Response(null, { status: 400 })
+      }
+      personMetadataSteps.add(delegatedStep)
+      return json({ uid: person.channel_id, name: person.name, email: 'NEVER_RETURN_WIRE_PERSON_INFO' })
     }
     if (delegatedSmoke && url.pathname.endsWith('/v1/bot/resolve/targets')) {
       if (url.searchParams.get('name') !== 'Fixture') return new Response(null, { status: 400 })
@@ -305,6 +365,44 @@ globalThis.fetch = async (input, init) => {
     })
     if (url.pathname.endsWith('/sendMessage')) {
       const body = JSON.parse(init.body)
+      if (delegatedSmoke && (body.channel_id === person.channel_id
+        || [personText, personCaption].includes(body.payload.content)
+        || body.payload.plain === personCardTitle + '\n' + personCardText
+        || received === 2 && delegatedStep >= 11 && body.payload.type === 8)) {
+        const reject = () => {
+          console.error('FIXTURE_PERSON_PAYLOAD_MISMATCH')
+          return new Response(null, { status: 400 })
+        }
+        if (received !== 2 || init.method !== 'POST' || body.channel_type !== 1 || body.channel_id !== person.channel_id
+          || !isDeepStrictEqual(Object.keys(body).sort(), ['channel_id', 'channel_type', 'payload'])
+          || !personAuthorized(delegatedStep) || !personMetadataSteps.has(delegatedStep)
+          || !personResults.has(10) || !resolvedPerson) return reject()
+        let kind, messageId
+        if (delegatedStep === 11 && isDeepStrictEqual(body.payload, { type: 1, content: personText })) {
+          kind = 'TEXT'; messageId = '783'
+        } else if (delegatedStep === 12 && personUploaded && isDeepStrictEqual(body.payload, {
+          type: 8, name: 'octo-tool-fixture.txt', url: 'https://files-fixture.invalid/fixture.txt',
+          size: Buffer.byteLength('written by native DSH'),
+        })) {
+          kind = 'FILE'; messageId = '784'
+        } else if (delegatedStep === 12 && personDeliveries.has('FILE')
+          && isDeepStrictEqual(body.payload, { type: 1, content: personCaption })) {
+          kind = 'CAPTION'; messageId = '785'
+        } else if (delegatedStep === 13 && personResults.has(12) && body.payload.type === 17
+          && body.payload.profile === 'octo/v1' && body.payload.card_version === '1.5'
+          && body.payload.card?.type === 'AdaptiveCard' && body.payload.card?.version === '1.5'
+          && body.payload.plain === personCardTitle + '\n' + personCardText
+          && !body.payload.card.actions?.length && body.payload.reply === undefined && body.payload.mention === undefined
+          && body.payload.card.body?.length === 2 && body.payload.card.body.every(block => block.type === 'TextBlock')
+          && body.payload.card.body[0].text === personCardTitle && body.payload.card.body[1].text === personCardText
+          && !/"(?:Action\.[^"]*|Input\.[^"]*|selectAction|on_behalf_of|template_ref)"/.test(JSON.stringify(body.payload))) {
+          kind = 'CARD'; messageId = '786'
+        } else return reject()
+        if (personDeliveries.has(kind)) return reject()
+        personDeliveries.add(kind)
+        console.log('FIXTURE_PERSON_' + kind + '_SENT=' + messageId)
+        return json({ message_id: messageId })
+      }
       if (delegatedSmoke && received === 2 && body.payload.type === 8) {
         if (!uploaded || body.channel_type !== 2 || body.channel_id !== group || body.on_behalf_of || body.payload.reply
           || body.payload.name !== 'octo-tool-fixture.txt' || body.payload.url !== 'https://files-fixture.invalid/fixture.txt') return new Response(null, { status: 400 })
@@ -426,13 +524,21 @@ globalThis.fetch = async (input, init) => {
         return json({ message_id: Number(id) })
       }
       const [type, address] = routes[sent] ?? []
-      const expectedText = ownerSmoke && sent === 0 ? ownerCaption : 'fixture response ' + (sent + 1)
+      const expectedText = ownerSmoke && sent === 0 ? ownerCaption
+        : delegatedSmoke && sent === 1 ? delegatedFinal : 'fixture response ' + (sent + 1)
       if (body.channel_id !== address || body.channel_type !== type || body.payload.content !== expectedText
         || type === 1 && body.payload.reply !== undefined
         || type >= 2 && (body.payload.reply?.message_id !== String(sent + 1)
           || body.payload.reply.message_seq !== 10 * (sent + 1) || body.payload.reply.payload?.type !== 1)) {
         console.error('FIXTURE_REPLY_MISMATCH')
         return new Response(null, { status: 400 })
+      }
+      if (delegatedSmoke && sent === 1) {
+        if (delegatedStep !== 13 || !personFinalReady || personResults.size !== 4 || personDeliveries.size !== 4) {
+          console.error('FIXTURE_PERSON_FINAL_BEFORE_TOOLS')
+          return new Response(null, { status: 400 })
+        }
+        console.log('FIXTURE_PERSON_FINAL_OK')
       }
       if (groupToolsSmoke && sent === 2 && (!groupQuestion?.answered || !groupQuestion?.writeCompleted
         || !groupDisplaySent || !groupDisplayReceipt || !groupFormAnswered || adminCompleted.size !== 4)) {
@@ -480,6 +586,13 @@ globalThis.fetch = async (input, init) => {
     const tail = JSON.stringify(body.messages.at(-1))
     const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
     const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-6])/g)).at(-1)?.[1] ?? 0)
+    if (delegatedSmoke && [3, 4, 5].includes(round)) {
+      if ((body.tools ?? []).some(tool => personOperations.includes(tool.name))) {
+        console.error('FIXTURE_PERSON_PRIVATE_SCOPE_MISMATCH')
+        return new Response(null, { status: 400 })
+      }
+      console.log('FIXTURE_PERSON_PRIVATE_SCOPE_OK=' + round)
+    }
     if (delegatedSmoke && round === 2) {
       if (delegatedStep === 0) {
         const until = Date.now() + 6000
@@ -488,8 +601,25 @@ globalThis.fetch = async (input, init) => {
       }
       const names = (body.tools ?? []).map(tool => tool.name)
       const operations = ['octo_messages_search_authorized', 'octo_messages_search_authorized', 'octo_messages_search_authorized_files', 'octo_messages_search_authorized_groups',
-        'octo_messages_resolve_targets', 'octo_messages_send_target', 'octo_messages_send_target', 'octo_messages_send_target_file', 'octo_messages_send_target_card']
+        'octo_messages_resolve_targets', 'octo_messages_send_target', 'octo_messages_send_target', 'octo_messages_send_target_file', 'octo_messages_send_target_card',
+        ...personOperations]
       if (operations.some(name => !names.includes(name)) || history.includes('NEVER_RETURN_WIRE_')) return new Response(null, { status: 400 })
+      if (delegatedStep === 0) {
+        const schema = body.tools.find(tool => tool.name === personOperations[0]).input_schema
+        if (schema?.type !== 'object' || !schema.required?.includes('name')
+          || schema.properties?.name?.type !== 'string'
+          || schema.properties?.limit?.type !== 'integer' || schema.properties.limit.minimum !== 1 || schema.properties.limit.maximum !== 5
+          || schema.properties?.page?.type !== 'integer' || schema.properties.page.minimum !== 1 || schema.properties.page.maximum !== 100
+          || personOperations.slice(1).some(name => {
+            const parameters = body.tools.find(tool => tool.name === name).input_schema
+            return !isDeepStrictEqual(parameters?.properties?.target?.properties?.channel_type?.enum, [1, 2, 5])
+              || parameters.properties.confirm_send?.const !== true || !parameters.required?.includes('confirm_send')
+          })) {
+          console.error('FIXTURE_PERSON_TOOL_SCHEMA_MISMATCH')
+          return new Response(null, { status: 400 })
+        }
+        console.log('FIXTURE_PERSON_TOOL_SCHEMA_OK')
+      }
       let prior
       if (delegatedStep) {
         const result = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
@@ -497,16 +627,58 @@ globalThis.fetch = async (input, init) => {
         const text = typeof result?.content === 'string' ? result.content : (result?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
         try { prior = JSON.parse(text) } catch {}
         const expected = ['AUTHORIZED-SEARCH-EXCERPT', 'AUTHORIZED-PAGE-TWO', 'AUTHORIZED-FILE-EXCERPT', 'Authorized group',
-          'Fixture Group', 'EXPLICIT-TARGET-FIXTURE', 'Fixture Topic', 'EXPLICIT-TARGET-CAPTION', 'display_card'][delegatedStep - 1]
+          'Fixture Group', 'EXPLICIT-TARGET-FIXTURE', 'Fixture Topic', 'EXPLICIT-TARGET-CAPTION', 'display_card',
+          person.name, 'PERSON-TEXT-FIXTURE', 'PERSON-FILE-CAPTION', 'display_card'][delegatedStep - 1]
         if (!prior || result.is_error || !text.includes(expected) || delegatedStep === 1 && !/^ocs_[a-f0-9]{32}$/.test(prior.continuation)
           || delegatedStep === 4 && ('match_count' in prior.groups[0] || 'total_groups' in prior)
           || delegatedStep === 8 && (!prior.ok || prior.message_id !== '780' || prior.caption_message_id !== '781' || prior.caption !== targetCaption)
           || delegatedStep === 9 && (!prior.ok || prior.message_id !== '782' || !prior.requiresFinalSummary)) return new Response(null, { status: 400 })
+        if (delegatedStep >= 10) {
+          const call = body.messages.filter(message => message.role === 'assistant')
+            .flatMap(message => Array.isArray(message.content) ? message.content : [])
+            .find(part => part.type === 'tool_use' && part.id === 'toolu_delegated_' + (delegatedStep - 1))
+          if (!call || call.name !== operations[delegatedStep - 1]
+            || !isDeepStrictEqual(call.input, personCalls.get(delegatedStep))) {
+            console.error('FIXTURE_PERSON_HOST_TOOL_MISMATCH')
+            return new Response(null, { status: 400 })
+          }
+          console.log('FIXTURE_PERSON_HOST_TOOL_OK=' + delegatedStep)
+          const receipt = delegatedStep === 10 ? {
+            candidates: [person], page: 1, more: false, scope: 'configured_space_humans', friendship_checked: false, needs_choice: false,
+          } : delegatedStep === 11 ? {
+            ok: true, message_id: '783', ...person, sent_as: 'bot', text: personText,
+          } : delegatedStep === 12 ? {
+            ok: true, message_id: '784', ...person, sent_as: 'bot', format: 'file', file_name: 'octo-tool-fixture.txt',
+            size: Buffer.byteLength('written by native DSH'), requiresFinalSummary: true, caption_message_id: '785', caption: personCaption,
+          } : {
+            ok: true, message_id: '786', ...person, sent_as: 'bot', format: 'display_card', fallbackBlocks: [], requiresFinalSummary: true,
+          }
+          const delivered = delegatedStep === 10 ? personDirectoryRead
+            : delegatedStep === 11 ? personDeliveries.has('TEXT')
+              : delegatedStep === 12 ? personUploaded && personDeliveries.has('FILE') && personDeliveries.has('CAPTION')
+                : personDeliveries.has('CARD')
+          if (!isDeepStrictEqual(prior, receipt) || !delivered || !personAuthorized(delegatedStep)) {
+            console.error('FIXTURE_PERSON_TOOL_RESULT_MISMATCH')
+            return new Response(null, { status: 400 })
+          }
+          if (delegatedStep === 10) {
+            const candidate = prior.candidates[0]
+            resolvedPerson = { channel_id: candidate.channel_id, channel_type: candidate.channel_type }
+          }
+          personResults.add(delegatedStep)
+          console.log('FIXTURE_PERSON_PRINCIPALS_OK=' + delegatedStep)
+          console.log('FIXTURE_PERSON_TOOL_RESULT_OK=' + delegatedStep)
+        }
         console.log('FIXTURE_DELEGATED_TOOL_OK=' + delegatedStep)
       }
       if (delegatedStep < operations.length) {
         const step = delegatedStep++, name = operations[step]
-        const args = step === 7 ? { target: { channel_id: group, channel_type: 2 }, path: 'octo-tool-fixture.txt', caption: targetCaption, confirm_send: true }
+        const args = step === 9 ? { name: person.name, limit: 5, page: 1 }
+          : step === 10 ? { target: resolvedPerson, text: personText, confirm_send: true }
+          : step === 11 ? { target: resolvedPerson, path: 'octo-tool-fixture.txt', caption: personCaption, confirm_send: true }
+          : step === 12 ? { target: resolvedPerson, title: personCardTitle,
+            blocks: [{ type: 'text', text: personCardText }], confirm_send: true }
+          : step === 7 ? { target: { channel_id: group, channel_type: 2 }, path: 'octo-tool-fixture.txt', caption: targetCaption, confirm_send: true }
           : step === 8 ? { target: { channel_id: group + '____' + thread, channel_type: 5 }, confirm_send: true,
             title: 'TARGET-CARD', blocks: [{ type: 'text', text: '完成文件交付。' }] }
           : step === 4 ? { name: 'Fixture' } : step >= 5 ? {
@@ -514,6 +686,7 @@ globalThis.fetch = async (input, init) => {
           text: 'EXPLICIT-TARGET-FIXTURE', uids: ['fixture-user'], confirm_send: true,
         } : { targets: [{ channel_id: group, channel_type: 2 }], keyword: 'fixture',
           ...(step === 1 && { continuation: prior.continuation }), ...(step === 2 && { filters: { file_exts: ['md'] } }) }
+        if (step >= 9) personCalls.set(step + 1, structuredClone(args))
         const frames = [
           { type: 'message_start', message: { id: 'delegated-' + step, model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
           { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_delegated_' + step, name, input: {} } },
@@ -523,6 +696,11 @@ globalThis.fetch = async (input, init) => {
         ]
         return new Response(frames.map(frame => 'event: ' + frame.type + '\ndata: ' + JSON.stringify(frame) + '\n\n').join(''), { headers: { 'Content-Type': 'text/event-stream' } })
       }
+      if (personResults.size !== 4 || personDeliveries.size !== 4) {
+        console.error('FIXTURE_PERSON_FINAL_BEFORE_TOOLS')
+        return new Response(null, { status: 400 })
+      }
+      personFinalReady = true
     }
     if (ownerSmoke && round === 3) {
       const names = (body.tools ?? []).map(tool => tool.name)
@@ -690,7 +868,8 @@ globalThis.fetch = async (input, init) => {
     const frames = [
       {type:'message_start', message:{id:'fixture',model:body.model,usage:{input_tokens:3,output_tokens:0}}},
       {type:'content_block_start',index:0,content_block:{type:'text',text:''}},
-      {type:'content_block_delta',index:0,delta:{type:'text_delta',text:round ? ownerSmoke && round === 1 ? ownerCaption : 'fixture response '+round : 'Fixture title'}},
+      {type:'content_block_delta',index:0,delta:{type:'text_delta',text:round ? ownerSmoke && round === 1 ? ownerCaption
+        : delegatedSmoke && round === 2 ? delegatedFinal : 'fixture response '+round : 'Fixture title'}},
       {type:'content_block_stop',index:0},
       {type:'message_delta',delta:{stop_reason:'end_turn'},usage:{output_tokens:5}},
       {type:'message_stop'},
