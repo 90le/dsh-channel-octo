@@ -1,0 +1,2 @@
+# Preserve standalone patches byte-for-byte, including required blank context lines.
+compat/octo-web/*.patch -text whitespace=-blank-at-eol

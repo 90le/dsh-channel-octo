@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { OctoClient } from '../src/octo.js'
-import { sendDisplayCard, spec } from '../src/display-card.js'
+import { sendDisplayCard, spec, displayCardParameters, normalizeDisplayCard, renderDisplayCard,
+  assertEditableDisplayCard, normalizeRichtextBlocks } from '../src/display-card.js'
 
 const messageId = '9223372036854775806'
 const dm = { channel_id: 'alice', channel_type: 1 }
@@ -269,4 +270,69 @@ test('cancellation cannot send after probing or leak its reason; cancellation du
   const duringWrite = fixture({ post: () => { writing.abort('bf_private'); throw new Error('bf_private') } })
   await assert.rejects(duringWrite.send(simple, dm, writing.signal), { code: 'display_card_delivery_unconfirmed' })
   assert.equal(duringWrite.calls.length, 2)
+})
+
+
+test('shared edit construction accepts every generated display variant and preserves all fallback text', () => {
+  for (const profile of [manifest, { ...manifest, elements: ['TextBlock'], actions: [] },
+    { ...manifest, limits: { max_nodes: 1 } }]) {
+    const args = structuredClone(allBlocks)
+    const prepared = normalizeDisplayCard(args)
+    args.title = 'Changed'
+    args.blocks[0].text = 'Changed'
+    const { frame } = renderDisplayCard(prepared, profile)
+    assert.match(frame.plain, /Daily summary/)
+    assert.match(frame.plain, /Overview/)
+    assert.doesNotMatch(frame.plain, /Changed/)
+    assert.doesNotThrow(() => assertEditableDisplayCard({ type: 17, ...frame }))
+    // These are the only server additions accepted for ordinary raw display cards.
+    assert.doesNotThrow(() => assertEditableDisplayCard({ type: 17, ...frame,
+      space_id: 'current-space', visibles: ['bot', 'human'], render_profile: 'octo-chat/v1' }))
+  }
+  const first = displayCardParameters(), second = displayCardParameters()
+  assert.deepEqual(first, spec.parameters)
+  first.$defs.block.oneOf[0].properties.type.const = 'unsafe'
+  assert.equal(second.$defs.block.oneOf[0].properties.type.const, 'heading')
+})
+
+test('source display eligibility is bounded and rejects malformed/unknown/workflow trees instead of guessing', () => {
+  const base = { type: 17, ...renderDisplayCard(normalizeDisplayCard(simple), manifest).frame }
+  const bad = [
+    null, { ...base, profile: 'octo/v2' }, { ...base, template_ref: null },
+    { ...base, catalog_provenance: null }, { ...base, transient: false }, { ...base, card_seq: 0 },
+    { ...base, render_profile: 'unknown' }, { ...base, plain: {} },
+    { ...base, card: { ...base.card, body: [1] } },
+    { ...base, card: { ...base.card, body: [{ type: 'constructor' }] } },
+    { ...base, card: { ...base.card, body: Array.from({ length: 201 }, () => ({ type: 'TextBlock', text: 'x' })) } },
+    { ...base, card: { ...base.card, metadata: { octo: { protocol: 'octo-card@1.0' } } } },
+    { ...base, card: { ...base.card, body: [{ type: 'TextBlock', text: 'x', callback: 'run' }] } },
+    { ...base, card: { ...base.card, body: [{ type: 'TextBlock', text: 'x'.repeat(25000) }] } },
+  ]
+  let deep = { type: 'TextBlock', text: 'Deep' }
+  for (let i = 0; i < 30; i++) deep = { type: 'Container', items: [deep] }
+  bad.push({ ...base, card: { ...base.card, body: [deep] } })
+  const cycle = { type: 'Container', items: [] }; cycle.items.push(cycle)
+  bad.push({ ...base, card: { ...base.card, body: [cycle] } })
+  for (const payload of bad) assert.throws(() => assertEditableDisplayCard(payload), { code: 'display_card_message_required' })
+})
+
+test('richtext normalization detaches ordered native text/image blocks, rejects secrets and never truncates', () => {
+  const input = [{ type: 'text', text: 'Before' }, { type: 'image', url: 'https://example.com/image.png', width: 20, height: 10 },
+    { type: 'text', text: 'After' }]
+  const content = normalizeRichtextBlocks(input)
+  assert.deepEqual(content, input)
+  input[0].text = 'Changed'
+  assert.equal(content[0].text, 'Before')
+  const accepted = normalizeRichtextBlocks(Array.from({ length: 20 }, (_, i) => ({ type: 'text', text: 'Line ' + i })))
+  assert.equal(accepted.length, 20)
+  assert.throws(() => normalizeRichtextBlocks([...accepted, { type: 'text', text: 'Overflow' }]), { code: 'invalid_richtext' })
+  assert.throws(() => normalizeRichtextBlocks([{ type: 'text', text: 'sk-' }, { type: 'text', text: 'abcdefghijklmnopqrstuv' }]),
+    { code: 'display_card_sensitive_content' })
+  for (const image of [
+    { width: NaN }, { height: Infinity }, { width: 1.5 }, { height: 16385 }, { size: -1 },
+    { name: '中'.repeat(54) }, { data: 'raw' }, { url: 'https://user:pass@example.com/a' },
+  ]) assert.throws(() => normalizeRichtextBlocks([{ ...input[1], ...image }]))
+  const getter = { type: 'text' }
+  Object.defineProperty(getter, 'text', { get() { throw new Error('must not read') } })
+  assert.throws(() => normalizeRichtextBlocks([getter]), { code: 'invalid_richtext' })
 })

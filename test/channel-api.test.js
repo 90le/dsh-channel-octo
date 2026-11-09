@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ChannelApi, ChannelApiError, CHANNEL_API_OPERATIONS } from '../src/channel-api.js'
+import { sendDisplayCard } from '../src/display-card.js'
 
 const G = '00112233445566778899aabbccddeeff'
 const OTHER = 'ffeeddccbbaa99887766554433221100'
@@ -85,6 +86,7 @@ function fixture(configChanges = {}) {
       return structuredClone(state.messages?.[path.split('/').at(-1)] ?? state.message)
     }
     if (['/v1/bot/message/edit', '/v1/bot/readReceipt'].includes(path)) return structuredClone(state.ack)
+    if (path === '/v1/bot/card/profile') return structuredClone(state.cardProfile ?? editManifest)
     if (path === '/v1/bot/sendMessage') return structuredClone(state.send)
     throw new Error('unexpected request ' + secret)
   }
@@ -1399,5 +1401,384 @@ test('read receipts reject foreign messages, removed requesters and absent ackno
     await denies(f.run('messages.mark_read', args, 'human', topic),
       { sibling: 'message_outside_channel', hidden: 'message_unavailable', removed: 'requester_not_member', ack: 'mutation_unconfirmed' }[change])
     assert.equal(f.writes.length, change === 'ack' ? 1 : 0)
+  }
+})
+
+
+// Independent edit-wire fixtures pinned to octo-server
+// f984d40549f66d56b1e90a048d28315eb12c92df modules/bot_api/send.go
+// (botMessageEdit, ResponseOK), pkg/richtext/plain.go, pkg/cardmsg/provenance.go;
+// openclaw-channel-octo 3cdb7e794ba40ae617fb0215177d1493dd26460a
+// src/api-fetch.ts editCardMessage/sendRichTextMessage and src/types.ts.
+const editManifest = { enabled: true, card_version: '1.5', profiles: ['octo/v1', 'octo/v2'],
+  config: { card_enabled: true, display_enabled: true, interaction_enabled: true },
+  elements: ['TextBlock', 'RichTextBlock', 'FactSet', 'ColumnSet', 'Table', 'Container', 'ActionSet'],
+  actions: ['Action.OpenUrl', 'Action.ToggleVisibility', 'Action.CopyToClipboard'] }
+const originalDisplay = () => ({ type: 17, profile: 'octo/v1', card_version: '1.5', render_profile: 'octo-chat/v1',
+  card: { type: 'AdaptiveCard', version: '1.5', body: [{ type: 'TextBlock', text: 'Original display', wrap: true }] }, plain: 'Original display' })
+const originalRichtext = () => ({ type: 14, content: [{ type: 'text', text: 'Original richtext' }], plain: 'Original richtext' })
+const editContracts = [
+  { op: 'messages.edit_display_card', payload: originalDisplay, format: 'display_card',
+    args: { title: 'Updated', blocks: [{ type: 'facts', items: [{ label: 'State', value: 'Ready' }] }] } },
+  { op: 'messages.edit_richtext', payload: originalRichtext, format: 'richtext', args: { blocks: [
+    { type: 'text', text: 'Updated introduction' },
+    { type: 'image', url: 'https://example.com/image.png', width: 640, height: 480, size: 1024, name: 'Example.png' },
+    { type: 'text', text: 'Closing text' },
+  ] } },
+]
+function editFixture(contract, current = route) {
+  const f = fixture()
+  f.state.message = message({ ...current, payload: contract.payload() })
+  f.editArgs = { message_id: f.state.message.message_id, ...structuredClone(contract.args) }
+  f.edit = (sender = current.channel_type === 1 ? 'human' : 'owner') => f.run(contract.op, f.editArgs, sender, current)
+  return f
+}
+
+test('structured edit exports are closed, mutating schemas; display schema keeps root-relative refs', () => {
+  for (const contract of editContracts) {
+    const def = CHANNEL_API_OPERATIONS.find(item => item.name === contract.op)
+    assert.equal(def.available, true)
+    assert.equal(def.mutating, true)
+    assert.deepEqual(def.parameters.required, ['message_id', 'blocks'])
+    assert.equal(def.parameters.additionalProperties, false)
+  }
+  const display = CHANNEL_API_OPERATIONS.find(item => item.name === 'messages.edit_display_card').parameters
+  assert.equal(display.properties.blocks.items.$ref, '#/$defs/block')
+  assert.equal(display.$defs.block.oneOf.length, 10)
+  assert.ok(Object.isFrozen(display.$defs.block.oneOf))
+})
+
+test('edits use exact official POST/JSON replacement and current DM/group/thread routes, never send or registry', async () => {
+  for (const contract of editContracts) for (const current of [dm, route, topic]) {
+    const f = editFixture(contract, current)
+    // Official DM physical peer ordering is not a caller-selected destination.
+    if (current === dm) f.state.message.channel_id = 'bot@human'
+    const receipt = await f.edit()
+    assert.deepEqual(receipt, { ok: true, message_id: f.editArgs.message_id, format: contract.format,
+      ...(contract.format === 'display_card' && { fallbackBlocks: [], requiresFinalSummary: true }) })
+    assert.ok(Buffer.byteLength(JSON.stringify(receipt)) < 512)
+    assert.equal(f.writes.length, 1)
+    const write = f.writes[0]
+    assert.equal(write.path, '/v1/bot/message/edit')
+    assert.equal(write.method, 'POST')
+    const content = JSON.parse(write.body.content_edit)
+    assert.deepEqual(Object.keys(write.body).sort(), ['channel_id', 'channel_type', 'content_edit', 'message_id'])
+    assert.deepEqual({ ...write.body, content_edit: undefined }, { ...current, message_id: f.editArgs.message_id, content_edit: undefined })
+    if (contract.format === 'richtext') assert.deepEqual(content, { type: 14, content: contract.args.blocks })
+    else {
+      assert.equal(content.type, 17)
+      assert.equal(content.profile, 'octo/v1')
+      assert.equal(content.card.body[1].type, 'FactSet')
+      assert.equal(content.template_ref, undefined)
+    }
+    const expectedRead = current === dm ? '/v1/bot/messages/person/human/' + f.editArgs.message_id
+      : root + (current === topic ? '/threads/' + T : '') + '/messages/' + f.editArgs.message_id
+    assert.equal(f.calls.filter(call => call.path === expectedRead).length, 2)
+    assert.equal(f.calls.at(-2).path, current === dm ? '/v1/bot/messages/sync' : root)
+    assert.ok(f.calls.every(call => call.signal instanceof AbortSignal))
+    assert.equal(f.calls.filter(call => call.path === '/v1/bot/card/profile').length, contract.format === 'display_card' ? 1 : 0)
+  }
+})
+
+test('edit display negotiation matches send construction and refuses unavailable or impossible profiles', async () => {
+  const contract = editContracts[0]
+  for (const limits of [undefined, { max_nodes: 1 }]) {
+    const f = editFixture(contract)
+    f.state.cardProfile = { ...editManifest, elements: ['TextBlock'], actions: [], ...(limits && { limits }) }
+    let sent
+    await sendDisplayCard({ route, args: contract.args, api: {
+      cardProfile: async () => f.state.cardProfile,
+      progressCard: async (_route, frame) => { sent = { type: 17, ...frame }; return '100' },
+    } })
+    const receipt = await f.edit()
+    assert.deepEqual(JSON.parse(f.writes[0].body.content_edit), sent)
+    assert.ok(receipt.fallbackBlocks.includes('facts'))
+  }
+  for (const change of [{ enabled: false }, { config: { card_enabled: true, display_enabled: false } },
+    { profiles: ['octo/v2'] }, { card_version: '2.0' }, { elements: [] }, { limits: { max_payload_bytes: 1 } }]) {
+    const f = editFixture(contract)
+    f.state.cardProfile = { ...editManifest, ...change }
+    await denies(f.edit(), change.limits ? 'display_card_limits_exceeded' : 'display_card_unavailable')
+    assert.equal(f.writes.length, 0)
+  }
+})
+
+test('new edits refuse foreign IDs/routes, hidden/revoked sources, non-bot authors and non-admin requesters', async () => {
+  const cases = [
+    [live => { live.message_id = '99' }, 'message_outside_channel'],
+    [live => { live.channel_id = OTHER }, 'message_outside_channel'],
+    [live => { live.channel_type = 1 }, 'invalid_message_response'],
+    [live => { live.from_uid = 'human' }, 'bot_message_required'],
+    [live => { live.message_seq = 0 }, 'invalid_message_response'],
+    [live => { live.payload.visibles = ['bot'] }, 'message_unavailable'],
+    [live => { live.payload.space_id = 'foreign' }, 'message_unavailable'],
+    [live => { live.payload.event = {} }, 'message_unavailable'],
+    [live => { live.message_extra = { revoke: 1 } }, 'message_unavailable'],
+    [live => { live.extra = { is_deleted: true } }, 'message_unavailable'],
+    [live => { live.revoked = '1' }, 'message_unavailable'],
+  ]
+  for (const contract of editContracts) {
+    for (const [change, code] of cases) {
+      const f = editFixture(contract)
+      change(f.state.message)
+      await denies(f.edit(), code)
+      assert.equal(f.writes.length, 0)
+    }
+    const f = editFixture(contract)
+    await denies(f.edit('human'), 'requester_admin_required')
+    assert.equal(f.writes.length, 0)
+    for (const channel_id of [G, G + '____' + SIBLING, OTHER + '____' + T]) {
+      const f = editFixture(contract, topic)
+      f.state.message.channel_id = channel_id
+      await denies(f.edit(), 'message_outside_channel')
+      assert.equal(f.writes.length, 0)
+    }
+    const deniedDM = editFixture(contract, dm)
+    await denies(deniedDM.edit('owner'), 'requester_not_allowed')
+    assert.equal(deniedDM.writes.length, 0)
+  }
+})
+
+test('structured edits recheck requester/bot/Space/group status after source lookups and card probing', async () => {
+  for (const contract of editContracts) for (const [change, code] of [
+    [state => { state.members = state.members.filter(row => row.uid !== 'owner') }, 'requester_not_member'],
+    [state => { state.members = state.members.filter(row => row.uid !== 'bot') }, 'bot_not_member'],
+    [state => { state.members.find(row => row.uid === 'owner').role = 0 }, 'mutation_permission_changed'],
+    [state => { state.groups[0].space_id = 'other' }, 'group_access_denied'],
+    [state => { state.group.status = 2 }, 'group_not_active'],
+  ]) {
+    const f = editFixture(contract)
+    f.state.intercept = call => {
+      if (call.path.endsWith('/messages/' + f.editArgs.message_id)) change(f.state)
+    }
+    await denies(f.edit(), code)
+    assert.equal(f.writes.length, 0)
+  }
+  const f = editFixture(editContracts[0])
+  f.state.intercept = call => {
+    if (call.path === '/v1/bot/card/profile') f.state.members.find(row => row.uid === 'owner').role = 0
+  }
+  await denies(f.edit(), 'mutation_permission_changed')
+  assert.equal(f.writes.length, 0)
+  for (const contract of editContracts) {
+    const f = editFixture(contract, dm)
+    let checks = 0
+    f.state.intercept = call => {
+      if (call.path === '/v1/bot/messages/sync' && ++checks === 2) throw Object.assign(new Error(secret), { status: 403 })
+    }
+    await denies(f.edit(), 'api_permission_denied')
+    assert.equal(f.writes.length, 0)
+  }
+})
+
+test('live source is re-read: revocation, ownership, visibility and workflow changes during preparation deny writes', async () => {
+  for (const contract of editContracts) for (const [change, code] of [
+    [live => { live.message_extra = { revoke: 1 } }, 'message_unavailable'],
+    [live => { live.from_uid = 'other' }, 'bot_message_required'],
+    [live => { live.payload.visibles = ['other'] }, 'message_unavailable'],
+    [live => { live.message_extra = { content_edit: JSON.stringify({ type: 17, profile: 'octo/v2', card: {} }) } },
+      contract.format === 'display_card' ? 'display_card_message_required' : 'richtext_message_required'],
+  ]) {
+    const f = editFixture(contract)
+    let reads = 0
+    f.state.intercept = call => {
+      if (call.path.endsWith('/messages/' + f.editArgs.message_id) && ++reads === 2) change(f.state.message)
+    }
+    await denies(f.edit(), code)
+    assert.equal(f.writes.length, 0)
+  }
+})
+
+test('original and effective card frames must both be unmanaged v1 displays, even after prior edits', async () => {
+  const denied = [
+    card => { card.profile = 'octo/v2' }, card => { card.profile = 'octo/v3' },
+    card => { card.template_ref = { id: 'ai.reasoning-process', version: '0.4.1' } },
+    card => { card.catalog_provenance = { producer: 'registry' } },
+    card => { card.card.metadata = { octo: { template: { id: 'question' } } } },
+    card => { card.transient = false }, card => { card.card_seq = 4 },
+    card => { card.card.body[0].text = 'DSH 回复进度' },
+    card => { card.card.body[0].text = 'DSH 等待你的回答（1/2）' },
+    card => { card.card.body[0].text = 'DSH 提问回执' },
+    card => { card.card.actions = [{ type: 'Action.Submit', data: { key: 'callback' } }] },
+    card => { card.card.body.push({ type: 'Container', items: [{ type: 'Input.Text', id: 'answer' }] }) },
+    card => { card.card.body[0].selectAction = { type: 'Action.Execute', data: {} } },
+    card => { card.card.body.push({ type: 'ActionSet', actions: [{ type: 'Action.Submit', title: 'Send' }] }) },
+  ]
+  for (const mutate of denied) for (const where of ['original', 'effective']) {
+    const f = editFixture(editContracts[0])
+    const blocked = originalDisplay(); mutate(blocked)
+    f.state.message.payload = where === 'original' ? blocked : originalDisplay()
+    f.state.message.message_extra = { content_edit: JSON.stringify(where === 'effective' ? blocked : originalDisplay()) }
+    await denies(f.edit(), 'display_card_message_required')
+    assert.equal(f.writes.length, 0)
+  }
+  for (const contract of editContracts) {
+    const f = editFixture(contract)
+    f.state.message.payload = Buffer.from(JSON.stringify(contract.payload())).toString('base64')
+    f.state.message.message_extra = { content_edit: JSON.stringify(contract.payload()) }
+    await f.edit()
+    assert.equal(f.writes.length, 1)
+  }
+})
+
+test('typed edits never cross types, including originals disguised by edited text or richtext', async () => {
+  for (const contract of editContracts) for (const type of [1, 8, 14, 17]) {
+    if (type === contract.payload().type) continue
+    const f = editFixture(contract)
+    f.state.message.payload = { type, content: 'Wrong original' }
+    f.state.message.message_extra = { content_edit: JSON.stringify(contract.payload()) }
+    await denies(f.edit(), contract.format === 'display_card' ? 'display_card_message_required' : 'richtext_message_required')
+    assert.equal(f.writes.length, 0)
+  }
+  const f = fixture()
+  f.state.message.payload = originalDisplay()
+  f.state.message.message_extra = { content_edit: '{"type":1,"content":"Disguised"}' }
+  await denies(f.run('messages.edit', { message_id: f.state.message.message_id, text: 'No' }, 'owner'), 'plain_text_message_required')
+  assert.equal(f.writes.length, 0)
+})
+
+test('structured edits reject injected control fields and oversized/unsafe arguments before any requests', async () => {
+  for (const contract of editContracts) {
+    for (const key of ['channel_id', 'channel_type', 'target', 'space_id', 'token', 'path', 'url', 'method', 'sender',
+      'on_behalf_of', 'payload', 'card', 'content_edit', 'plain', 'template_ref', 'card_seq', 'message_seq', 'transient', 'actions']) {
+      const f = editFixture(contract)
+      f.editArgs[key] = secret
+      await denies(f.edit(), 'invalid_arguments')
+      assert.equal(f.calls.length, 0)
+    }
+    for (const value of ['0', '9223372036854775808', '1/other', 100, null]) {
+      const f = editFixture(contract)
+      f.editArgs.message_id = value
+      await denies(f.edit(), 'invalid_arguments')
+      assert.equal(f.calls.length, 0)
+    }
+  }
+  const f = editFixture(editContracts[1])
+  for (const blocks of [[], new Array(1), [{ type: 'text', text: '' }], [{ type: 'text', text: '中'.repeat(1334) }],
+    Array.from({ length: 3 }, () => ({ type: 'text', text: 'x'.repeat(3000) })),
+    [{ type: 'text', text: 'x', mention: { all: 1 } }], [{ type: 'image', url: 'https://example.com/a', width: 0, height: 2 }],
+    [{ type: 'image', url: 'https://example.com/a', width: 1, height: 2, size: 20971521 }],
+    [{ type: 'Action.Submit', text: 'Run' }]]) {
+    f.editArgs.blocks = blocks
+    await denies(f.edit(), 'invalid_richtext')
+  }
+  for (const url of ['http://example.com/a', 'https://127.0.0.1/a', 'https://example.com/?token=hidden', 'file:///private']) {
+    f.editArgs.blocks = [{ type: 'image', url, width: 1, height: 1 }]
+    await denies(f.edit(), 'display_card_unsafe_link')
+  }
+  f.editArgs.blocks = [{ type: 'text', text: secret }]
+  await denies(f.edit(), 'display_card_sensitive_content')
+  assert.equal(f.calls.length, 0)
+  const display = editFixture(editContracts[0])
+  display.editArgs.blocks = [{ type: 'text', text: 'Hi', selectAction: { type: 'Action.Submit' } }]
+  await denies(display.edit(), 'invalid_display_card')
+  assert.equal(display.calls.length, 0)
+})
+
+test('structured edit snapshots nested input and current route before awaits, without invoking top-level accessors', async () => {
+  for (const contract of editContracts) {
+    const current = { ...route }, f = editFixture(contract, current)
+    f.state.intercept = () => {
+      current.channel_id = OTHER
+      f.editArgs.message_id = '99'
+      f.editArgs.blocks[0].type = 'Action.Submit'
+    }
+    await f.edit()
+    assert.equal(f.writes[0].body.channel_id, G)
+    assert.equal(f.writes[0].body.message_id, '9223372036854775806')
+    assert.ok(!f.writes[0].body.content_edit.includes('Action.Submit'))
+    const rejected = editFixture(contract)
+    Object.defineProperty(rejected.editArgs, 'message_id', { get() { throw new Error(secret) } })
+    await denies(rejected.edit(), 'invalid_arguments')
+    assert.equal(rejected.calls.length, 0)
+  }
+})
+
+test('edit acknowledgements are explicit; unknown outcomes never retry, fallback-send or expose response content', async () => {
+  for (const contract of editContracts) {
+    for (const ack of [undefined, null, {}, { ok: true }, { status: 0 }, { status: '200' },
+      { status: 500, body: secret }, { status: 200, error: secret }, { status: 200, ok: false }]) {
+      const f = editFixture(contract)
+      f.state.ack = ack
+      await denies(f.edit(), 'mutation_unconfirmed')
+      assert.equal(f.writes.length, 1)
+    }
+    for (const [status, code] of [[403, 'api_permission_denied'], [409, 'api_conflict'], [429, 'api_rate_limited'],
+      [500, 'mutation_unconfirmed'], [undefined, 'mutation_unconfirmed']]) {
+      const f = editFixture(contract)
+      f.state.intercept = call => { if (call.path === '/v1/bot/message/edit') throw Object.assign(new Error(secret), { status }) }
+      await denies(f.edit(), code)
+      assert.equal(f.writes.length, 1)
+    }
+    const f = editFixture(contract)
+    f.state.ack = { status: 200, content: secret, token: secret, raw: { text: 'x'.repeat(100000) } }
+    assert.ok(JSON.stringify(await f.edit()).length < 512)
+  }
+})
+
+test('abort before edit is a no-write; abort after dispatch is an unknown write, never retried', async () => {
+  for (const contract of editContracts) for (const phase of ['before', 'lookup', 'write']) {
+    const f = editFixture(contract), controller = new AbortController()
+    if (phase === 'before') controller.abort(new Error(secret))
+    f.state.intercept = call => {
+      if (phase === 'lookup' && call.path.endsWith('/messages/' + f.editArgs.message_id)
+        || phase === 'write' && call.path === '/v1/bot/message/edit') controller.abort(new Error(secret))
+    }
+    await denies(f.api.dispatch(route, 'owner', contract.op, f.editArgs, controller.signal), phase === 'write' ? 'mutation_unconfirmed' : 'aborted')
+    assert.equal(f.writes.length, phase === 'write' ? 1 : 0)
+  }
+})
+
+
+test('official GET content_edit objects are honored for typed edits and reads, alongside legacy strings', async () => {
+  for (const contract of editContracts) for (const asString of [false, true]) {
+    const f = editFixture(contract)
+    const effective = contract.payload()
+    if (effective.type === 14) effective.content[0].text = 'Latest object richtext'
+    else { effective.card.body[0].text = 'Latest object card'; effective.plain = 'Latest object card' }
+    f.state.message.message_extra = { content_edit: asString ? JSON.stringify(effective) : effective }
+    const read = await f.run('messages.read', { message_id: f.editArgs.message_id })
+    assert.match(read.text, /Latest object/)
+    await f.edit()
+    assert.equal(f.writes.length, 1)
+  }
+  const f = fixture()
+  f.state.message.message_extra = { content_edit: { type: 1, content: 'Latest plain text' } }
+  await f.run('messages.edit', { message_id: f.state.message.message_id, text: 'Next plain text' }, 'owner')
+  assert.deepEqual(JSON.parse(f.writes[0].body.content_edit), { type: 1, content: 'Next plain text' })
+})
+
+test('official object-shaped current edits cannot hide v2, Registry, deleted, malformed or oversized sources', async () => {
+  for (const [extra, code] of [
+    [{ content_edit: { ...originalDisplay(), profile: 'octo/v2' } }, 'display_card_message_required'],
+    [{ content_edit: { ...originalDisplay(), template_ref: { id: 'form', version: '1' } } }, 'display_card_message_required'],
+    [{ content_edit: { ...originalDisplay(), catalog_provenance: {} } }, 'display_card_message_required'],
+    [{ content_edit: { ...originalDisplay(), visibles: ['bot'] } }, 'invalid_message_response'],
+    [{ content_edit: { ...originalDisplay(), space_id: 'other' } }, 'message_unavailable'],
+    [{ content_edit: { ...originalDisplay(), plain: 'x'.repeat(120001) } }, 'invalid_message_response'],
+    [{ content_edit: [] }, 'invalid_message_response'], [{ content_edit: 0 }, 'invalid_message_response'],
+    [{ is_mutual_deleted: 1 }, 'message_unavailable'],
+  ]) {
+    const f = editFixture(editContracts[0])
+    f.state.message.message_extra = extra
+    await denies(f.edit(), code)
+    assert.equal(f.writes.length, 0)
+  }
+  const f = editFixture(editContracts[0])
+  f.state.message.extra = { content_edit: originalDisplay() }
+  f.state.message.message_extra = { content_edit: { ...originalDisplay(), profile: 'octo/v2' } }
+  await denies(f.edit(), 'invalid_message_response')
+  assert.equal(f.writes.length, 0)
+})
+
+test('new typed edits retain sender/channel allowlists and pinned Space before reads or writes', async () => {
+  for (const contract of editContracts) for (const [settings, current, code] of [
+    [{ senderPolicy: 'allowlist', allowed: ['human'] }, route, 'requester_not_allowed'],
+    [{ channelPolicy: 'allowlist', groups: [], threads: [] }, route, 'route_not_allowed'],
+    [{ channelPolicy: 'allowlist', groups: [G], threads: [] }, topic, 'route_not_allowed'],
+  ]) {
+    const f = fixture(settings)
+    await denies(f.run(contract.op, { message_id: '100', ...contract.args }, 'owner', current), code)
+    assert.equal(f.calls.length, 0)
   }
 })

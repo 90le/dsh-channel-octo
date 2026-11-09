@@ -15,6 +15,15 @@ let questionIndex = 0
 let groupStep = 0
 let groupQuestion
 let groupDisplaySent = false, groupDisplayReceipt = false
+let groupFormAnswered = false, groupFormFeedback = false
+const typedForm = { title: 'Fixture typed form', inputs: [
+  { id: 'note', kind: 'text', label: '说明', required: true },
+  { id: 'amount', kind: 'number', label: '数量', required: true },
+  { id: 'date', kind: 'date', label: '日期', required: true },
+  { id: 'time', kind: 'time', label: '时间', required: true },
+  { id: 'flag', kind: 'toggle', label: '开关', required: true },
+  { id: 'pick', kind: 'choice', label: '多选', required: true, multi: true, options: [{ title: '甲', value: 'a' }, { title: '乙', value: 'b' }] },
+], actions: [{ id: 'submit', label: '提交' }] }
 const groupDisplayForm = { title: 'Fixture summary', blocks: [
   { type: 'text', text: 'Group work completed.' },
   { type: 'facts', items: [{ label: 'Status', value: 'Ready' }] },
@@ -161,7 +170,7 @@ globalThis.fetch = async (input, init) => {
       return json({ status: 200 })
     }
     if (url.pathname.endsWith('/card/profile')) return json({
-      enabled: true, card_version: '1.5', profiles: ['octo/v1', 'octo/v2'], inputs: ['Input.ChoiceSet'],
+      enabled: true, card_version: '1.5', profiles: ['octo/v1', 'octo/v2'], inputs: ['Input.Text', 'Input.Number', 'Input.Date', 'Input.Time', 'Input.Toggle', 'Input.ChoiceSet'],
       elements: ['TextBlock', 'FactSet', 'Table', 'TableRow', 'TableCell'],
       config: { card_enabled: true, display_enabled: true, interaction_enabled: true, reasoning_enabled: true,
         reasoning_template_ref: { id: 'ai.reasoning-process', version: '0.4.1' } },
@@ -170,6 +179,13 @@ globalThis.fetch = async (input, init) => {
     })
     if (url.pathname.endsWith('/message/edit')) {
       const body = JSON.parse(init.body)
+      if (groupToolsSmoke && body.message_id === '505' && body.content_edit) {
+        const frame = JSON.parse(body.content_edit)
+        if (body.channel_id !== group || body.channel_type !== 2 || frame.card.actions?.length || !frame.plain.includes('表单答案已交给 DSH')) return new Response(null, { status: 400 })
+        groupFormFeedback = true
+        console.log('FIXTURE_TYPED_FORM_FEEDBACK')
+        return json({})
+      }
       if (ownerSmoke && body.content_edit && Number(body.message_id) >= 501
         && Number(body.message_id) <= (groupToolsSmoke ? 504 : 503)) {
         const frame = JSON.parse(body.content_edit)
@@ -216,6 +232,16 @@ globalThis.fetch = async (input, init) => {
         if (body.channel_id !== (inGroup ? group : 'fixture-user') || body.channel_type !== (inGroup ? 2 : 1)
           || !body.payload.card.actions?.[0]?.data) return new Response(null, { status: 400 })
         const index = ++questionIndex, id = 500 + index, eventId = String(900 + index)
+        if (inGroup && body.payload.plain === typedForm.title) {
+          if (index !== 5 || groupStep !== 5 || body.payload.card.body.filter(n => n.type.startsWith('Input.')).length !== 6) return new Response(null, { status: 400 })
+          setTimeout(() => questionEvents.set('907', { event_id: '907', event_type: 'card_action', event_data: {
+            message_id: '505', action_id: 'submit', space_id: 'fixture-space', operator_uid: 'fixture-user',
+            channel_id: group, channel_type: 2, data: body.payload.card.actions[0].data,
+            inputs: { note: 'typed answer', amount: '2.5', date: '2028-02-29', time: '12:30', flag: 'true', pick: 'a,b' },
+          } }), 300).unref()
+          console.log('FIXTURE_TYPED_FORM_SENT')
+          return json({ message_id: id })
+        }
         const event = { event_id: eventId, event_type: 'card_action', event_data: {
           message_id: String(id), action_id: 'answer', space_id: 'fixture-space', operator_uid: 'fixture-user',
           channel_id: body.channel_id, channel_type: body.channel_type,
@@ -287,7 +313,7 @@ globalThis.fetch = async (input, init) => {
         return new Response(null, { status: 400 })
       }
       if (groupToolsSmoke && sent === 2 && (!groupQuestion?.answered || !groupQuestion?.writeCompleted
-        || !groupDisplaySent || !groupDisplayReceipt)) {
+        || !groupDisplaySent || !groupDisplayReceipt || !groupFormAnswered)) {
         console.error('FIXTURE_GROUP_FINAL_BEFORE_TOOLS')
         return new Response(null, { status: 400 })
       }
@@ -369,7 +395,7 @@ globalThis.fetch = async (input, init) => {
         if (!groupQuestion.writeCompleted) console.log('FIXTURE_GROUP_WRITE_OK')
         groupQuestion.writeCompleted = true
       }
-      if (groupToolsSmoke && groupStep === 4) {
+      if (groupToolsSmoke && groupStep >= 4) {
         const result = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
           .find(part => part.type === 'tool_result' && part.tool_use_id === 'toolu_fixture_group_octo_display_card')
         const text = typeof result?.content === 'string' ? result.content
@@ -384,14 +410,25 @@ globalThis.fetch = async (input, init) => {
         groupDisplayReceipt = true
         console.log('FIXTURE_GROUP_DISPLAY_RECEIPT_OK')
       }
-      if (groupStep < (groupToolsSmoke ? 4 : 1)) {
+      if (groupToolsSmoke && groupStep === 5) {
+        const result = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+          .find(part => part.type === 'tool_result' && part.tool_use_id === 'toolu_fixture_group_octo_form')
+        const text = typeof result?.content === 'string' ? result.content : (result?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
+        let answer; try { answer = JSON.parse(text) } catch {}
+        if (result?.is_error || !groupFormFeedback || answer?.action !== 'submit' || answer.values?.note !== 'typed answer'
+          || answer.values.amount !== 2.5 || answer.values.flag !== true || answer.values.date !== '2028-02-29'
+          || answer.values.time !== '12:30' || JSON.stringify(answer.values.pick) !== '["a","b"]') return new Response(null, { status: 400 })
+        groupFormAnswered = true
+        console.log('FIXTURE_TYPED_FORM_ANSWERED')
+      }
+      if (groupStep < (groupToolsSmoke ? 5 : 1)) {
         const step = groupStep++
-        const name = ['octo_members', 'ask_user_question', 'write', 'octo_display_card'][step]
+        const name = ['octo_members', 'ask_user_question', 'write', 'octo_display_card', 'octo_form'][step]
         const id = 'toolu_fixture_group_' + (step === 0 ? 'members' : name)
         const args = [{}, { questions: [{ id: 'fixture-group-choice', question: 'Continue with the group file?', options: [
           { label: 'Fixture group answer', description: 'Write the group file' },
           { label: 'Wrong callback answer', description: 'Must not be accepted' },
-        ] }] }, { file_path: 'group-tool-fixture.txt', content: 'group native tools executed' }, groupDisplayForm][step]
+        ] }] }, { file_path: 'group-tool-fixture.txt', content: 'group native tools executed' }, groupDisplayForm, typedForm][step]
         const frames = [
           { type: 'message_start', message: { id: 'fixture-group-tool', model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
           { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id, name, input: {} } },

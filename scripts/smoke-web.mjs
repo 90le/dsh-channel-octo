@@ -463,7 +463,7 @@ export function apply(ctx) {
     if (groupToolsSmoke && (readFileSync(join(home, 'group-tool-fixture.txt'), 'utf8') !== 'group native tools executed'
       || ['FIXTURE_GROUP_QUESTION_SENT', 'FIXTURE_GROUP_INVALID_CALLBACKS_IGNORED', 'FIXTURE_GROUP_QUESTION_ANSWERED',
         'FIXTURE_ANSWER_FEEDBACK=504', 'FIXTURE_GROUP_WRITE_OK', 'FIXTURE_GROUP_DISPLAY_CARD_OK=700',
-        'FIXTURE_GROUP_DISPLAY_RECEIPT_OK', 'FIXTURE_GROUP_FINAL_OK'].some(marker => !output.includes(marker))
+        'FIXTURE_GROUP_DISPLAY_RECEIPT_OK', 'FIXTURE_GROUP_FINAL_OK', 'FIXTURE_TYPED_FORM_SENT', 'FIXTURE_TYPED_FORM_FEEDBACK', 'FIXTURE_TYPED_FORM_ANSWERED'].some(marker => !output.includes(marker))
       || /FIXTURE_GROUP_INVALID_CALLBACK_ACCEPTED|FIXTURE_QUESTION_FEEDBACK_MISMATCH|FIXTURE_GROUP_DISPLAY_(?:CARD_MISMATCH|RECEIPT_WRONG)/.test(output))) {
       throw new Error('Group native question/write/display-card/final roundtrip failed: '
         + output.replace(/https?:\/\/\S+/g, '[url]').slice(-2000))
@@ -475,6 +475,8 @@ export function apply(ctx) {
         || !rows[0].session_id || rows[0].session_id !== rows[1].session_id) throw new Error('File and follow-up did not share one confirmed reply')
       if (groupToolsSmoke) {
         const final = db.prepare("SELECT session_id FROM jobs WHERE message_id='3' AND state='sent'").get()
+        const formAnswer = db.prepare("SELECT session_id,state,input FROM jobs WHERE message_id='card_action:907'").get()
+        if (formAnswer?.session_id !== final?.session_id || formAnswer?.state !== 'ignored' || formAnswer?.input !== '') throw new Error('Typed form lost its waiting native turn')
         const answers = db.prepare("SELECT message_id,sender,channel_type,channel_id,session_id,state FROM jobs WHERE message_id IN ('card_action:904','card_action:905','card_action:906')").all()
         const card = db.prepare("SELECT claimed,binding FROM card_bindings WHERE message_id='504'").get()
         if (!final?.session_id || answers.length !== 1 || answers[0].message_id !== 'card_action:906'

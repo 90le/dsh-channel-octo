@@ -10,6 +10,7 @@ import { channelView, loadSettings } from './web.js'
 import { normalizeImControls } from './im-controls.js'
 import { Worker } from './worker.js'
 import { sessionExists } from './session-state.js'
+import { botCommandMenu, setBotCommands } from './bot-commands.js'
 
 const legacy = 'legacy'
 const textOnly = 'text-only'
@@ -546,6 +547,30 @@ export class Accounts {
       runtime.record = next
       await this.changeConnection(runtime)
       return this.overview()
+    })
+  }
+
+  updateBotCommands(accountId, input) {
+    return this.locked(async () => {
+      this.checkRevision(input)
+      if (!input || typeof input !== 'object' || Array.isArray(input)
+        || Object.keys(input).some(key => !['revision', 'action'].includes(key))) fail('invalid_bot_commands')
+      botCommandMenu(input.action)
+      const record = this.record(accountId)
+      const runtime = this.runtimes.get(accountId)
+      if (!runtime?.settings?.config) fail('channel_not_configured')
+      if (runtime.changing) fail('account_transition')
+      // Pausing reception does not remove the native menu. Both operations
+      // remain explicit and available for a configured, paused account.
+      let token
+      try { token = await this.tokenFor(record) } catch { fail('invalid_bot_token') }
+      if (!validToken(token)) fail('invalid_bot_token')
+      const identity = await this.identify(token)
+      if (!sameBot(identity, record)) fail('bot_identity_mismatch')
+      const botCommands = await setBotCommands({ apiBase: this.endpoint, token, fetchImpl: this.fetchImpl },
+        input.action, this.lifetime.signal)
+      this.revision = id()
+      return { ...this.overview(), botCommands }
     })
   }
 

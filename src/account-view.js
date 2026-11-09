@@ -106,12 +106,63 @@ const caption = {
   remove: ['移除账号', 'Remove account'],
   confirmRemove: ['确定移除这个账号？已有 DSH 会话和历史记录会保留。', 'Remove this account? Existing DSH sessions and history will remain.'],
   failedOptions: ['无法读取账号设置选项。', 'Could not load account settings.'],
+  commandMenu: ['Octo 命令菜单', 'Octo command menu'],
+  publishMenu: ['发布菜单', 'Publish menu'], clearMenu: ['清空菜单', 'Clear menu'],
+  menuHint: ['发布会替换此 Bot 的全部现有菜单；命令权限仍按当前设置。', 'Publishing replaces this bot’s entire menu. Command permissions still follow current settings.'],
+  confirmPublish: ['确认替换现有菜单？', 'Replace the existing menu?'],
+  confirmClear: ['确认清空此 Bot 的全部命令菜单？', 'Clear this bot’s entire command menu?'],
+  confirmMenu: ['确认', 'Confirm'],
+  menuPublished: ['命令菜单已发布。', 'Command menu published.'],
+  menuCleared: ['命令菜单已清空。', 'Command menu cleared.'],
+  menuUnavailable: ['账号配置不可用，无法修改菜单。', 'Account configuration is unavailable.'],
+  bot_commands_failed: ['未收到 Octo 的成功确认，请检查菜单后再试。', 'Octo did not confirm success. Check the menu before retrying.'],
+  invalid_bot_commands: ['菜单操作无效，请重新打开设置。', 'Invalid menu action. Reopen settings.'],
+  account_not_found: ['账号已移除，请刷新。', 'This account was removed. Refresh the page.'],
+  channel_not_configured: ['账号配置不可用，请先检查连接。', 'Check this account’s connection settings first.'],
+}
+
+export function createBotCommandMenu(React, { Button }) {
+  const { createElement: h, useRef, useState } = React
+  return function BotCommandMenu({ lang, disabled, busy, perform }) {
+    const tr = key => caption[key]?.[lang === 'zh' ? 0 : 1] || caption.failure[lang === 'zh' ? 0 : 1]
+    const [action, setAction] = useState('')
+    const [working, setWorking] = useState(false)
+    const [notice, setNotice] = useState(null)
+    const pending = useRef(false)
+    const blocked = disabled || busy || working
+    const confirm = async () => {
+      if (blocked || pending.current || !['publish', 'clear'].includes(action)) return
+      pending.current = true
+      setWorking(true)
+      setNotice(null)
+      try {
+        await perform(action)
+        setNotice({ text: tr(action === 'publish' ? 'menuPublished' : 'menuCleared') })
+      } catch (error) { setNotice({ error: true, text: tr(error?.message) }) }
+      finally { pending.current = false; setWorking(false); setAction('') }
+    }
+    return h('section', { className: 'dsho-account-footer', 'aria-label': tr('commandMenu') },
+      h('strong', null, tr('commandMenu')),
+      h('p', { className: 'dsho-account-note' }, '/help · /status · /new · /card · /choose'),
+      h('p', { className: 'dsho-account-note' }, tr(disabled ? 'menuUnavailable' : 'menuHint')),
+      h('div', { className: 'dsho-account-buttons' }, ...['publish', 'clear'].map(kind =>
+        h(Button, { key: kind, type: 'button', variant: 'outline', size: 'sm', disabled: !!blocked,
+          onClick: () => { if (!blocked) { setAction(kind); setNotice(null) } } }, tr(kind === 'publish' ? 'publishMenu' : 'clearMenu')))),
+      action && h('div', { className: 'dsho-account-buttons' },
+        h('span', null, tr(action === 'publish' ? 'confirmPublish' : 'confirmClear')),
+        h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!blocked, onClick: confirm }, tr('confirmMenu')),
+        h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!(busy || working),
+          onClick: () => setAction('') }, tr('cancel'))),
+      working && h('p', { role: 'status', className: 'dsho-account-note' }, tr('processing')),
+      notice && h('p', { role: notice.error ? 'alert' : 'status', className: notice.error ? 'dsho-alert' : 'dsho-account-note' }, notice.text))
+  }
 }
 
 export function createAccountView(React, primitives, { request, status, label }) {
   const { createElement: h, useEffect, useId, useRef, useState } = React
   const { Button, Switch } = primitives
   const Editor = createAccountEditor(React, primitives)
+  const BotCommandMenu = createBotCommandMenu(React, primitives)
   const talk = lang => key => Object.hasOwn(caption, key) ? caption[key][lang === 'zh' ? 0 : 1] : ''
   const send = (suffix, method, body) => request(suffix, {
     method, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
@@ -159,6 +210,7 @@ export function createAccountView(React, primitives, { request, status, label })
       return () => controller.abort()
     }, [])
     const perform = async (method, suffix, body, finish = false) => {
+      if (pending.current) throw new Error('account_transition')
       pending.current = true
       setBusy(true)
       try {
@@ -205,6 +257,8 @@ export function createAccountView(React, primitives, { request, status, label })
             { revision: revision.current })),
           onRemove: account && (() => { setConfirming(true); return false }),
         }),
+      account && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
+        perform: action => perform('POST', endpoint(account.id) + '/commands', { action, revision: revision.current }) }),
       confirming && h(ConfirmRemove, { tr, onClose: () => setConfirming(false),
         remove: () => perform('POST', endpoint(account.id) + '/remove', { revision: revision.current }, true) }))
   }

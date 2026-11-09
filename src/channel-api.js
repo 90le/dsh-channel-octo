@@ -1,6 +1,8 @@
 import { validUid } from './config.js'
 import { ruleScope } from './rules.js'
 import { normalizeOctoContent } from './octo-content.js'
+import { displayCardParameters, normalizeDisplayCard, renderDisplayCard,
+  assertEditableDisplayCard, normalizeRichtextBlocks } from './display-card.js'
 
 // Bot-token contracts: octo-server f984d405, modules/bot_api/{groups,threads,
 // sync,send,search_route}.go; modules/message/api_message_get.go. This module
@@ -49,6 +51,37 @@ const freeze = value => {
     Object.freeze(value)
   }
   return value
+}
+
+// Official edit contract pins (reviewed local source, no live calls):
+// octo-server f984d40549f66d56b1e90a048d28315eb12c92df:
+//   modules/bot_api/bot_api.go /message/edit + /card/profile;
+//   modules/bot_api/send.go botMessageEdit: own message, full content_edit,
+//   no message_seq, ResponseOK status=200, no raw Registry takeover;
+//   modules/message/api.go newMessageExtraResp: content_edit is a JSON object;
+//   pkg/richtext/plain.go NormalizeContentEdit: type=14 text/image blocks;
+//   pkg/cardmsg/{provenance,profiles}.go: Registry markers and v1/v2 identity.
+// openclaw-channel-octo 3cdb7e794ba40ae617fb0215177d1493dd26460a:
+//   src/api-fetch.ts editCardMessage/sendRichTextMessage, src/types.ts RichTextBlock.
+// This narrower API never takes OBO, template_ref, card_seq or raw card trees.
+const displayEditParameters = displayCardParameters()
+displayEditParameters.properties = { message_id: messageID, ...displayEditParameters.properties }
+displayEditParameters.required = ['message_id', ...displayEditParameters.required]
+const richtextBlocks = { type: 'array', minItems: 1, maxItems: 20, items: { oneOf: [
+  schema({ type: { const: 'text' }, text }, ['type', 'text']),
+  schema({ type: { const: 'image' }, url: { type: 'string', minLength: 1, maxLength: 2048, pattern: '^https://' },
+    width: { type: 'integer', minimum: 1, maximum: 16384 }, height: { type: 'integer', minimum: 1, maximum: 16384 },
+    name: { type: 'string', minLength: 1, maxLength: 160 }, size: { type: 'integer', minimum: 0, maximum: 20 * 1024 * 1024 } },
+  ['type', 'url', 'width', 'height']),
+] } }
+const structuredEdits = new Set(['messages.edit_richtext', 'messages.edit_display_card'])
+// Only helpers with static error codes run here; no upstream error text is exposed.
+const displayWork = fn => {
+  try { return fn() } catch (error) {
+    const allowed = ['invalid_display_card', 'display_card_sensitive_content', 'display_card_unsafe_link',
+      'display_card_unavailable', 'display_card_limits_exceeded', 'display_card_message_required', 'invalid_richtext']
+    fail(allowed.includes(error?.code) ? error.code : 'invalid_arguments')
+  }
 }
 
 /** Ordinary JSON schemas; callers should mount only available operations. */
@@ -111,6 +144,10 @@ export const CHANNEL_API_OPERATIONS = freeze([
       all: { type: 'boolean' } }, ['text']), true),
   spec('messages.edit', 'Edit a bot-authored plain text message in this channel; group requester must be owner/admin.',
     schema({ message_id: messageID, text }, ['message_id', 'text']), true),
+  spec('messages.edit_richtext', 'Replace an already-sent bot-authored type-14 richtext message in the current conversation. Group requester must be owner/admin. Supply ordered text/image blocks; images require public HTTPS URLs and dimensions. Max 20 blocks, 8 KiB total UTF-8 content, 24 KiB payload. No uploads, mentions or raw payload. Returns only a confirmed edit receipt; never retry an unconfirmed write automatically.',
+    schema({ message_id: messageID, blocks: richtextBlocks }, ['message_id', 'blocks']), true),
+  spec('messages.edit_display_card', 'Replace an already-sent bot-authored octo/v1 display card in the current conversation. Group requester must be owner/admin. Uses the same bounded title/blocks and live capability negotiation as octo_display_card. No progress, question, callback, v2 or Registry cards; no raw actions. Max 6 block levels, 200 objects, 8 KiB UTF-8 content and 24 KiB payload. Returns only a confirmed receipt; still provide a short final summary. Never retry an unconfirmed edit automatically.',
+    displayEditParameters, true),
   spec('messages.mark_read', 'Mark specified current-channel messages as read by the bot and clear the bot unread count; does not act as the requester.',
     schema({ message_ids: { type: 'array', items: messageID, minItems: 1, maxItems: 10, uniqueItems: true } }, ['message_ids']), true),
   spec('voice.context.read', 'Owner DM only: read personal voice-correction context in the bot server-selected primary Space, not group/thread settings.'),
@@ -413,7 +450,7 @@ export class ChannelApi {
     return { ok: true, version: raw.version }
   }
 
-  #message(raw, scope, sender, details = false) {
+  #message(raw, scope, sender, details = false, editType) {
     if (!object(raw) || !id(raw.message_id) || !seq(raw.message_seq) || !validUid(raw.from_uid)
       || raw.channel_type !== scope.route.channel_type) fail('invalid_message_response')
     const channel = scope.route.channel_id
@@ -431,11 +468,39 @@ export class ChannelApi {
     if (!object(payload) || payload.event != null || payload.space_id != null && payload.space_id !== this.#config.spaceId) fail('message_unavailable')
     if (payload.visibles != null && (!Array.isArray(payload.visibles)
       || payload.visibles.length > 0 && !payload.visibles.includes(sender))) fail('message_unavailable')
+    const checkEditSource = value => {
+      if (value.type !== editType) fail(editType === 17 ? 'display_card_message_required'
+        : editType === 14 ? 'richtext_message_required' : 'plain_text_message_required')
+      if (editType === 17) displayWork(() => assertEditableDisplayCard(value))
+    }
+    if (editType) {
+      checkEditSource(payload) // Original identity cannot be laundered by content_edit.
+      for (const extra of [raw, raw.extra, raw.message_extra]) {
+        if (!extra) continue
+        if (['revoke', 'revoked', 'is_deleted', 'is_mutual_deleted'].some(key => extra[key] != null && ![0, false].includes(extra[key]))) fail('message_unavailable')
+      }
+      if (raw.extra?.content_edit && raw.message_extra?.content_edit
+        && JSON.stringify(raw.extra.content_edit) !== JSON.stringify(raw.message_extra.content_edit)) fail('invalid_message_response')
+    }
     const edited = raw.message_extra?.content_edit ?? raw.extra?.content_edit
-    if (edited) {
-      if (typeof edited !== 'string' || edited.length > 120000) fail('invalid_message_response')
-      try { payload = JSON.parse(edited) } catch { payload = { type: 1, content: edited } }
+    if (edited != null && edited !== '') {
+      // Official GET (newMessageExtraResp) decodes content_edit into an object.
+      // Older transports expose the stored JSON string. Accept both, bounded;
+      // never mistake an effective v2/Registry frame for the original v1 card.
+      if (object(edited)) {
+        let encoded
+        try { encoded = JSON.stringify(edited) } catch { fail('invalid_message_response') }
+        if (typeof encoded !== 'string' || Buffer.byteLength(encoded, 'utf8') > 120000) fail('invalid_message_response')
+        payload = JSON.parse(encoded)
+      } else {
+        if (typeof edited !== 'string' || edited.length > 120000) fail('invalid_message_response')
+        try { payload = JSON.parse(edited) } catch { payload = { type: 1, content: edited } }
+      }
       if (!object(payload) || payload.visibles != null || payload.event != null) fail('invalid_message_response')
+    }
+    if (editType) {
+      if (payload.space_id != null && payload.space_id !== this.#config.spaceId) fail('message_unavailable')
+      checkEditSource(payload)
     }
     const normalized = normalizeOctoContent(payload, { allowFiles: details })
     const attachments = normalized?.attachment ? [normalized.attachment] : normalized?.attachments ?? []
@@ -449,12 +514,12 @@ export class ChannelApi {
       })), attachments_truncated: attachments.length > 2 }) }
   }
 
-  async #readMessage(scope, sender, messageId, signal, details = false) {
+  async #readMessage(scope, sender, messageId, signal, details = false, editType) {
     if (!id(messageId)) fail('invalid_arguments')
     const base = scope.group ? scope.root + (scope.thread ? '/threads/' + scope.thread : '')
       : '/v1/bot/messages/person/' + encodeURIComponent(scope.route.channel_id)
     const path = scope.group ? base + '/messages/' + messageId : base + '/' + messageId
-    const result = this.#message(await this.#call(path, undefined, signal), scope, sender, details)
+    const result = this.#message(await this.#call(path, undefined, signal), scope, sender, details, editType)
     if (result.message_id !== messageId) fail('message_outside_channel')
     return result
   }
@@ -536,7 +601,25 @@ export class ChannelApi {
   async dispatch(route, sender, operation, args = {}, signal = new AbortController().signal) {
     const definition = specs.get(operation)
     if (!definition) fail('unknown_operation')
-    validate(args, definition.parameters)
+    const structuredEdit = structuredEdits.has(operation)
+    let prepared
+    if (structuredEdit) {
+      // The recursive display DSL and richtext union use their bounded runtime
+      // normalizers, not this module's flat-schema validator. Reject top-level
+      // accessors/symbols/extra fields before reading or awaiting anything.
+      if (!object(args) || ![Object.prototype, null].includes(Object.getPrototypeOf(args))
+        || Reflect.ownKeys(args).some(key => typeof key !== 'string' || !Object.hasOwn(definition.parameters.properties, key)
+          || !Object.hasOwn(Object.getOwnPropertyDescriptor(args, key), 'value'))
+        || !id(args.message_id) || typeof args.message_id !== 'string') fail('invalid_arguments')
+      prepared = displayWork(() => operation === 'messages.edit_display_card'
+        ? normalizeDisplayCard({ ...(args.title !== undefined && { title: args.title }), blocks: args.blocks })
+        : normalizeRichtextBlocks(args.blocks))
+      // The prepared value is already detached. Do not serialize raw input
+      // again (toJSON/accessors or cycles are not a second input channel).
+      args = { message_id: args.message_id }
+      if (!(signal instanceof AbortSignal)) fail('invalid_arguments')
+      signal = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
+    } else validate(args, definition.parameters)
     // Copy admitted inputs before the first await; do not retain mutable model args.
     args = JSON.parse(JSON.stringify(args))
     const search = Object.hasOwn(searchEndpoints, operation)
@@ -548,7 +631,7 @@ export class ChannelApi {
     const voice = operation.startsWith('voice.context.')
     if (voice) this.#requireOwnerDM(scope, sender)
     if (operation === 'groups.create') this.#requireOwner(sender)
-    if (!scope.group && !voice && !search && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
+    if (!scope.group && !voice && !search && !structuredEdit && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
       'messages.mark_read', 'space.members.search', 'groups.create'].includes(operation)) fail('group_required')
     const thread = operation.startsWith('thread.') ? this.#threadPath(scope, args) : undefined
     const access = await this.#access(scope, sender, definition.mutating, signal)
@@ -748,9 +831,45 @@ export class ChannelApi {
       return { ok: true, message_id: id(raw.message_id), ...scope.route, text: payload.content,
         ...(payload.mention && { mention: payload.mention }) }
     }
+    if (structuredEdit) {
+      requireAdmin()
+      const card = operation === 'messages.edit_display_card', type = card ? 17 : 14
+      const readSource = async () => {
+        const source = await this.#readMessage(scope, sender, args.message_id, signal, false, type)
+        if (source.from_uid !== this.#config.botUid) fail('bot_message_required')
+      }
+      await readSource()
+      let payload, fallbackBlocks
+      if (card) {
+        const profile = await this.#call('/v1/bot/card/profile', undefined, signal)
+        const rendered = displayWork(() => renderDisplayCard(prepared, profile))
+        payload = { type: 17, ...rendered.frame }
+        fallbackBlocks = [...rendered.fallbacks]
+      } else payload = { type: 14, content: prepared } // plain is server-owned.
+      const content_edit = JSON.stringify(payload)
+      // Re-read live visibility, ownership and BOTH original/effective types
+      // after probing. Then recheck authorization immediately before mutation.
+      await readSource()
+      const fresh = await this.#access(scope, sender, true, signal)
+      if (scope.group && !admin(fresh.actor)) fail('mutation_permission_changed')
+      if (signal.aborted) fail('aborted')
+      let raw
+      try {
+        raw = await this.#call('/v1/bot/message/edit', { ...scope.route, message_id: args.message_id, content_edit }, signal)
+      } catch (error) {
+        // Abort/timeout/5xx after dispatch can mean the write landed. Never
+        // claim failure/success or retry; preserve only definitive 4xx refusals.
+        if (['api_invalid_request', 'api_authentication_failed', 'api_permission_denied', 'api_not_found',
+          'api_method_not_allowed', 'api_conflict', 'api_rate_limited'].includes(error?.code)) throw error
+        fail('mutation_unconfirmed')
+      }
+      if (raw?.status !== 200) fail('mutation_unconfirmed')
+      return { ok: true, message_id: args.message_id, format: card ? 'display_card' : 'richtext',
+        ...(card && { fallbackBlocks, requiresFinalSummary: true }) }
+    }
     if (operation === 'messages.edit') {
       requireAdmin()
-      const message = await this.#readMessage(scope, sender, args.message_id, signal)
+      const message = await this.#readMessage(scope, sender, args.message_id, signal, false, 1)
       if (message.from_uid !== this.#config.botUid) fail('bot_message_required')
       if (message.type !== 1) fail('plain_text_message_required')
       const fresh = await this.#access(scope, sender, true, signal)

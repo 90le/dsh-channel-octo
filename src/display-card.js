@@ -26,32 +26,42 @@ const record = value => value !== null && typeof value === 'object'
   && [Object.prototype, null].includes(Object.getPrototypeOf(value))
 const shape = (value, keys) => record(value) && Reflect.ownKeys(value).every(key =>
   typeof key === 'string' && keys.includes(key) && Object.hasOwn(Object.getOwnPropertyDescriptor(value, key), 'value'))
-const schema = (properties, required = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false })
-const string = maxLength => ({ type: 'string', minLength: 1, maxLength })
-const enumeration = values => ({ type: 'string', enum: values })
-const array = (items, maxItems) => ({ type: 'array', items, minItems: 1, maxItems })
-const blockList = array({ $ref: '#/$defs/block' }, 20)
-const colors = ['default', 'good', 'warning', 'attention', 'accent']
-const styles = ['default', 'good', 'warning', 'attention', 'emphasis']
-const richSegment = schema({ text: string(1000), bold: { type: 'boolean' }, subtle: { type: 'boolean' },
-  fontType: enumeration(['Default', 'Monospace']), color: enumeration(colors) }, ['text'])
-const variants = {
-  heading: schema({ type: { const: 'heading' }, text: string(2048), size: enumeration(['medium', 'large']) }, ['type', 'text']),
-  text: schema({ type: { const: 'text' }, text: string(2048) }),
-  rich: schema({ type: { const: 'rich' }, segments: array(richSegment, 20) }),
-  facts: schema({ type: { const: 'facts' }, items: array(schema({ label: string(160), value: string(2048) }), 20) }),
-  columns: schema({ type: { const: 'columns' }, columns: array(schema({ blocks: blockList }), 4) }),
-  table: schema({ type: { const: 'table' },
-    columns: array(schema({ width: { type: 'number', exclusiveMinimum: 0, maximum: 100 } }, []), 6),
-    rows: array(schema({ cells: array({ oneOf: [schema({ text: string(2048) }), schema({ blocks: blockList })] }, 6) }), 12),
-    firstRowAsHeader: { type: 'boolean' } }, ['type', 'rows']),
-  link: schema({ type: { const: 'link' }, text: string(160), url: { ...string(2048), pattern: '^https://' } }),
-  group: schema({ type: { const: 'group' }, style: enumeration(styles), blocks: blockList }, ['type', 'blocks']),
-  collapsible: schema({ type: { const: 'collapsible' }, summary: string(160), blocks: blockList,
-    actionLabel: string(80), expandLabel: string(80), collapseLabel: string(80), defaultVisible: { type: 'boolean' } },
-  ['type', 'summary', 'blocks']),
-  copy: schema({ type: { const: 'copy' }, label: string(80), text: string(4096) }, ['type', 'text']),
+// Hoisted and self-contained: ChannelApi also imports this schema through the
+// OctoClient module cycle. Return fresh JSON schemas, never shared mutable data.
+export function displayCardParameters() {
+  const schema = (properties, required = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false })
+  const string = maxLength => ({ type: 'string', minLength: 1, maxLength })
+  const enumeration = values => ({ type: 'string', enum: values })
+  const array = (items, maxItems) => ({ type: 'array', items, minItems: 1, maxItems })
+  const blockList = array({ $ref: '#/$defs/block' }, 20)
+  const colors = ['default', 'good', 'warning', 'attention', 'accent']
+  const styles = ['default', 'good', 'warning', 'attention', 'emphasis']
+  const richSegment = schema({ text: string(1000), bold: { type: 'boolean' }, subtle: { type: 'boolean' },
+    fontType: enumeration(['Default', 'Monospace']), color: enumeration(colors) }, ['text'])
+  const variants = {
+    heading: schema({ type: { const: 'heading' }, text: string(2048), size: enumeration(['medium', 'large']) }, ['type', 'text']),
+    text: schema({ type: { const: 'text' }, text: string(2048) }),
+    rich: schema({ type: { const: 'rich' }, segments: array(richSegment, 20) }),
+    facts: schema({ type: { const: 'facts' }, items: array(schema({ label: string(160), value: string(2048) }), 20) }),
+    columns: schema({ type: { const: 'columns' }, columns: array(schema({ blocks: blockList }), 4) }),
+    table: schema({ type: { const: 'table' },
+      columns: array(schema({ width: { type: 'number', exclusiveMinimum: 0, maximum: 100 } }, []), 6),
+      rows: array(schema({ cells: array({ oneOf: [schema({ text: string(2048) }), schema({ blocks: blockList })] }, 6) }), 12),
+      firstRowAsHeader: { type: 'boolean' } }, ['type', 'rows']),
+    link: schema({ type: { const: 'link' }, text: string(160), url: { ...string(2048), pattern: '^https://' } }),
+    group: schema({ type: { const: 'group' }, style: enumeration(styles), blocks: blockList }, ['type', 'blocks']),
+    collapsible: schema({ type: { const: 'collapsible' }, summary: string(160), blocks: blockList,
+      actionLabel: string(80), expandLabel: string(80), collapseLabel: string(80), defaultVisible: { type: 'boolean' } },
+    ['type', 'summary', 'blocks']),
+    copy: schema({ type: { const: 'copy' }, label: string(80), text: string(4096) }, ['type', 'text']),
+  }
+  return { ...schema({ title: string(160), blocks: blockList }, ['blocks']),
+    $defs: { block: { oneOf: Object.values(variants) } } }
 }
+const variants = Object.fromEntries(displayCardParameters().$defs.block.oneOf.map(value => [value.properties.type.const, value]))
+const richSegment = variants.rich.properties.segments.items
+const colors = richSegment.properties.color.enum
+const styles = variants.group.properties.style.enum
 
 export const spec = {
   name: 'octo_display_card',
@@ -63,8 +73,7 @@ export const spec = {
     + 'Never include secrets, raw logs or private reasoning. Limit nesting to 6 blocks, total objects to 200 and text to 8 KiB UTF-8; field limits also apply in bytes. '
     + 'If display cards are unavailable or content cannot fit, send an ordinary final text reply instead. '
     + 'This tool returns a delivery receipt, NOT a final answer. After success you MUST still produce a short final summary to the user.',
-  parameters: { ...schema({ title: string(160), blocks: blockList }, ['blocks']),
-    $defs: { block: { oneOf: Object.values(variants) } } },
+  parameters: displayCardParameters(),
 }
 
 // The upstream credential-shape guard is deliberately conservative for group-visible output.
@@ -325,6 +334,90 @@ function fits(frame, limits) {
     && bytes(JSON.stringify({ type: 17, ...frame })) <= limits.max_payload_bytes
 }
 
+/** Validate and detach model arguments synchronously, before any asynchronous work. */
+export function normalizeDisplayCard(args) { return normalize(args) }
+
+/** Pure construction shared by sends and edits; no transport or raw action input. */
+export function renderDisplayCard(normalized, profile) {
+  const limits = capabilities(profile)
+  const { frame, fallbacks } = build(normalized, profile)
+  if (!fits(frame, limits)) {
+    // Preserve every accepted character instead of dropping rows, children or copy data.
+    frame.card.body = [textBlock(frame.plain)]
+    fallbacks.add('limits')
+    if (!fits(frame, limits)) fail('display_card_limits_exceeded')
+  }
+  return { frame, fallbacks }
+}
+
+// A source card is intentionally restricted to our display construction subset.
+// Unknown metadata/fields are NOT evidence of a display card. In particular, the
+// server allows raw v1/v2 edits, but this tool must never take over managed cards.
+// octo-server f984d405: pkg/cardmsg/{profiles,provenance,interactive}.go;
+// modules/bot_api/send.go: raw edits reject Registry markers on the original.
+export function assertEditableDisplayCard(payload) {
+  const reject = () => fail('display_card_message_required')
+  if (!shape(payload, ['type', 'profile', 'card_version', 'card', 'plain', 'render_profile', 'space_id', 'visibles'])
+    || payload.type !== 17 || payload.profile !== 'octo/v1' || payload.card_version !== version
+    || payload.render_profile !== undefined && payload.render_profile !== 'octo-chat/v1'
+    || !shape(payload.card, ['type', 'version', 'body']) || payload.card.type !== 'AdaptiveCard'
+    || payload.card.version !== version || !Array.isArray(payload.card.body) || !payload.card.body.length
+    || payload.card.body.some(item => !record(item) || typeof item.type !== 'string')
+    || payload.plain !== undefined && typeof payload.plain !== 'string') reject()
+  const fields = {
+    TextBlock: ['text', 'wrap', 'weight', 'size'], RichTextBlock: ['inlines'],
+    TextRun: ['text', 'weight', 'isSubtle', 'fontType', 'color'], FactSet: ['facts'],
+    ColumnSet: ['columns'], Column: ['width', 'items'], Table: ['columns', 'firstRowAsHeader', 'rows'],
+    TableRow: ['cells'], TableCell: ['items'], Container: ['items', 'style', 'id', 'isVisible'],
+    ActionSet: ['actions', 'id', 'isVisible'], 'Action.OpenUrl': ['title', 'url'],
+    'Action.ToggleVisibility': ['title', 'targetElements'], 'Action.CopyToClipboard': ['title', 'text'],
+  }
+  let nodes = 0, size = 0
+  const walk = (value, depth = 0) => {
+    if (depth > 24 || ++nodes > 2000) reject()
+    if (typeof value === 'string') {
+      size += bytes(value)
+      // Legacy progress/question display frames have no template provenance.
+      if (size > maxPayloadBytes || /DSH (?:回复进度|等待你的回答|提问回执)/u.test(value)) reject()
+    } else if (Array.isArray(value)) {
+      if (value.length > 200) reject()
+      for (const item of value) walk(item, depth + 1)
+    } else if (value && typeof value === 'object') {
+      const keys = value.type === undefined ? ['title', 'value', 'width', 'elementId', 'isVisible']
+        : Object.hasOwn(fields, value.type) ? fields[value.type] : undefined
+      if (!keys || !shape(value, value.type === undefined ? keys : ['type', ...keys])) reject()
+      for (const item of Object.values(value)) walk(item, depth + 1)
+    } else if (value !== null && !['number', 'boolean'].includes(typeof value)) reject()
+  }
+  walk(payload.card.body)
+  if (payload.plain !== undefined) walk(payload.plain)
+}
+
+/** Safe public-image URLs and text for type-14 edits; never fetches media. */
+export function normalizeRichtextBlocks(blocks) {
+  if (!Array.isArray(blocks) || !blocks.length || blocks.length > 20) fail('invalid_richtext')
+  let total = 0
+  const texts = []
+  const text = (value, max) => {
+    if (typeof value !== 'string' || value.length > max || !value.trim() || control.test(value)
+      || bytes(value) > max || (total += bytes(value)) > maxContentBytes) fail('invalid_richtext')
+    safeContent(value)
+    texts.push(value)
+    return value
+  }
+  const content = Array.from(blocks, block => {
+    if (shape(block, ['type', 'text']) && block.type === 'text') return { type: 'text', text: text(block.text, 4000) }
+    if (!shape(block, ['type', 'url', 'width', 'height', 'name', 'size']) || block.type !== 'image'
+      || ![block.width, block.height].every(n => Number.isSafeInteger(n) && n > 0 && n <= 16384)
+      || block.size !== undefined && (!Number.isSafeInteger(block.size) || block.size < 0 || block.size > 20 * 1024 * 1024)) fail('invalid_richtext')
+    return { type: 'image', url: safeUrl(text(block.url, 2048)), width: block.width, height: block.height,
+      ...(block.name !== undefined && { name: text(block.name, 160) }), ...(block.size !== undefined && { size: block.size }) }
+  })
+  if (sensitive(texts.join(''))) fail('display_card_sensitive_content')
+  if (bytes(JSON.stringify({ type: 14, content })) > maxPayloadBytes) fail('invalid_richtext')
+  return content
+}
+
 /**
  * Parent binds an authenticated OctoClient and an already admitted current route
  * {channel_id, channel_type: 1|2|5}, and rechecks tool authority before calling.
@@ -350,14 +443,7 @@ export async function sendDisplayCard({ api, route, args, signal } = {}) {
     fail(active.aborted ? 'display_card_aborted' : 'display_card_probe_failed')
   }
   if (active.aborted) fail('display_card_aborted')
-  const limits = capabilities(profile)
-  const { frame, fallbacks } = build(normalized, profile)
-  if (!fits(frame, limits)) {
-    // Preserve every accepted character instead of dropping rows, children or copy data.
-    frame.card.body = [textBlock(frame.plain)]
-    fallbacks.add('limits')
-    if (!fits(frame, limits)) fail('display_card_limits_exceeded')
-  }
+  const { frame, fallbacks } = renderDisplayCard(normalized, profile)
   if (active.aborted) fail('display_card_aborted')
   let messageId
   try { messageId = await api.progressCard(target, frame, active) } catch (error) {

@@ -1,0 +1,671 @@
+diff --git a/packages/dmworkbase/src/Components/Conversation/historySnapshot.test.ts b/packages/dmworkbase/src/Components/Conversation/historySnapshot.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b4515c3d5128e05e7ca4cbc309e05bfdf052167
+--- /dev/null
++++ b/packages/dmworkbase/src/Components/Conversation/historySnapshot.test.ts
+@@ -0,0 +1,170 @@
++// @vitest-environment node
++import { describe, expect, it } from "vitest"
++import { HistorySnapshot, sameSnapshotMessage, type SnapshotMessage } from "./historySnapshot"
++
++const file = (): SnapshotMessage => ({ messageID: "101", messageSeq: 101, clientMsgNo: "file" })
++const text = (): SnapshotMessage => ({ messageID: "102", messageSeq: 102, clientMsgNo: "text" })
++
++describe("in-flight history snapshot reconciliation", () => {
++    it("retains a distinct live final after the file snapshot without copying older history", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.remember([{ messageID: "1", messageSeq: 1, clientMsgNo: "old" }])
++        snapshot.arrivals.push(text())
++        expect(snapshot.merge([file(), ...snapshot.arrivals]).map(m => m.messageSeq)).toEqual([101, 102])
++    })
++
++    it("deduplicates REST/WS copies even when a client number changes", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        const live = { ...text(), clientMsgNo: "different" }
++        expect(snapshot.merge([file(), text(), live])).toEqual([file(), live])
++    })
++
++    it("accepts positive server sequence as an identity but never conflates empty keys", () => {
++        expect(sameSnapshotMessage({ messageSeq: 102 }, text())).toBe(true)
++        expect(sameSnapshotMessage({ clientMsgNo: "" }, { clientMsgNo: "" })).toBe(false)
++        expect(sameSnapshotMessage({ messageSeq: 0 }, { messageSeq: 0 })).toBe(false)
++        expect(new HistorySnapshot().merge([{}, {}])).toHaveLength(2)
++    })
++
++    it("keeps local deletion tombstones across repeated overlapping-snapshot merges", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.arrivals.push(text())
++        snapshot.remove([text()])
++        expect(snapshot.merge([file(), ...snapshot.arrivals])).toEqual([file()])
++        expect(snapshot.merge([file(), text(), ...snapshot.arrivals])).toEqual([file()])
++    })
++
++    it("does not revive a deleted snapshot row through a stale live alias", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.remember([{ ...text(), clientMsgNo: "server-alias", isDeleted: true }])
++        expect(snapshot.merge([file(), text()])).toEqual([file()])
++    })
++
++    it("retains revocation received before the message has loaded", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.revoke("102", "moderator")
++        expect(snapshot.merge([text()])[0]).toMatchObject({ revoke: true, revoker: "moderator" })
++    })
++
++    it("preserves known revocation when a stale snapshot or live copy says otherwise", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.remember([{ ...text(), revoke: true, revoker: "moderator" }])
++        const merged = snapshot.merge([{ ...text(), revoke: false }, { ...text(), clientMsgNo: "alias" }])
++        expect(merged).toHaveLength(1)
++        expect(merged[0]).toMatchObject({ revoke: true, revoker: "moderator" })
++    })
++
++    it("keeps deletion stronger than revocation across identity aliases", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.remove([{ messageID: "102" }])
++        const merged = snapshot.merge([
++            { messageID: "102", clientMsgNo: "alias", revoke: true },
++            { clientMsgNo: "alias", messageSeq: 102 },
++        ])
++        expect(merged).toEqual([])
++        expect(snapshot.merge([{ messageSeq: 102 }])).toEqual([])
++    })
++
++    it.each([NaN, Infinity, -Infinity, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1, "102" as unknown as number])(
++        "does not use invalid sequence %s as an identity or tombstone alias", seq => {
++            const snapshot = new HistorySnapshot<SnapshotMessage>()
++            expect(sameSnapshotMessage({ messageSeq: seq }, { messageSeq: seq })).toBe(false)
++            expect(snapshot.merge([{ messageSeq: seq }, { messageSeq: seq }])).toHaveLength(2)
++            snapshot.remove([{ messageID: "deleted", messageSeq: seq }])
++            expect(snapshot.merge([{ messageID: "other", messageSeq: seq }])).toHaveLength(1)
++        })
++
++    it("uses safe positive sequence and canonical server ID in comparisons", () => {
++        expect(sameSnapshotMessage({ messageSeq: Number.MAX_SAFE_INTEGER }, { messageSeq: Number.MAX_SAFE_INTEGER })).toBe(true)
++        expect(sameSnapshotMessage({ messageID: "1", messageSeq: 1 }, { messageID: "1", messageSeq: 2 })).toBe(true)
++        const pairs: [SnapshotMessage, SnapshotMessage][] = [
++            [{ messageID: "1", clientMsgNo: "same" }, { messageID: "2", clientMsgNo: "same" }],
++            [{ messageSeq: 1, clientMsgNo: "same" }, { messageSeq: 2, clientMsgNo: "same" }],
++            [{ messageID: "1", messageSeq: 1 }, { messageID: "2", messageSeq: 1 }],
++        ]
++        for (const [a, b] of pairs) {
++            expect(sameSnapshotMessage(a, b)).toBe(false)
++            expect(sameSnapshotMessage(b, a)).toBe(false)
++            expect(new HistorySnapshot().merge([a, b])).toEqual([a, b])
++        }
++    })
++
++    it("still matches valid identities when the sequence is invalid, without mixing key namespaces", () => {
++        expect(sameSnapshotMessage({ clientMsgNo: "c", messageSeq: Infinity }, { clientMsgNo: "c", messageSeq: NaN })).toBe(true)
++        expect(sameSnapshotMessage({ messageID: "1" }, { clientMsgNo: "1" })).toBe(false)
++        expect(sameSnapshotMessage({ messageID: "1" }, { messageSeq: 1 })).toBe(false)
++    })
++
++    it("deduplicates one canonical server ID even if its sequence differs", () => {
++        const a = { messageID: "1", messageSeq: 1, clientMsgNo: "old" }
++        const b = { messageID: "1", messageSeq: 2, clientMsgNo: "new" }
++        expect(new HistorySnapshot().merge([a, b])).toEqual([b])
++    })
++
++    it("joins disjoint groups through a late alias bridge in every input order", () => {
++        const rows = [{ messageID: "1" }, { messageSeq: 1 }, { clientMsgNo: "c", messageID: "1" }, { clientMsgNo: "c", messageSeq: 1 }]
++        for (const order of permutations(rows)) {
++            expect(new HistorySnapshot().merge(order)).toEqual([order[order.length - 1]])
++        }
++    })
++
++    it("never lets a partial alias bridge collapse conflicting server messages", () => {
++        const a = { messageID: "1", messageSeq: 1, clientMsgNo: "a" }
++        const b = { messageID: "2", messageSeq: 2, clientMsgNo: "b" }
++        const bridge = { messageSeq: 1, clientMsgNo: "b" }
++        for (const order of permutations([a, b, bridge])) {
++            const merged = new HistorySnapshot().merge(order)
++            expect(merged).toHaveLength(2)
++            expect(merged).toContain(b)
++            expect(merged.filter(message => message.messageSeq === 1)).toHaveLength(1)
++        }
++    })
++
++    it.each(["deleted", "revoked"])("does not transfer %s state through a reused client number", state => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        const a = { ...file(), clientMsgNo: "same" }
++        const b = { ...text(), clientMsgNo: "same" }
++        if (state === "deleted") snapshot.remove([a])
++        else snapshot.remember([{ ...a, revoke: true, revoker: "moderator" }])
++        for (const input of [[a, b], [b], [a, b]]) {
++            const merged = snapshot.merge(input.map(message => ({ ...message })))
++            const kept = merged.find(message => message.messageID === "102")
++            expect(kept).toBeDefined()
++            expect(kept?.revoke).not.toBe(true)
++            if (state === "deleted") expect(merged.some(message => message.messageID === "101")).toBe(false)
++            else if (input.length > 1) expect(merged.find(message => message.messageID === "101")?.revoke).toBe(true)
++        }
++    })
++
++    it("qualifies learned terminal aliases before a later conflicting arrival", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.remove([{ messageID: "101" }])
++        expect(snapshot.merge([{ ...file(), clientMsgNo: "shared" }])).toEqual([])
++        expect(snapshot.merge([{ ...text(), clientMsgNo: "shared" }])).toHaveLength(1)
++        expect(snapshot.merge([{ messageSeq: 101 }])).toEqual([])
++        expect(snapshot.merge([file()])).toEqual([])
++    })
++
++    it("does not transfer terminal state through conflicting sequence identities", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.revoke("101", "moderator")
++        snapshot.merge([file()])
++        const b = { messageID: "other", messageSeq: 101 }
++        expect(snapshot.merge([b])[0].revoke).not.toBe(true)
++        expect(snapshot.merge([file()])[0].revoke).toBe(true)
++    })
++
++    it("keeps an ambiguous weak tombstone disabled on later merges", () => {
++        const snapshot = new HistorySnapshot<SnapshotMessage>()
++        snapshot.remove([{ clientMsgNo: "same" }])
++        const a = { ...file(), clientMsgNo: "same" }
++        const b = { ...text(), clientMsgNo: "same" }
++        expect(snapshot.merge([a, b])).toEqual([a, b])
++        expect(snapshot.merge([b])).toEqual([b])
++    })
++})
++
++function permutations<T>(items: T[]): T[][] {
++    if (items.length === 0) return [[]]
++    return items.flatMap((item, index) => permutations(items.filter((_, i) => i !== index)).map(rest => [item, ...rest]))
++}
+diff --git a/packages/dmworkbase/src/Components/Conversation/historySnapshot.ts b/packages/dmworkbase/src/Components/Conversation/historySnapshot.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..73b32b5133d91fac531675d7c52f4d50df23076f
+--- /dev/null
++++ b/packages/dmworkbase/src/Components/Conversation/historySnapshot.ts
+@@ -0,0 +1,150 @@
++/** Request-scoped reconciliation only: never copy the entire old history window. */
++export interface SnapshotMessage {
++    clientMsgNo?: string
++    messageID?: string
++    messageSeq?: number
++    isDeleted?: boolean
++    revoke?: boolean
++    revoker?: string
++}
++
++function validSeq(seq: number | undefined): seq is number {
++    return typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0
++}
++
++function keys(message: SnapshotMessage): string[] {
++    const result: string[] = []
++    if (message.clientMsgNo) result.push(`client:${message.clientMsgNo}`)
++    if (message.messageID) result.push(`id:${message.messageID}`)
++    if (validSeq(message.messageSeq)) result.push(`seq:${message.messageSeq}`)
++    return result
++}
++
++export function sameSnapshotMessage(a: SnapshotMessage, b: SnapshotMessage): boolean {
++    // A weaker key cannot override a disagreement between stronger identities.
++    if (a.messageID && b.messageID) return a.messageID === b.messageID
++    if (validSeq(a.messageSeq) && validSeq(b.messageSeq)) return a.messageSeq === b.messageSeq
++    return !!a.clientMsgNo && a.clientMsgNo === b.clientMsgNo
++}
++
++type Entry = { message: SnapshotMessage; index: number }
++
++function groupByAliases(entries: Entry[], ignored: Set<string>): Entry[][] {
++    const groups: Array<{ entries: Entry[]; aliases: Set<string> }> = []
++    for (const entry of entries) {
++        const aliases = new Set(keys(entry.message).filter(key => !ignored.has(key)))
++        const members = [entry]
++        // Existing groups have disjoint alias sets. Newly acquired aliases cannot
++        // hit an already skipped group, so a single reverse pass is sufficient.
++        for (let i = groups.length - 1; i >= 0; i--) {
++            if ([...aliases].some(key => groups[i].aliases.has(key))) {
++                for (const key of groups[i].aliases) aliases.add(key)
++                members.push(...groups[i].entries)
++                groups.splice(i, 1)
++            }
++        }
++        groups.push({ entries: members, aliases })
++    }
++    return groups.map(group => group.entries)
++}
++
++function identities(entries: Entry[]) {
++    return {
++        ids: new Set(entries.map(entry => entry.message.messageID).filter((id): id is string => !!id)),
++        seqs: new Set(entries.map(entry => entry.message.messageSeq).filter(validSeq)),
++    }
++}
++
++/** Shared by overlapping requests; discarded when the owning request settles. */
++export class HistorySnapshot<T extends SnapshotMessage> {
++    readonly arrivals: T[] = []
++    // Preserve identity context: flat tombstone aliases could delete an unrelated
++    // message that reuses a client number. Ambiguous aliases stay disabled for
++    // this request chain, even if only one of the conflicting rows arrives again.
++    private terminal = new Map<string, SnapshotMessage>()
++    private ambiguous = new Set<string>()
++
++    remember(messages: readonly SnapshotMessage[]): void {
++        for (const message of messages) {
++            if (!message.isDeleted && !message.revoke) continue
++            const identity = {
++                clientMsgNo: message.clientMsgNo || undefined,
++                messageID: message.messageID || undefined,
++                messageSeq: validSeq(message.messageSeq) ? message.messageSeq : undefined,
++            }
++            if (keys(identity).length === 0) continue
++            const key = JSON.stringify(identity)
++            const previous = this.terminal.get(key)
++            this.terminal.set(key, {
++                ...identity,
++                isDeleted: message.isDeleted || previous?.isDeleted,
++                revoke: message.revoke || previous?.revoke,
++                revoker: message.revoker ?? previous?.revoker,
++            })
++        }
++    }
++
++    remove(messages: readonly SnapshotMessage[]): void {
++        this.remember(messages.map(message => ({
++            messageID: message.messageID, messageSeq: message.messageSeq,
++            clientMsgNo: message.clientMsgNo, isDeleted: true,
++        })))
++    }
++
++    revoke(messageID: string, revoker?: string): void {
++        if (messageID) this.remember([{ messageID, revoke: true, revoker }])
++    }
++
++    merge(messages: readonly T[]): T[] {
++        this.remember(messages)
++        const entries: Entry[] = messages.map((message, index) => ({ message, index }))
++        entries.push(...Array.from(this.terminal.values(), message => ({ message, index: -1 })))
++        let groups = groupByAliases(entries, this.ambiguous)
++        let ignoredCount = this.ambiguous.size
++        for (const group of groups) {
++            const { ids, seqs } = identities(group)
++            if (ids.size > 1 || seqs.size > 1) {
++                // Do not guess which server message an ambiguous client belongs to.
++                for (const { message } of group) {
++                    if (message.clientMsgNo) this.ambiguous.add(`client:${message.clientMsgNo}`)
++                }
++            }
++        }
++        if (this.ambiguous.size !== ignoredCount) groups = groupByAliases(entries, this.ambiguous)
++        ignoredCount = this.ambiguous.size
++        for (const group of groups) {
++            if (identities(group).ids.size > 1) {
++                // Server ID is canonical when sequence itself has conflicting IDs.
++                for (const { message } of group) {
++                    if (validSeq(message.messageSeq)) this.ambiguous.add(`seq:${message.messageSeq}`)
++                }
++            }
++        }
++        if (this.ambiguous.size !== ignoredCount) groups = groupByAliases(entries, this.ambiguous)
++        const result: Array<{ message: T; index: number }> = []
++        for (const group of groups) {
++            const index = Math.max(...group.map(entry => entry.index))
++            const deleted = group.some(entry => entry.message.isDeleted)
++            const revoked = group.some(entry => entry.message.revoke)
++            const revoker = group.find(entry => entry.message.revoke && entry.message.revoker !== undefined)?.message.revoker
++            if (deleted || revoked) {
++                const { ids, seqs } = identities(group)
++                // Qualify learned aliases so future collisions cannot inherit state.
++                this.remember(group.map(({ message }) => ({
++                    messageID: message.messageID || (ids.size === 1 ? [...ids][0] : undefined),
++                    messageSeq: validSeq(message.messageSeq) ? message.messageSeq : (seqs.size === 1 ? [...seqs][0] : undefined),
++                    clientMsgNo: message.clientMsgNo,
++                    isDeleted: deleted, revoke: revoked, revoker,
++                })))
++            }
++            if (deleted || index < 0) continue
++            const message = messages[index]
++            if (revoked) {
++                message.revoke = true
++                message.revoker = revoker
++            }
++            result.push({ message, index })
++        }
++        return result.sort((a, b) => a.index - b.index).map(entry => entry.message)
++    }
++}
+diff --git a/packages/dmworkbase/src/Components/Conversation/vm.ts b/packages/dmworkbase/src/Components/Conversation/vm.ts
+index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84a800a2f9 100644
+--- a/packages/dmworkbase/src/Components/Conversation/vm.ts
++++ b/packages/dmworkbase/src/Components/Conversation/vm.ts
+@@ -66,6 +66,7 @@ import {
+ } from "../../im-runtime/readAttentionHost";
+ import { captureCurrentImConversationSyncContext } from "../../im-runtime/conversationSyncContext";
+ import { isSummaryTipContent } from "../../Messages/SummaryNotify/protocol";
++import { HistorySnapshot, sameSnapshotMessage } from "./historySnapshot";
+ 
+ export interface FoldSessionParticipant {
+     uid: string
+@@ -205,6 +206,8 @@ export default class ConversationVM extends ProviderListener {
+     pullupHasMore: boolean = false // 上拉是否有更多
+     pulldownFinished: boolean = false // 下拉完成
+     pendingMessages: MessageWrap[] = [] // 缓冲区：pullupHasMore 期间收到的实时消息
++    private historySyncVersion = 0
++    private historySync?: { journal: HistorySnapshot<MessageWrap>; preserveWindow: boolean }
+     messageContainerId = `viewport-${ConversationVM.nextMessageContainerSeq++}` // 消息容器的ID
+     static sendQueue: Map<string, Array<MessageWrap>> = new Map() // 发送队列
+     static foldSessionPreview: Map<string, { participants: string[], count: number }> = new Map() // 会话列表折叠预览缓存
+@@ -813,13 +816,15 @@ export default class ConversationVM extends ProviderListener {
+ 
+     // 仅仅删除本地消息
+     async deleteMessagesFromLocal(deletedMessages: Message[]): Promise<void> {
+-
++        this.historySync?.journal.remove(deletedMessages)
++        this.pendingMessages = this.pendingMessages.filter(message =>
++            !deletedMessages.some(deleted => sameSnapshotMessage(message, deleted)))
+         let messages = this.messagesOfOrigin
+         let newMessages = new Array()
+         for (const message of messages) {
+             let exist = false
+             for (const deletedMessage of deletedMessages) {
+-                if (deletedMessage.clientMsgNo === message.clientMsgNo) {
++                if (sameSnapshotMessage(message, deletedMessage)) {
+                     exist = true
+                     this.removeSendingMessageIfNeed(deletedMessage.clientSeq, deletedMessage.channel)
+                     if (this.lastMessage?.clientMsgNo === deletedMessage.clientMsgNo) {
+@@ -1098,6 +1103,7 @@ export default class ConversationVM extends ProviderListener {
+             const cmdContent = message.content as CMDContent
+             const param = cmdContent.param
+             if (cmdContent.cmd === 'messageRevoke') { //消息撤回
++                this.historySync?.journal.revoke(String(param.message_id || ""), message.fromUID)
+                 let existMessage = this.findMessageWithMessageID(param.message_id)
+                 if (existMessage) {
+                     existMessage.revoke = true
+@@ -1158,6 +1164,8 @@ export default class ConversationVM extends ProviderListener {
+ 
+         WKApp.endpointManager.setMethod(EndpointID.clearChannelMessages, (channel: Channel) => {
+             if (channel.isEqual(this.channel)) {
++                this.invalidateHistorySnapshot()
++                this.pendingMessages = []
+                 if (this.messagesOfOrigin.length > 0) {
+                     this.browseToMessageSeq = this.messagesOfOrigin[this.messagesOfOrigin.length - 1].messageSeq
+                 }
+@@ -1293,6 +1301,7 @@ export default class ConversationVM extends ProviderListener {
+     }
+ 
+     didUnMount(): void {
++        this.invalidateHistorySnapshot()
+         this.readSyncRevision++
+         this.readSyncDisposed = true
+         this.pendingUnreadClearSeq = undefined
+@@ -1437,6 +1446,7 @@ export default class ConversationVM extends ProviderListener {
+             this.showScrollToBottomBtn = false
+             await this.refreshNewMsgCount({ reconcileRead: true })
+         } else {
++            this.showScrollToBottomBtn = false // Explicit jump-to-latest may scroll after its fetch.
+             return this.requestMessagesOfFirstPage(0)
+         }
+ 
+@@ -1736,6 +1746,9 @@ export default class ConversationVM extends ProviderListener {
+             return
+         }
+         for (const messageExtra of messageExtras) {
++            if (messageExtra.revoke) {
++                this.historySync?.journal.revoke(messageExtra.messageID, messageExtra.revoker)
++            }
+             this.updateReplyMessageContent(messageExtra)
+             const message = this.findMessageWithMessageID(messageExtra.messageID)
+             if (message) {
+@@ -1878,8 +1891,18 @@ export default class ConversationVM extends ProviderListener {
+ 
+     // 向列表追加消息
+     appendMessage(messageWrap: MessageWrap) {
++        if (this.historySync && this.historySync.journal.merge([messageWrap]).length === 0) return
++        // Persisted arrivals only; removed typing placeholders must not be replayed.
++        if (messageWrap.messageSeq > 0) this.historySync?.journal.arrivals.push(messageWrap)
+         const senderIsSelf = messageWrap.fromUID === WKApp.loginInfo.uid
+         this.updateLastMessageIfNeed(messageWrap)
++        // A locate request owns the viewport, even before its response sets pullupHasMore.
++        if (this.historySync?.preserveWindow) {
++            if (messageWrap.contentType === MessageContentTypeConst.typing) return
++            this.pendingMessages.push(messageWrap)
++            this.notifyListener()
++            return
++        }
+         if (this.pullupHasMore) {
+             // 缓存消息，等 pullupHasMore 变 false 后追加，避免消息丢失 (#246)
+             this.pendingMessages.push(messageWrap)
+@@ -1897,13 +1920,8 @@ export default class ConversationVM extends ProviderListener {
+             this.pendingMessages = []
+         }
+         // 去重：避免实时消息与历史拉取竞态导致同一条消息重复出现
+-        // clientMsgNo/messageID 为主键，messageSeq > 0 时额外用 seq 兜底（防止不同 clientMsgNo 的同一条消息重复）
+-        const msgKey = messageWrap.clientMsgNo || messageWrap.messageID?.toString()
+-        const alreadyExists = this.messagesOfOrigin.some(m => {
+-            if (msgKey && (m.clientMsgNo || m.messageID?.toString()) === msgKey) return true
+-            if (messageWrap.messageSeq > 0 && m.messageSeq === messageWrap.messageSeq) return true
+-            return false
+-        })
++        // 与历史合并使用相同身份规则，避免重复 clientMsgNo 吞掉另一条服务端消息。
++        const alreadyExists = this.messagesOfOrigin.some(m => sameSnapshotMessage(m, messageWrap))
+         if (!alreadyExists) {
+             this.messagesOfOrigin.push(messageWrap)
+         }
+@@ -2128,6 +2146,46 @@ export default class ConversationVM extends ProviderListener {
+         return 0
+     }
+ 
++    private beginHistorySnapshot(preserveWindow: boolean): number {
++        const journal = this.historySync?.journal || new HistorySnapshot<MessageWrap>()
++        journal.remember([...this.messagesOfOrigin, ...this.pendingMessages])
++        this.historySync = { journal, preserveWindow }
++        return ++this.historySyncVersion
++    }
++
++    private invalidateHistorySnapshot(): void {
++        this.historySyncVersion++
++        this.historySync = undefined
++        this.loading = false
++    }
++
++    private mergeHistorySnapshot(messages: MessageWrap[], remoteMessages: Message[]): MessageWrap[] {
++        const sync = this.historySync
++        if (!sync) return messages
++        // Remember tombstones before filtering: an older live copy must not revive them.
++        sync.journal.remember(this.toMessageWraps(remoteMessages))
++        const merged = this.sortMessages(sync.journal.merge([
++            ...messages, ...this.pendingMessages, ...sync.journal.arrivals,
++        ]))
++        if (!sync.preserveWindow) {
++            this.pendingMessages = []
++            const latestSeq = Math.max(this.conversationLastMessageSeq(), this.lastMessage?.messageSeq || 0)
++            if (latestSeq > 0 && merged.some(message => message.messageSeq >= latestSeq)) {
++                this.pullupHasMore = false
++            }
++            return merged
++        }
++        const seqs = remoteMessages.map(message => message.messageSeq).filter(seq => seq > 0)
++        const firstSeq = seqs.length ? Math.min(...seqs) : 0
++        const lastSeq = seqs.length ? Math.max(...seqs) : 0
++        const inWindow = (message: MessageWrap) => messages.some(other => sameSnapshotMessage(message, other))
++            || (firstSeq > 0 && message.messageSeq >= firstSeq && message.messageSeq <= lastSeq)
++        this.pendingMessages = merged.filter(message => !inWindow(message)
++            && (!message.messageSeq || message.messageSeq > lastSeq))
++        if (this.pendingMessages.length > 0) this.pullupHasMore = true
++        return merged.filter(inWindow)
++    }
++
+     // 同步消息
+     async syncMessages(
+         initMessageSeq?: number,
+@@ -2135,6 +2193,7 @@ export default class ConversationVM extends ProviderListener {
+         locateOffsetY: number = 0,
+         highlightLocatedMessage: boolean = false,
+     ) {
++        const version = this.beginHistorySnapshot(!!initMessageSeq && initMessageSeq > 0)
+         this.loading = true
+         this.liveFoldRevokeClientMsgNos.clear()
+         this.notifyListener()
+@@ -2158,10 +2217,13 @@ export default class ConversationVM extends ProviderListener {
+             }
+         }
+         const remoteMessages = await WKApp.conversationProvider.syncMessages(this.channel, opts).catch((error) => {
++            if (version !== this.historySyncVersion) return
++            this.historySync = undefined
+             this.loading = false
+             this.notifyListener()
+             throw error
+         })
++        if (version !== this.historySyncVersion) return
+ 
+         const newMessages = new Array<Message>()
+         if (remoteMessages && remoteMessages.length > 0) {
+@@ -2186,12 +2248,10 @@ export default class ConversationVM extends ProviderListener {
+         } else {
+             this.pullupHasMore = false;
+         }
+-        // 首页加载完成后 flush 缓冲的实时消息 (#246)
+-        if (!this.pullupHasMore && this.pendingMessages.length > 0) {
+-            allMessages = [...allMessages, ...this.pendingMessages]
+-            allMessages = this.sortMessages(allMessages)
+-            this.pendingMessages = []
+-        }
++        allMessages = this.mergeHistorySnapshot(allMessages, remoteMessages || [])
++        const scrollBottom = !this.historySync?.preserveWindow && !this.pullupHasMore
++            && !this.showScrollToBottomBtn
++        this.historySync = undefined
+         let initMessage: MessageWrap | undefined
+         if (initMessageSeq && initMessageSeq > 0) {
+             for (const message of allMessages) {
+@@ -2206,7 +2266,7 @@ export default class ConversationVM extends ProviderListener {
+         }
+ 
+         this.messagesOfOrigin = allMessages
+-        this.refreshAndLocateMessages(allMessages, initMessage, true, () => {
++        this.refreshAndLocateMessages(allMessages, initMessage, scrollBottom, () => {
+             this.loading = false
+             if (stateCallback) {
+                 stateCallback()
+@@ -2214,7 +2274,7 @@ export default class ConversationVM extends ProviderListener {
+             // loading 完成后，主动确保 bot 消息的 channelInfo 已载入
+             // 修复：loading 期间 channelInfoListener 会被跳过，导致 AI 标识不显示
+             this.ensureBotChannelInfos()
+-        }, locateOffsetY)
++        }, locateOffsetY, () => version === this.historySyncVersion)
+     }
+ 
+     async requestMessagesAroundMessageSeq(messageSeq: number, stateCallback?: () => void) {
+@@ -2225,6 +2285,7 @@ export default class ConversationVM extends ProviderListener {
+             return
+         }
+ 
++        const version = this.beginHistorySnapshot(true)
+         this.loading = true
+         this.initLocateMessageSeq = 0
+         this.liveFoldRevokeClientMsgNos.clear()
+@@ -2246,10 +2307,13 @@ export default class ConversationVM extends ProviderListener {
+             WKApp.conversationProvider.syncMessages(this.channel, olderOpts),
+             WKApp.conversationProvider.syncMessages(this.channel, newerOpts),
+         ]).catch((error) => {
++            if (version !== this.historySyncVersion) return [[], []]
++            this.historySync = undefined
+             this.loading = false
+             this.notifyListener()
+             throw error
+         })
++        if (version !== this.historySyncVersion) return
+         const toAvailableMessageWraps = (remoteMessages?: Message[]) => {
+             const messages = new Array<Message>()
+             if (remoteMessages && remoteMessages.length > 0) {
+@@ -2287,13 +2351,12 @@ export default class ConversationVM extends ProviderListener {
+             this.pullupHasMore = newerRemoteCount >= newerOpts.limit
+         }
+ 
+-        if (!this.pullupHasMore && this.pendingMessages.length > 0) {
+-            allMessages = this.sortMessages([...allMessages, ...this.pendingMessages])
+-            this.pendingMessages = []
+-        }
++        allMessages = this.mergeHistorySnapshot(allMessages, [...(olderRemoteMessages || []), ...(newerRemoteMessages || [])])
++        this.historySync = undefined
+ 
+         this.messagesOfOrigin = allMessages
+         this.refreshMessages(this.messagesOfOrigin, () => {
++            if (version !== this.historySyncVersion) return
+             this.loading = false
+             if (stateCallback) {
+                 stateCallback()
+@@ -2349,8 +2412,9 @@ export default class ConversationVM extends ProviderListener {
+     }
+ 
+     // 刷新消息列表并定位到某条消息
+-    refreshAndLocateMessages(messages: MessageWrap[], locateMessage?: MessageWrap, scrollBottom?: boolean, callback?: () => void, locateOffsetY: number = 0) {
++    refreshAndLocateMessages(messages: MessageWrap[], locateMessage?: MessageWrap, scrollBottom?: boolean, callback?: () => void, locateOffsetY: number = 0, isCurrent: () => boolean = () => true) {
+         this.refreshMessages(messages, () => {
++            if (!isCurrent()) return
+             if (locateMessage) {
+                 this.scrollToMessage(locateMessage, locateOffsetY)
+             } else if (scrollBottom) {
+@@ -2466,6 +2530,7 @@ export default class ConversationVM extends ProviderListener {
+         const previousScrollTop = viewport?.scrollTop || 0
+         const previousScrollHeight = viewport?.scrollHeight || 0
+ 
++        const version = this.historySyncVersion
+         this.loading = true
+         const opts = new SyncMessageOptions()
+         opts.limit = WKApp.config.pageSizeOfMessage
+@@ -2473,10 +2538,12 @@ export default class ConversationVM extends ProviderListener {
+         opts.startMessageSeq = minMessage.messageSeq - 1
+ 
+         let remoteMessages = await WKApp.conversationProvider.syncMessages(this.channel, opts).catch((error) => {
++            if (version !== this.historySyncVersion) return []
+             this.loading = false
+             this.notifyListener()
+             throw error
+         })
++        if (version !== this.historySyncVersion) return
+         const newMessages = new Array<Message>()
+         if (remoteMessages && remoteMessages.length > 0) {
+             remoteMessages.forEach(msg => {
+@@ -2492,6 +2559,7 @@ export default class ConversationVM extends ProviderListener {
+         this.messagesOfOrigin = ConversationVM.deduplicateMessages(this.messagesOfOrigin)
+         this.messagesOfOrigin = this.sortMessages(this.messagesOfOrigin)
+         this.refreshMessages(this.messagesOfOrigin, () => {
++            if (version !== this.historySyncVersion) return
+             const nextViewport = document.getElementById(this.messageContainerId) as HTMLElement | null
+             if (nextViewport) {
+                 nextViewport.scrollTop = getPulldownRestoredScrollTop({
+@@ -2515,6 +2583,7 @@ export default class ConversationVM extends ProviderListener {
+             return
+         }
+ 
++        const version = this.historySyncVersion
+         this.loading = true
+         const opts = new SyncMessageOptions()
+         opts.limit = WKApp.config.pageSizeOfMessage
+@@ -2522,10 +2591,12 @@ export default class ConversationVM extends ProviderListener {
+         opts.startMessageSeq = maxMessage.messageSeq
+ 
+         let remoteMessages = await WKApp.conversationProvider.syncMessages(this.channel, opts).catch((error) => {
++            if (version !== this.historySyncVersion) return []
+             this.loading = false
+             this.notifyListener()
+             throw error
+         })
++        if (version !== this.historySyncVersion) return
+         const newMessages = new Array<Message>()
+         if (remoteMessages && remoteMessages.length > 0) {
+             remoteMessages.forEach(msg => {
+@@ -2548,7 +2619,7 @@ export default class ConversationVM extends ProviderListener {
+         this.messagesOfOrigin = ConversationVM.deduplicateMessages(this.messagesOfOrigin)
+         this.refreshAndLocateMessages(this.messagesOfOrigin, undefined, false, () => {
+             this.loading = false
+-        })
++        }, 0, () => version === this.historySyncVersion)
+     }
+ 
+     // 获取当前消息列表的最小序列号的消息
+@@ -2642,7 +2713,7 @@ export default class ConversationVM extends ProviderListener {
+     distinctMessages(messages: Array<MessageWrap>) {
+         for (let i = 0; i < messages.length; i++) {
+             for (let j = i + 1; j < messages.length; j++) {
+-                if (messages[i].clientMsgNo && messages[i].clientMsgNo !== '' && messages[i].clientMsgNo === messages[j].clientMsgNo) {
++                if (sameSnapshotMessage(messages[i], messages[j])) {
+                     messages.splice(j, 1)
+                     j--;
+                 }

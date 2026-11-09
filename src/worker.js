@@ -11,6 +11,7 @@ import { finalMentions, textSegments, hasMarkdown, boundedMarkdown, mentionGuida
 import { CHANNEL_API_OPERATIONS as operationSpecs } from './channel-api.js'
 import { spec as displayCardSpec, sendDisplayCard } from './display-card.js'
 import { voiceTool } from './voice-tool.js'
+import { formToolSpec } from './form-tool.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
@@ -92,6 +93,18 @@ export class Worker {
     this.host = host
   }
 
+  liveToolAllowed(job, config = this.config) {
+    return this.config === config && config.toolPermission !== 'text-only' && authorizedTools(config, job)
+      && permitsRoute(config, job.sender, job.channel_type, job.channel_id ?? job.sender)
+  }
+
+  async liveToolAccess(job, signal) {
+    const config = this.config
+    if (!this.liveToolAllowed(job, config) || !await this.api.allowsMessage(config, job, signal)
+      || !this.liveToolAllowed(job, config)) throw new Error('octo_access_denied')
+    return config
+  }
+
   pause(stopIntake = false) {
     this.paused = true
     this.stopIntake = stopIntake
@@ -100,7 +113,9 @@ export class Worker {
 
   acceptInbound(eventId, message) {
     const question = !message.attachment && !message.attachments?.length && !message.command && message.text.trim() && this.questions.match(message)
-    if (question && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
+    if (question && this.config.toolPermission !== 'text-only'
+      && permitsRoute(this.config, message.sender, message.channelType, message.channelId)
+      && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
       if (this.store.rememberAnswer(eventId, message, question.sessionId)) this.questions.text(question, message.text)
       return
     }
@@ -159,7 +174,7 @@ export class Worker {
       const action = parseCardAction(event)
       if (action) {
         const binding = this.store.cardBinding(action.messageId)
-        const selection = resolveCardAction(event, binding, this.config)
+        const selection = resolveCardAction(event, binding, this.config, Date.now(), { reportInvalidInputs: !!binding?.questionKey })
         if (selection && permitsRoute(this.config, selection.operatorUid, selection.route.channel_type, selection.route.channel_id)) {
           const message = {
             messageId: 'card_action:' + id, sender: selection.operatorUid, channelId: selection.route.channel_id,
@@ -167,8 +182,12 @@ export class Worker {
           }
           if (binding.questionKey) {
             const pending = this.questions.match(message)
-            if (pending?.key === binding.questionKey && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
-              if (this.store.claimCard(selection, message, pending.sessionId ?? null)) this.questions.card(pending, binding.questionKey, selection.selection)
+            if (pending?.key === binding.questionKey && this.config.toolPermission !== 'text-only'
+              && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
+              if (this.store.claimCard(selection, message, pending.sessionId ?? null)) {
+                if (selection.invalidInputs) await this.questions.rejectCard(pending)
+                else this.questions.card(pending, binding.questionKey, selection.selection, selection)
+              }
             } else if (this.store.claimCard(selection, message, null)) {
               // A restart or completed wait must visibly retire the old form.
               await this.questions.closeCard(binding, '这次提问的等待已结束，答案未交给 DSH。请重新发起提问。', signal)
@@ -365,8 +384,14 @@ export class Worker {
                         || ['space.members.search', 'groups.create'].includes(spec.name)))).map(spec => ({
                   name: 'octo_' + spec.name.replaceAll('.', '_'), description: spec.description, parameters: spec.parameters,
                 })),
-                  displayCardSpec, ...(voice ? [voice.spec] : [])],
+                  displayCardSpec, ...(voice ? [voice.spec] : []), ...(toolsAllowed ? [formToolSpec] : [])],
+                waitNames: toolsAllowed ? [formToolSpec.name] : [],
                 execute: (name, args, toolSignal) => {
+                  if (name === formToolSpec.name) return (async () => {
+                    const current = await this.liveToolAccess(job, toolSignal)
+                    return this.questions.form(args, { ...job, session_id: session.session_id }, current, toolSignal,
+                      waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), () => this.liveToolAllowed(job, current))
+                  })()
                   if (name === voice?.spec.name) return (async () => {
                     if (!this.config.allowFiles || this.config.toolPermission === 'text-only'
                       || !await this.api.allowsMessage(this.config, job, toolSignal)) throw new Error('octo_access_denied')
@@ -383,9 +408,11 @@ export class Worker {
                   return this.api.channel.dispatch(route, job.sender, operation.name, args, toolSignal)
                 }, guidance: mentionGuidance,
               } }),
-              ...(toolsAllowed && { onQuestion: (questions, askSignal) => this.questions.ask(questions,
-                { ...job, session_id: session.session_id }, config, askSignal,
-                waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' })) }),
+              ...(toolsAllowed && { onQuestion: async (questions, askSignal) => {
+                const current = await this.liveToolAccess(job, askSignal)
+                return this.questions.ask(questions, { ...job, session_id: session.session_id }, current, askSignal,
+                  waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), () => this.liveToolAllowed(job, current))
+              } }),
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
               ...(toolsAllowed && config.transport === 'websocket'
                 && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })

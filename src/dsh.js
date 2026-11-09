@@ -49,6 +49,12 @@ export class DshHost {
       let channelNames = new Set()
       if (extras.channelTools?.specs?.length) {
         const mounted = mountChannelTools(scoped, { ...extras.channelTools, signal,
+          execute: async (name, args, toolSignal) => {
+            const waiting = extras.channelTools.waitNames?.includes(name)
+            if (waiting) deadline.pause()
+            try { return await extras.channelTools.execute(name, args, toolSignal) }
+            finally { if (waiting) deadline.resume() }
+          },
           isActive: () => authority.active && !authority.mixed && !signal.aborted })
         cleanup.push(mounted)
         channelNames = new Set(mounted.names)

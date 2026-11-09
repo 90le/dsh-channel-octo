@@ -86,6 +86,7 @@ const accountErrors = {
   workspace_unavailable: 400, model_unavailable: 400, reasoning_unavailable: 400, permission_unavailable: 400,
   permission_requires_allowlist: 400, settings_changed: 409, channel_not_configured: 409,
   transport_managed_by_host: 400, invalid_settings: 400, settings_not_saved: 500,
+  invalid_bot_commands: 400, bot_commands_failed: 502,
 }
 
 export function registerWeb(ctx, accounts) {
@@ -118,7 +119,7 @@ export function registerWeb(ctx, accounts) {
         if (req.method === 'POST' && target === path + '/accounts/verify') {
           return send(200, await accounts.verify(input?.token))
         }
-        const match = /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})(?:\/(settings|state|diagnose|reconnect|remove))?$/.exec(target)
+        const match = /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})(?:\/(settings|state|diagnose|reconnect|remove|commands))?$/.exec(target)
         if (req.method === 'PUT' && (target === path + '/settings' || match?.[2] === 'settings')) {
           return send(200, await accounts.saveRules(match?.[1], input))
         }
@@ -126,6 +127,7 @@ export function registerWeb(ctx, accounts) {
         if (req.method === 'POST' && match?.[2] === 'diagnose') return send(200, await accounts.diagnose(match[1]))
         if (req.method === 'POST' && match?.[2] === 'reconnect') return send(200, await accounts.reconnect(match[1], input))
         if (req.method === 'POST' && match?.[2] === 'remove') return send(200, await accounts.remove(match[1], input))
+        if (req.method === 'POST' && match?.[2] === 'commands') return send(200, await accounts.updateBotCommands(match[1], input))
         if (req.method === 'POST' && target === path + '/accounts' || req.method === 'PUT' && match && !match[2]) {
           return send(200, await accounts.save(match?.[1], input))
         }

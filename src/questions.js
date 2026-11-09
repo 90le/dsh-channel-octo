@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { sendCard, createCard } from './octo-cards.js'
+import { cardInputValues } from './card-inputs.js'
 
 const cut = (value, max) => typeof value === 'string'
   ? Array.from(value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').trim()).slice(0, max).join('') : ''
@@ -33,8 +34,60 @@ function presentation(question, index, total) {
   return { title, text: [...prompt, ...labels, help].join('\n') }
 }
 
+function formInstructions(form) {
+  const example = JSON.stringify({ action: form.actions[0].id, values: Object.fromEntries(form.inputs.map(input => [input.id,
+    input.kind === 'number' ? 1 : input.kind === 'date' ? '2026-01-01' : input.kind === 'time' ? '09:00'
+      : input.kind === 'toggle' ? false : input.kind === 'choice' ? input.options[0].value : '填写答案'])) })
+  return [form.title, form.text, ...form.inputs.map(input => input.label + ' [' + input.id + ']：' + input.kind
+    + (input.options ? ' ' + input.options.map(o => o.title + '=' + o.value).join(' / ') : '')),
+  '请按此 JSON 格式填写并回复：' + example + '。多选值用逗号分隔；也可回复「跳过」。',
+  '操作：' + form.actions.map(action => action.label + '=' + action.id).join(' / ')].filter(Boolean).join('\n')
+}
+function checkAccess(authorize) { if (authorize() !== true) throw new Error('octo_access_denied') }
+
 export class QuestionBridge {
   constructor({ api, store, log }) { Object.assign(this, { api, store, log }) }
+
+  async form(form, job, config, signal, onWaiting, authorize = () => true) {
+    checkAccess(authorize)
+    if (this.current) throw new Error('octo_question_busy')
+    form = structuredClone(form)
+    createCard(form) // Validate the entire form before waiting or sending anything.
+    if (!form.inputs?.length || !form.actions?.length) throw new Error('invalid_card_form')
+    const wait = AbortSignal.any([signal, AbortSignal.timeout(15 * 60_000)])
+    wait.throwIfAborted()
+    const response = Promise.withResolvers()
+    void response.promise.catch(() => {})
+    const stop = () => response.reject(wait.reason)
+    wait.addEventListener('abort', stop, { once: true })
+    const active = { key: randomUUID(), form, index: 0, total: 1, sender: job.sender, sessionId: job.session_id,
+      route: { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }, response, ready: false, signal: wait, authorize }
+    this.current = active
+    onWaiting(true)
+    try {
+      try {
+        const sent = await sendCard(config, { ...active.route, operatorUid: job.sender }, form, wait, authorize)
+        active.binding = { ...sent.binding, questionKey: active.key, questionTitle: form.title }
+        this.store.bindCard(active.binding)
+      } catch (error) {
+        // An uncertain POST may already be delivered. Never create a second form.
+        if (error?.code !== 'card_profile_unavailable' && !error?.cardNotSent) throw error
+        for (const line of formInstructions(form).match(/[\s\S]{1,1500}/gu) ?? []) {
+          checkAccess(authorize)
+          await this.api.send(active.route.channel_id, line, wait, active.route.channel_type)
+        }
+      }
+      wait.throwIfAborted()
+      active.ready = true
+      return await response.promise
+    } finally {
+      wait.removeEventListener('abort', stop)
+      this.current = undefined
+      await active.feedback
+      if (active.binding) await this.closeCard(active.binding, active.summary ?? '表单等待已结束，未收到完整答案。请重新发起；旧表单不能继续提交。', signal)
+      onWaiting(false)
+    }
+  }
 
   async closeCard(binding, summary, signal) {
     if (!binding?.questionKey) return
@@ -64,7 +117,8 @@ export class QuestionBridge {
     }
   }
 
-  async ask(questions, job, config, signal, onWaiting) {
+  async ask(questions, job, config, signal, onWaiting, authorize = () => true) {
+    checkAccess(authorize)
     if (this.current || !Array.isArray(questions) || !questions.length || questions.length > 8
       || questions.some(q => typeof q?.id !== 'string' || typeof q.question !== 'string'
         || (q.options !== undefined && (!Array.isArray(q.options) || q.options.length > 12
@@ -82,7 +136,7 @@ export class QuestionBridge {
         void response.promise.catch(() => {})
         const key = randomUUID()
         this.current = { key, question, index, total: questions.length, sender: job.sender, sessionId: job.session_id,
-          route: { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }, response, ready: false }
+          route: { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }, response, ready: false, signal: wait, authorize }
         try {
           const active = this.current
           const { title, text } = presentation(question, index, questions.length)
@@ -90,23 +144,33 @@ export class QuestionBridge {
           const options = question.options ?? []
           // Plans require their full detail. If too large, use the DSH panel rather than ask for approval of a fragment.
           if (question.intent && Array.from(question.detail ?? '').length > 900) throw new Error('octo_question_review_too_long')
-          if (!question.multiSelect && options.length >= 2 && options.length <= 12
+          if ((options.length >= 2 || options.length === 0) && options.length <= 12
             && Buffer.byteLength(text) <= 2048 && options.every(row => row.label && Buffer.byteLength(row.label) <= 100)) {
             try {
+              const choices = options.map((row, i) => ({ title: row.label, value: 'q' + (i + 1) }))
+              const fields = options.length === 0
+                ? { inputs: [{ kind: 'text', id: 'response', label: '输入答案', required: true }] }
+                : question.multiSelect
+                  ? { inputs: [{ kind: 'choice', id: 'selection', label: '选择一个或多个选项', multi: true, required: true, options: choices }] }
+                  : { choice: { id: 'selection', label: '选择一个选项', options: choices } }
               const result = await sendCard(config, { ...active.route, operatorUid: active.sender }, {
                 title, text, actions: [{ id: 'answer', label: '提交回答' }],
-                choice: { id: 'selection', label: '选择一个选项', options: options.map((row, i) => ({ title: row.label, value: 'q' + (i + 1) })) },
-              }, wait)
+                ...fields,
+              }, wait, authorize)
               active.binding = { ...result.binding, questionKey: key, questionTitle: title }
               this.store.bindCard(active.binding)
               sent = true
-            } catch {
+            } catch (error) {
+              if (error?.code !== 'card_profile_unavailable' && !error?.cardNotSent) throw error
               if (!wait.aborted) this.log('question_card_fallback')
             }
           }
           if (!sent) {
             const lines = (title + '\n' + text).match(/[\s\S]{1,1500}/gu) ?? []
-            for (const line of lines) await this.api.send(active.route.channel_id, line, wait, active.route.channel_type)
+            for (const line of lines) {
+              checkAccess(authorize)
+              await this.api.send(active.route.channel_id, line, wait, active.route.channel_type)
+            }
           }
           wait.throwIfAborted()
           active.ready = true
@@ -133,6 +197,16 @@ export class QuestionBridge {
 
   text(current, input) {
     if (this.current !== current || !current.ready) return false
+    if (current.form) {
+      if (/^(跳过|skip)$/iu.test(input.trim())) return this.completeForm(current, { skipped: true })
+      let response
+      try { response = JSON.parse(input) } catch { return this.invalidFormReply(current) }
+      if (!response || typeof response !== 'object' || Array.isArray(response)
+        || Object.keys(response).some(key => !['action', 'values'].includes(key))
+        || !current.form.actions.some(action => action.id === response.action)) return this.invalidFormReply(current)
+      const values = cardInputValues(current.form.inputs, response.values, current.binding?.inputLimits)
+      return values ? this.completeForm(current, { action: response.action, values }) : this.invalidFormReply(current)
+    }
     current.ready = false
     const result = answer(current.question, input)
     current.summary = '已收到第 ' + (current.index + 1) + '/' + current.total + ' 题的答案。'
@@ -143,7 +217,49 @@ export class QuestionBridge {
     return true
   }
 
-  card(current, key, choice) {
+  completeForm(current, result) {
+    if (this.current !== current || !current.ready) return false
+    current.ready = false
+    current.summary = result.skipped ? '已跳过表单。DSH 将继续处理。' : '表单答案已交给 DSH，正在继续处理。'
+    if (current.binding) this.store.finishQuestionCard(current.binding.messageId, current.summary)
+    current.response.resolve(result)
+    return true
+  }
+
+  async rejectCard(current) {
+    if (this.current !== current || !current.ready || current.signal.aborted) return
+    checkAccess(current.authorize ?? (() => true))
+    // Octo deduplicates submits by message/action/operator. Retire this action
+    // and explicitly retain the waiting turn for a fresh text answer.
+    await this.closeCard(current.binding, '本次卡片答案格式无效，尚未提交。请按随后提示直接回复文字；DSH 仍在等待你的答案。', current.signal)
+    const text = current.form ? formInstructions(current.form) : presentation(current.question, current.index, current.total).text
+    for (const line of text.match(/[\s\S]{1,1500}/gu) ?? []) {
+      checkAccess(current.authorize ?? (() => true))
+      await this.api.send(current.route.channel_id, line, current.signal, current.route.channel_type)
+    }
+  }
+
+  invalidFormReply(current) {
+    if (!current.feedbackPending && Date.now() - (current.lastFeedback ?? 0) >= 3000) {
+      current.lastFeedback = Date.now()
+      current.feedbackPending = true
+      const signal = AbortSignal.any([current.signal, AbortSignal.timeout(5000)])
+      current.feedback = Promise.resolve().then(() => this.api.send(current.route.channel_id,
+        '表单答案尚未提交：请检查必填项、选项和日期/数字格式。可在卡片中填写，或按上面的 JSON 格式回复；回复「跳过」可继续。',
+        signal, current.route.channel_type)).catch(() => this.log('form_validation_feedback_unconfirmed'))
+        .finally(() => { current.feedbackPending = false })
+    }
+    return false
+  }
+
+  card(current, key, choice, action) {
+    if (current?.form) return current.key === key && action?.values && this.completeForm(current, { action: action.actionId, values: action.values })
+    if (current?.key === key && action?.values) {
+      if (typeof action.values.response === 'string') return this.text(current, action.values.response)
+      if (Array.isArray(action.values.selection) && action.values.selection.every(value => /^q\d{1,2}$/u.test(value))) {
+        return this.text(current, action.values.selection.map(value => value.slice(1)).join(','))
+      }
+    }
     if (!current || current.key !== key || !/^q\d{1,2}$/u.test(choice ?? '')) return false
     return this.text(current, choice.slice(1))
   }

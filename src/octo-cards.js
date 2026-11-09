@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { apiEndpoint, validToken, validUid } from './config.js'
 import { decimalId, OctoClient, OctoError, readJson } from './octo.js'
 import { ruleScope } from './rules.js'
+import { cardInputs, cardInputValues } from './card-inputs.js'
 
 const version = '1.5'
 const display = 'octo/v1'
@@ -36,11 +37,11 @@ const literal = value => value.replace(/[\\[\]<>]/g, '\\$&')
  * No raw Adaptive Card tree, server markers, URLs as actions, or arbitrary submit data.
  */
 export function createCard(form) {
-  if (!shape(form, ['title', 'text', 'actions', 'choice'])) invalid()
+  if (!shape(form, ['title', 'text', 'actions', 'choice', 'inputs'])) invalid()
   const title = text(form.title, 160)
   const description = form.text === undefined ? undefined : text(form.text, 2048)
   const actions = form.actions === undefined ? [] : form.actions
-  if (!Array.isArray(actions) || actions.length > 4) invalid()
+  if (!Array.isArray(actions) || actions.length > (form.inputs === undefined ? 4 : 6)) invalid()
   const used = new Set()
   function takeId(value) {
     if (!id(value) || used.has(value)) invalid()
@@ -53,6 +54,10 @@ export function createCard(form) {
   })
   const body = [{ type: 'TextBlock', text: literal(title), weight: 'Bolder', wrap: true }]
   if (description) body.push({ type: 'TextBlock', text: literal(description), wrap: true })
+  if (form.inputs !== undefined) {
+    if (form.choice !== undefined || !buttons.length) invalid()
+    try { body.push(...cardInputs(form.inputs, used)) } catch { invalid() }
+  }
   if (form.choice !== undefined) {
     const choice = form.choice
     if (!buttons.length || !shape(choice, ['id', 'label', 'options']) || !Array.isArray(choice.options)
@@ -141,7 +146,9 @@ function supports(profile, payload, choice) {
     && policy?.card_enabled === true && policy.display_enabled === true
     && (payload.profile !== interaction || policy.interaction_enabled === true)
     && (profile.elements === undefined || (Array.isArray(profile.elements) && profile.elements.includes('TextBlock')))
+    && card.body.filter(node => node.type.startsWith('Input.')).every(node => Array.isArray(profile.inputs) && profile.inputs.includes(node.type))
     && (!choice || (Array.isArray(profile.inputs) && profile.inputs.includes('Input.ChoiceSet')))
+    && fits('max_inputs_bytes', bytes(JSON.stringify(card.body.filter(node => node.type.startsWith('Input.')))))
     && fits('max_nodes', card.body.length + (card.actions?.length ?? 0))
     && fits('max_depth', 1) && fits('max_payload_bytes', bytes(JSON.stringify(payload)))
 }
@@ -152,7 +159,9 @@ function supports(profile, payload, choice) {
  * operator for interaction. Returns {messageId, binding}; save only a confirmed
  * binding in trusted local state. A display card returns binding: null.
  */
-export async function sendCard(config, route, form, signal = new AbortController().signal) {
+export async function sendCard(config, route, form, signal = new AbortController().signal, authorize = () => true) {
+  if (authorize() !== true) throw new OctoError('octo_access_denied')
+  form = structuredClone(form)
   const payload = createCard(form)
   const account = accountScope(config)
   const { token, fetchImpl } = config ?? {}
@@ -178,16 +187,32 @@ export async function sendCard(config, route, form, signal = new AbortController
   if (bytes(JSON.stringify(payload)) > payloadLimit) invalid()
   signal.throwIfAborted()
   const api = new OctoClient({ apiBase, token, fetchImpl })
-  const profile = await api.cardProfile(signal)
+  let profile
+  try { profile = await api.cardProfile(signal) } catch (error) {
+    signal.throwIfAborted()
+    error.cardNotSent = true
+    throw error
+  }
+  const inputLimits = {}
+  if (form.inputs) {
+    for (const [key, bound] of [['max_input_text_bytes', 4000], ['max_inputs_bytes', 16 * 1024]]) {
+      const value = profile.limits?.[key] ?? bound
+      if (!Number.isSafeInteger(value) || value < 4) throw new OctoError('card_profile_unavailable')
+      inputLimits[key] = Math.min(value, bound)
+    }
+    for (const node of payload.card.body) if (node.type === 'Input.Text') node.maxLength = Math.floor(inputLimits.max_input_text_bytes / 4)
+  }
   if (!supports(profile, payload, choice)) throw new OctoError('card_profile_unavailable')
   signal.throwIfAborted()
   // This existing client method is the raw type-17 send path used by progress too.
+  if (authorize() !== true) throw new OctoError('octo_access_denied')
   const { type: _type, ...frame } = payload
   const messageId = await api.progressCard(target, frame, signal)
   const binding = buttons ? Object.freeze({
     account, spaceId, messageId, route: Object.freeze(target), operatorUid, cardNonce: frameNonce,
     actionIds: Object.freeze(buttons.map(button => button.id)),
     choice: choice ? Object.freeze({ id: choice.id, values: Object.freeze(choice.choices.map(item => item.value)) }) : null,
+    ...(form.inputs && { inputSpecs: structuredClone(form.inputs), inputLimits }),
     expiresAt: Date.now() + bindingTtl,
   }) : null
   return { messageId, binding }
@@ -198,7 +223,7 @@ export async function sendCard(config, route, form, signal = new AbortController
  * selection for the original conversation. Persist/atomically claim cardKey
  * with the enqueue before ACK to consume at most one selection per card.
  */
-export function resolveCardAction(rawEvent, binding, verifiedAccount, now = Date.now()) {
+export function resolveCardAction(rawEvent, binding, verifiedAccount, now = Date.now(), { reportInvalidInputs = false } = {}) {
   const action = parseCardAction(rawEvent)
   const account = accountScope(verifiedAccount)
   if (!action || !account || !binding || account !== binding.account
@@ -213,17 +238,25 @@ export function resolveCardAction(rawEvent, binding, verifiedAccount, now = Date
 
   const keys = Object.keys(action.inputs)
   let selection
-  if (binding.choice !== null) {
+  let values
+  let invalidInputs = false
+  if (binding.inputSpecs) {
+    values = cardInputValues(binding.inputSpecs, action.inputs, binding.inputLimits)
+    if (!values) invalidInputs = true
+  } else if (binding.choice !== null) {
     if (!record(binding.choice) || keys.length !== 1 || keys[0] !== binding.choice.id
-      || !Array.isArray(binding.choice.values)) return null
-    selection = binding.choice.values.find(value => value === action.inputs[binding.choice.id])
-    if (selection === undefined) return null
-  } else if (keys.length) return null
+      || !Array.isArray(binding.choice.values)) invalidInputs = true
+    else selection = binding.choice.values.find(value => value === action.inputs[binding.choice.id])
+    if (selection === undefined) invalidInputs = true
+  } else if (keys.length) invalidInputs = true
+  if (invalidInputs && !reportInvalidInputs) return null
 
   return {
     cardKey: JSON.stringify([account, binding.messageId]), eventId: action.eventId,
     messageId: binding.messageId, operatorUid: binding.operatorUid, actionId,
     route: { channel_id: binding.route.channel_id, channel_type: binding.route.channel_type },
     ...(selection !== undefined && { selection }),
+    ...(values && { values }),
+    ...(invalidInputs && { invalidInputs: true }),
   }
 }

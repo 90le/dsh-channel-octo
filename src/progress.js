@@ -59,9 +59,11 @@ const toolLabels = new Map([
   ['octo_messages_search_media', '搜索图片与视频'], ['octo_messages_search_all', '搜索消息和文件'],
   ['octo_messages_search_around', '读取消息前后文'], ['octo_messages_notify', '发送频道消息'],
   ['octo_messages_edit', '编辑消息'], ['octo_messages_mark_read', '标记已读'],
+  ['octo_messages_edit_richtext', '编辑图文消息'], ['octo_messages_edit_display_card', '编辑展示卡片'],
   ['octo_voice_transcribe', '转写语音'], ['octo_voice_context_read', '读取语音词汇'],
   ['octo_voice_context_update', '更新语音词汇'], ['octo_voice_context_delete', '清除语音词汇'],
   ['octo_display_card', '发送展示卡片'],
+  ['octo_form', '等待填写表单'],
 ])
 const action = (tool, detail, status = 'active') => ({
   tool, detail, statusGlyph: status === 'done' ? '✓' : status === 'failed' ? '!' : '●',
