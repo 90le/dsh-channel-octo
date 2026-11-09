@@ -57,6 +57,7 @@ const routes = [
 ]
 const progressCards = new Map([
   ['200', { turn: 1, type: 1, address: 'fixture-user', seq: 1 }],
+  ...(delegatedSmoke ? [['202', { turn: 2, type: 1, address: 'fixture-user', seq: 1 }]] : []),
   ...(groupToolsSmoke ? [['201', { turn: 3, type: 2, address: group, seq: 1 }]] : []),
 ])
 function removeFirstFixtureSession() {
@@ -158,6 +159,14 @@ globalThis.fetch = async (input, init) => {
       const uid = url.pathname.split('/').at(-1)
       if (!['fixture-user', 'fixture-bot'].includes(uid) || url.searchParams.get('space_id') !== 'fixture-space') return new Response(null, { status: 403 })
       return json({ uid, principal_type: uid === 'fixture-user' ? 'human' : 'user_bot' })
+    }
+    if (delegatedSmoke && url.pathname.endsWith('/v1/bot/resolve/targets')) {
+      if (url.searchParams.get('name') !== 'Fixture') return new Response(null, { status: 400 })
+      return json({ total: 1, truncated: false, candidates: [{ channel_id: group, channel_type: 2, kind: 'group', group_no: group, name: 'Fixture Group' }] })
+    }
+    if (delegatedSmoke && url.pathname.endsWith('/groups/' + group + '/threads/' + thread)) {
+      return json({ group_no: group, short_id: thread, channel_id: group + '____' + thread, channel_type: 5,
+        name: 'Fixture Topic', status: 1, creator_uid: 'fixture-user' })
     }
     if (delegatedSmoke && url.pathname.includes('/v1/bot/messages/_search_global_')) {
       const body = JSON.parse(init.body)
@@ -295,6 +304,15 @@ globalThis.fetch = async (input, init) => {
     })
     if (url.pathname.endsWith('/sendMessage')) {
       const body = JSON.parse(init.body)
+      if (delegatedSmoke && body.payload.content?.startsWith('EXPLICIT-TARGET-FIXTURE')) {
+        const topicSend = body.channel_type === 5
+        if (received !== 2 || body.channel_id !== (topicSend ? group + '____' + thread : group)
+          || ![2, 5].includes(body.channel_type) || body.on_behalf_of || body.payload.reply
+          || body.payload.type !== 1 || body.payload.mention?.uids?.[0] !== 'fixture-user'
+          || !body.payload.content.includes('@Fixture User')) return new Response(null, { status: 400 })
+        console.log('FIXTURE_PROACTIVE_SENT=' + body.channel_type)
+        return json({ message_id: topicSend ? '779' : '778' })
+      }
       if (ownerSmoke && body.payload.type === 8) {
         if (!uploaded || body.channel_type !== 1 || body.channel_id !== 'fixture-user') return new Response(null, { status: 400 })
         console.log('FIXTURE_FILE_OK')
@@ -444,8 +462,14 @@ globalThis.fetch = async (input, init) => {
     const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
     const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-6])/g)).at(-1)?.[1] ?? 0)
     if (delegatedSmoke && round === 2) {
+      if (delegatedStep === 0) {
+        const until = Date.now() + 6000
+        while (!progressCards.get('202').opened && Date.now() < until) await delay(50)
+        if (!progressCards.get('202').opened) throw new Error('FIXTURE_SECOND_PROGRESS_MISSING')
+      }
       const names = (body.tools ?? []).map(tool => tool.name)
-      const operations = ['octo_messages_search_authorized', 'octo_messages_search_authorized', 'octo_messages_search_authorized_files', 'octo_messages_search_authorized_groups']
+      const operations = ['octo_messages_search_authorized', 'octo_messages_search_authorized', 'octo_messages_search_authorized_files', 'octo_messages_search_authorized_groups',
+        'octo_messages_resolve_targets', 'octo_messages_send_target', 'octo_messages_send_target']
       if (operations.some(name => !names.includes(name)) || history.includes('NEVER_RETURN_WIRE_')) return new Response(null, { status: 400 })
       let prior
       if (delegatedStep) {
@@ -453,14 +477,18 @@ globalThis.fetch = async (input, init) => {
           .find(part => part.type === 'tool_result' && part.tool_use_id === 'toolu_delegated_' + (delegatedStep - 1))
         const text = typeof result?.content === 'string' ? result.content : (result?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
         try { prior = JSON.parse(text) } catch {}
-        const expected = ['AUTHORIZED-SEARCH-EXCERPT', 'AUTHORIZED-PAGE-TWO', 'AUTHORIZED-FILE-EXCERPT', 'Authorized group'][delegatedStep - 1]
+        const expected = ['AUTHORIZED-SEARCH-EXCERPT', 'AUTHORIZED-PAGE-TWO', 'AUTHORIZED-FILE-EXCERPT', 'Authorized group',
+          'Fixture Group', 'EXPLICIT-TARGET-FIXTURE', 'Fixture Topic'][delegatedStep - 1]
         if (!prior || result.is_error || !text.includes(expected) || delegatedStep === 1 && !/^ocs_[a-f0-9]{32}$/.test(prior.continuation)
           || delegatedStep === 4 && ('match_count' in prior.groups[0] || 'total_groups' in prior)) return new Response(null, { status: 400 })
         console.log('FIXTURE_DELEGATED_TOOL_OK=' + delegatedStep)
       }
       if (delegatedStep < operations.length) {
         const step = delegatedStep++, name = operations[step]
-        const args = { targets: [{ channel_id: group, channel_type: 2 }], keyword: 'fixture',
+        const args = step === 4 ? { name: 'Fixture' } : step >= 5 ? {
+          target: { channel_id: step === 5 ? group : group + '____' + thread, channel_type: step === 5 ? 2 : 5 },
+          text: 'EXPLICIT-TARGET-FIXTURE', uids: ['fixture-user'], confirm_send: true,
+        } : { targets: [{ channel_id: group, channel_type: 2 }], keyword: 'fixture',
           ...(step === 1 && { continuation: prior.continuation }), ...(step === 2 && { filters: { file_exts: ['md'] } }) }
         const frames = [
           { type: 'message_start', message: { id: 'delegated-' + step, model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },

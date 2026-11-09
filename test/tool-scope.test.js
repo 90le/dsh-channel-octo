@@ -25,11 +25,13 @@ test('hot configuration refreshes channel API admission without reconnecting or 
     allowed: new Set(['alice']), apiBase: 'https://octo.invalid/api', token: 'bf_fixture',
     fetchImpl: async () => Response.json({ messages: [] }) }
   const api = new OctoClient(config)
+  const previousChannel = api.channel
   const worker = new Worker({ config, api, store, host: {}, log() {} })
   const route = { channel_type: 1, channel_id: 'alice' }
   await api.channel.dispatch(route, 'alice', 'inspect')
   const next = { ...config, ownerUid: undefined, allowed: new Set(['bob']) }
   worker.reconfigure(next, {})
+  await assert.rejects(previousChannel.dispatch(route, 'alice', 'inspect'), { code: 'account_configuration_changed' })
   assert.equal(next.ownerUid, 'alice')
   await assert.rejects(api.channel.dispatch(route, 'alice', 'inspect'), { code: 'requester_not_allowed' })
   await api.channel.dispatch({ channel_type: 1, channel_id: 'bob' }, 'bob', 'inspect')
@@ -62,6 +64,7 @@ test('group scope enables native tools only after admission and separates restri
   assert.notEqual(runs[0].session, runs[1].session)
   assert.ok(runs.every(r => r.extras.channelTools.specs.some(s => s.name === 'octo_members')))
   assert.ok(runs.every(r => !r.extras.channelTools.specs.some(s => s.name.startsWith('octo_messages_search_authorized'))))
+  assert.ok(runs.every(r => !r.extras.channelTools.specs.some(s => ['octo_messages_send_target', 'octo_messages_resolve_targets'].includes(s.name))))
   assert.equal(sent.length, 2)
   assert.equal(sent[0][1], '请 @小明 查看。')
   assert.equal(sent[0][4].from_name, '小明')
@@ -89,6 +92,8 @@ test('read-only channels expose no Octo mutations and DM tools remain in the ori
       } else {
         assert.ok(!names.includes('octo_members'))
         assert.ok(names.includes('octo_messages_search_authorized'))
+        assert.ok(names.includes('octo_messages_send_target'))
+        assert.ok(names.includes('octo_messages_resolve_targets'))
         assert.ok(names.includes('octo_voice_context_read'))
         assert.ok(names.includes('octo_groups_create'))
         await extras.channelTools.execute('octo_messages_recent', {}, signal)

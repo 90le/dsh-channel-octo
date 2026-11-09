@@ -446,6 +446,7 @@ export function apply(ctx) {
   }
   const expectedCards = [
     { id: '200', type: '1', address: 'fixture-user', answering: true },
+    ...(delegatedSmoke ? [{ id: '202', type: '1', address: 'fixture-user', answering: false }] : []),
     // Group completion may beat the edit throttle after its question is answered.
     // Its initial reasoning state and final completed edit are still mandatory.
     ...(groupToolsSmoke ? [{ id: '201', type: '2', address: '00112233445566778899aabbccddeeff', answering: false }] : []),
@@ -467,7 +468,7 @@ export function apply(ctx) {
           || (i === updates.length - 1 ? row[2] !== 'completed' : !['reasoning', 'answering'].includes(row[2])))
     }) || /FIXTURE_CARD_.*MISMATCH/.test(output)) {
     throw new Error('expected route-bound progress cards with ordered states and final completed edits: '
-      + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
+      + (output.match(/FIXTURE_CARD[^\r\n]*/g) ?? []).join('\n'))
   }
   if (groupToolsSmoke) console.log('FIXTURE_GROUP_PROGRESS_OK=201')
   if (browserModule && !/dsh_session_reused/.test(output)) throw new Error('Web did not hold the fixture session open during the second turn')
@@ -478,9 +479,11 @@ export function apply(ctx) {
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   if (!output.includes('FIXTURE_RICH_IMAGE_DOWNLOADED') || output.includes('FIXTURE_SYNC_SCOPE_WRONG')) throw new Error('Missing scoped rich media/history')
   if (delegatedSmoke) {
-    if ([1, 2, 3, 4].some(step => !output.includes('FIXTURE_DELEGATED_TOOL_OK=' + step))
+    if ([1, 2, 3, 4, 5, 6, 7].some(step => !output.includes('FIXTURE_DELEGATED_TOOL_OK=' + step))
+      || [2, 5].some(type => !output.includes('FIXTURE_PROACTIVE_SENT=' + type))
       || output.includes('FIXTURE_DELEGATED_SCOPE_MISMATCH')) throw new Error('Delegated search native roundtrip failed')
     console.log('PASS: native private delegated message/file/group searches and bound continuation, without raw cursors or attachments.')
+    console.log('PASS: native target discovery and explicit group/topic sends with member mentions, without impersonation or empty quotes.')
   }
   if (ownerSmoke) {
     if (groupToolsSmoke && (readFileSync(join(home, 'group-tool-fixture.txt'), 'utf8') !== 'group native tools executed'

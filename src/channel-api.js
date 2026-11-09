@@ -103,6 +103,12 @@ const displayWork = fn => {
 
 /** Ordinary JSON schemas; callers should mount only available operations. */
 export const CHANNEL_API_OPERATIONS = freeze([
+  { ...spec('messages.resolve_targets', 'In your own private conversation, resolve an explicitly named group/topic that you and this Bot currently belong to in the configured Space and route policy. Returns live names, not message content. If multiple candidates match, ask the user to choose; a truncated result is not exhaustive. Never guess IDs from names.',
+    schema({ name: { type: 'string', minLength: 1, maxLength: 100 }, kind: { type: 'string', enum: ['all', 'group', 'thread'] },
+      limit: { type: 'integer', minimum: 1, maximum: 5 } }, ['name'])), privateOnly: true },
+  { ...spec('messages.send_target', 'Only on an explicit user request in their own private conversation: send text/Markdown as this Bot to one precisely identified group or topic. Resolve names first and ask on ambiguity. Both requester and Bot must currently be members. confirm_send=true affirms the user requested this exact target and text; never automatically forward private content. Optional native mentions use verified member UIDs; all=true requires requester admin. No fabricated reply/quote, user impersonation, bulk send or automatic retry after an unconfirmed delivery.',
+    schema({ target: schema({ channel_id: uid, channel_type: { type: 'integer', enum: [2, 5] } }, ['channel_id', 'channel_type']),
+      text, uids: memberTargets, all: { type: 'boolean' }, confirm_send: { type: 'boolean', const: true } }, ['target', 'text', 'confirm_send']), true), privateOnly: true },
   ...authorizedSearchSpecs({ spec, schema, uid, searchPage, searchKeyword, searchFilters }),
   spec('inspect', 'Inspect the current channel and its parent group permissions.'),
   spec('groups.list', 'Return only the current parent group, never other groups.'),
@@ -196,6 +202,10 @@ export const CHANNEL_API_OPERATIONS = freeze([
 ])
 const specs = new Map(CHANNEL_API_OPERATIONS.map(value => [value.name, value]))
 const errorHints = Object.freeze({
+  account_configuration_changed: '账号配置已变更，此次旧配置下的操作已停止。请基于当前配置重新确认；已经发出的写请求不会自动重试。',
+  private_operation_required: '请在你与 Bot 的私聊中明确选择目标频道；共享群聊不会开放跨频道发送。',
+  invalid_target_response: '目标频道信息未能通过校验，未猜测或发送到其他地址。',
+  thread_not_active: '此子区已归档或不可用，未发送消息。',
   private_search_required: '跨频道检索仅在发起人自己的私聊中提供，结果不会回发到共享群聊。',
   delegated_search_unavailable: '未能确认服务器支持按用户授权检索；没有退回 Bot 身份读取。请检查 Octo 版本及授权检索配置。',
   delegated_search_denied: 'Octo 未允许本用户的委托检索。请检查自己对该 Bot 已有的读取授权、频道范围及当前访问权限；插件不会自动创建授权。',
@@ -430,6 +440,7 @@ export class ChannelApi {
   #config
   #ownerUid
   #searchContinuations = new Map()
+  #revoked = false
   constructor({ request, config }) {
     if (typeof request !== 'function' || !validUid(config?.botUid) || !validUid(config?.spaceId)) fail('invalid_channel_api_config')
     this.#request = request
@@ -445,7 +456,10 @@ export class ChannelApi {
       || !['joined', 'allowlist'].includes(this.#config.channelPolicy)) fail('invalid_channel_api_config')
   }
 
+  revoke() { this.#revoked = true; this.#searchContinuations.clear() }
+
   async #call(path, body, signal, method = body === undefined ? 'GET' : 'POST') {
+    if (this.#revoked) fail('account_configuration_changed')
     if (signal?.aborted) fail('aborted')
     let result
     try { result = await this.#request(path, body === undefined ? undefined : JSON.stringify(body), signal, { method }) }
@@ -456,6 +470,7 @@ export class ChannelApi {
       fail(apiErrorCode(error))
     }
     if (signal?.aborted) fail('aborted')
+    if (this.#revoked) fail('account_configuration_changed')
     // Never expose a transport exception, HTTP body, nested error, or credentials.
     if (Number.isInteger(result?.status) && result.status >= 400) fail(statusError(result.status))
     if (object(result) && (result.error != null || result.ok === false
@@ -480,7 +495,8 @@ export class ChannelApi {
   async #membership(scope, signal) {
     // Pin the parent to the configured Space, including allowlisted routes.
     const groups = list(await this.#call('/v1/bot/groups?' + new URLSearchParams({ space_id: this.#config.spaceId }), undefined, signal), 1000)
-    if (!groups.some(row => row?.group_no === scope.group && row.space_id === this.#config.spaceId)) fail('group_access_denied')
+    const matches = groups.filter(row => row?.group_no === scope.group)
+    if (matches.length !== 1 || matches[0].space_id !== this.#config.spaceId) fail('group_access_denied')
     const rows = memberRows(await this.#call(scope.root + '/members', undefined, signal))
     if (!rows.some(row => row.uid === this.#config.botUid && row.robot === 1)) fail('bot_not_member')
     return rows
@@ -945,7 +961,77 @@ export class ChannelApi {
     return boundAuthorizedSearchResult(result)
   }
 
+  async #targetAccess(target, sender, signal) {
+    const scope = this.#scope(target)
+    if (!scope.group || !/^[a-fA-F0-9]{32}$/.test(scope.group)) fail('invalid_route')
+    const access = await this.#access(scope, sender, true, signal)
+    let topic
+    if (scope.thread) {
+      topic = this.#thread(await this.#call(scope.root + '/threads/' + scope.thread, undefined, signal), scope, scope.thread)
+      if (topic.status !== 1) fail('thread_not_active')
+    }
+    // Metadata requests can outlive membership/admin changes. Make the actual
+    // member read the final network await before returning/sending; the server
+    // still owns atomic membership/group lifecycle enforcement at dispatch.
+    const rows = await this.#membership(scope, signal)
+    const actor = rows.find(row => row.uid === sender)
+    if (!actor || actor.robot !== 0) fail('requester_not_member')
+    return { scope, access: { ...access, rows, actor, bot: rows.find(row => row.uid === this.#config.botUid) },
+      target: { ...scope.route, name: topic?.name ?? access.group.name,
+      ...(topic && { parent_name: access.group.name }) } }
+  }
+
+  async #proactive(scope, sender, operation, args, signal) {
+    if (scope.route.channel_type !== 1 || scope.route.channel_id !== sender) fail('private_operation_required')
+    if (await this.#principal(sender, signal) !== 'human' || await this.#principal(this.#config.botUid, signal) !== 'user_bot') fail('requester_not_allowed')
+    if (operation === 'messages.resolve_targets') {
+      const kind = args.kind ?? 'all', limit = args.limit ?? 5
+      const raw = await this.#call('/v1/bot/resolve/targets?' + new URLSearchParams({ name: webhookName(args.name), kind, limit: 20 }), undefined, signal)
+      if (!object(raw) || !Array.isArray(raw.candidates) || raw.candidates.length > (kind === 'all' ? 40 : 20)
+        || raw.total !== raw.candidates.length || typeof raw.truncated !== 'boolean') fail('invalid_target_response')
+      const candidates = [], seen = new Set()
+      // Global resolver results are bot-visible and not Space-scoped upstream.
+      // Never return their names/counts until current human membership and the
+      // configured account route policy have independently authorized the route.
+      for (const candidate of raw.candidates) {
+        const selected = ruleScope(candidate?.channel_type, candidate?.channel_id)
+        if (!selected || candidate.group_no !== selected.group
+          || candidate.kind !== (selected.thread ? 'thread' : 'group')
+          || kind !== 'all' && candidate.kind !== kind
+          || selected.thread && candidate.short_id !== selected.thread) fail('invalid_target_response')
+        const key = candidate.channel_type + ':' + candidate.channel_id
+        if (seen.has(key)) fail('invalid_target_response')
+        seen.add(key)
+        try {
+          const value = await this.#targetAccess(candidate, sender, signal)
+          candidates.push(value.target)
+        } catch (error) {
+          if (!['route_not_allowed', 'group_access_denied', 'requester_not_member', 'bot_not_member',
+            'group_not_active', 'thread_not_active', 'api_not_found', 'api_permission_denied'].includes(error?.code)) throw error
+        }
+      }
+      const verified = []
+      await this.#access(scope, sender, false, signal, true)
+      for (const candidate of candidates.slice(0, limit)) verified.push((await this.#targetAccess(candidate, sender, signal)).target)
+      return { candidates: verified, truncated: raw.truncated || candidates.length > limit,
+        scope: 'requester_and_bot_member_routes', needs_choice: verified.length !== 1 || raw.truncated || candidates.length > limit }
+    }
+    // Re-read before committing: name discovery is never an authorization cache.
+    await this.#targetAccess(args.target, sender, signal)
+    await this.#access(scope, sender, true, signal, true)
+    const fresh = await this.#targetAccess(args.target, sender, signal)
+    const uids = args.uids ?? []
+    if (args.all && !admin(fresh.access.actor)) fail('requester_admin_required')
+    if (uids.some(uid => !fresh.access.rows.some(row => row.uid === uid))) fail('mention_not_member')
+    const payload = notificationPayload(args.text, uids, fresh.access.rows, args.all)
+    const raw = await this.#mutation('/v1/bot/sendMessage', { ...fresh.scope.route, payload }, signal)
+    if (!id(raw?.message_id)) fail('mutation_unconfirmed')
+    return { ok: true, message_id: id(raw.message_id), ...fresh.target, sent_as: 'bot',
+      text: payload.content, ...(payload.mention && { mention: payload.mention }) }
+  }
+
   async dispatch(route, sender, operation, args = {}, signal = new AbortController().signal) {
+    if (this.#revoked) fail('account_configuration_changed')
     const definition = specs.get(operation)
     if (!definition) fail('unknown_operation')
     const structuredEdit = structuredEdits.has(operation)
@@ -953,9 +1039,13 @@ export class ChannelApi {
     const scopedRead = identityRead || webhookReads.has(operation)
     const clearRevisions = operation === 'messages.clear_card_revisions'
     const delegatedSearch = Object.hasOwn(authorizedSearchEndpoints, operation)
-    if (scopedRead || webhookWrites.has(operation) || clearRevisions || delegatedSearch) args = readArguments(args, definition.parameters)
+    const proactive = ['messages.resolve_targets', 'messages.send_target'].includes(operation)
+    if (scopedRead || webhookWrites.has(operation) || clearRevisions || delegatedSearch || proactive) args = readArguments(args, definition.parameters)
     if (operation === 'webhooks.test' && args.confirm_send !== true
-      || clearRevisions && args.confirm_clear !== true) fail('explicit_confirmation_required')
+      || clearRevisions && args.confirm_clear !== true
+      || operation === 'messages.send_target' && args.confirm_send !== true) fail('explicit_confirmation_required')
+    if (proactive && (operation === 'messages.resolve_targets' ? !webhookName(args.name)
+      : !args.text.trim() || args.all && args.uids?.length)) fail('invalid_arguments')
     if (operation === 'webhooks.update') {
       if (args.name !== undefined) args.name = webhookName(args.name)
       if (Object.keys(args).length < 2 || args.name !== undefined && (!args.name || Buffer.byteLength(args.name, 'utf8') > 64)) fail('invalid_arguments')
@@ -995,19 +1085,20 @@ export class ChannelApi {
     if (['rules.edit', 'thread.rules.edit'].includes(operation) && Buffer.byteLength(args.content, 'utf8') > 10240) fail('invalid_arguments')
     if (operation === 'group.edit' && !Object.keys(args).length) fail('invalid_arguments')
     const scope = this.#scope(route)
-    if (definition.privateOnly && scope.route.channel_type !== 1) fail('private_search_required')
+    if (definition.privateOnly && scope.route.channel_type !== 1) fail(proactive ? 'private_operation_required' : 'private_search_required')
     if (!definition.available) fail(definition.unavailableReason)
     const voice = operation.startsWith('voice.context.')
     if (voice) this.#requireOwnerDM(scope, sender)
     if (operation === 'groups.create') this.#requireOwner(sender)
     if (clearRevisions) this.#requireOwner(sender)
-    if (!scope.group && !voice && !search && !delegatedSearch && !structuredEdit && !identityRead && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
+    if (!scope.group && !voice && !search && !delegatedSearch && !proactive && !structuredEdit && !identityRead && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
       'messages.mark_read', 'messages.clear_card_revisions', 'space.members.search', 'groups.create'].includes(operation)) fail('group_required')
     const thread = operation.startsWith('thread.') ? this.#threadPath(scope, args) : undefined
-    const access = await this.#access(scope, sender, definition.mutating, signal, scopedRead || delegatedSearch)
+    const access = await this.#access(scope, sender, definition.mutating, signal, scopedRead || delegatedSearch || proactive)
     const requireAdmin = () => { if (scope.group && !admin(access.actor)) fail('requester_admin_required') }
 
     if (delegatedSearch) return this.#authorizedSearch(scope, sender, operation, args, signal)
+    if (proactive) return this.#proactive(scope, sender, operation, args, signal)
 
     if (identityRead) return this.#identities(scope, sender, operation, args, access, signal)
     if (webhookReads.has(operation)) return this.#webhooks(scope, sender, operation, args, access, signal)

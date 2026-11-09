@@ -66,9 +66,11 @@ export class OctoClient {
   }
 
   configureChannel(config) {
-    this.channel = validUid(config.botUid) && validUid(config.spaceId)
+    const next = validUid(config.botUid) && validUid(config.spaceId)
       ? new ChannelApi({ config, request: (path, body, signal, options) => this.#request(path, body, signal, options) })
       : undefined
+    this.channel?.revoke()
+    this.channel = next
   }
 
   async #request(path, body, signal, { timeout = 15_000, auth = true, method, multipart = false,
