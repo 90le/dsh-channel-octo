@@ -32,6 +32,8 @@ export class InboxRecovery {
       const routeCurrent = () => {
         const latest = this.store.inboxRoute(route.channel_type, route.channel_id)
         return current() && latest?.floor_seq === route.floor_seq && latest.since_ms === route.since_ms
+          && latest.prefix_until_seq === route.prefix_until_seq && latest.prefix_since_ms === route.prefix_since_ms
+          && latest.directory_all === route.directory_all
       }
       this.store.blockInboxRoute(route)
       try {
@@ -47,7 +49,14 @@ export class InboxRecovery {
         for (let page = 0; !completed && page < 10; page++) {
           const batch = await this.api.inboxPage(config, route, start, upper, signal)
           if (!routeCurrent()) return
-          if (!batch.count) {
+          if (batch.skippedThrough != null || !batch.count && batch.scannedThrough != null) {
+            const through = batch.skippedThrough ?? batch.scannedThrough
+            if (!channelSequence(through) || through < start || through > upper
+              || batch.skippedThrough != null && through > route.prefix_until_seq) throw new Error('invalid_inbox_scan_boundary')
+            this.store.checkpointInbox(route, through, [])
+            completed = through >= upper
+            start = through + 1
+          } else if (!batch.count) {
             this.store.checkpointInbox(route, upper, [])
             completed = true
           } else {

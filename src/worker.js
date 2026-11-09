@@ -16,6 +16,7 @@ import { voiceTool } from './voice-tool.js'
 import { formToolSpec } from './form-tool.js'
 import { deferredFormSpecs, publishDeferredForm, manageDeferredForm, deferredMessage, flushDeferredFeedback } from './deferred-forms.js'
 import { InboxRecovery } from './inbox.js'
+import { DirectoryDiscovery } from './directory-discovery.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
@@ -157,6 +158,7 @@ export class Worker {
       const live = this.config
       return !this.stopIntake && deliveryProfile(live, job) === profile
         && permitsRoute(live, job.sender, job.channel_type, job.channel_id ?? job.sender)
+        && (!job.ambient || live.mentionPolicy === 'octo')
         && (!files || live.allowFiles && live.toolPermission !== 'text-only' && authorizedTools(live, job))
         && (!files || deliveryMediaProfile(live) === mediaProfile)
         && (!command || safeCommand(live, job))
@@ -167,7 +169,7 @@ export class Worker {
     // Retain the configured admission model. For Octo-managed access, verify
     // the live friendship/membership again after preparation, not just intake.
     try {
-      if ((job.deferredForm || current.botKind === 'app' || job.ambient || current.senderPolicy === 'octo' || job.channel_type !== 1 && current.channelPolicy === 'joined')
+      if ((job.directoryRecovery || job.deferredForm || current.botKind === 'app' || job.ambient || current.senderPolicy === 'octo' || job.channel_type !== 1 && current.channelPolicy === 'joined')
         && !await this.api.allowsMessage(job.deferredForm ? { ...current, senderPolicy: 'octo' } : current, job, signal)) throw new Error('delivery_access_changed')
     } catch (error) {
       if (error instanceof OctoError && ['api_authentication_failed', 'api_permission_denied', 'api_not_found', 'api_disabled']
@@ -175,7 +177,8 @@ export class Worker {
       throw error
     }
     signal.throwIfAborted()
-    if (!allowed()) throw new Error('delivery_access_changed')
+    if (!allowed() || this.config.senderPolicy !== current.senderPolicy
+      || this.config.channelPolicy !== current.channelPolicy) throw new Error('delivery_access_changed')
     return true
   }
 
@@ -402,7 +405,8 @@ export class Worker {
           // sequence checkpoints; the event consumer does not inject live text.
           const timestamp = event.message.timestamp
           const known = this.store.inboxRoute(message.channelType, message.channelId)
-          if ((!known || known.since_ms > 0 && message.messageSeq <= known.floor_seq)
+          if ((!known || known.since_ms > 0 && message.messageSeq <= known.floor_seq
+            || known.directory_all === 1 || message.messageSeq <= known.prefix_until_seq)
             && channelSequence(message.messageSeq) && this.inbox.enabled
             && Number.isSafeInteger(timestamp) && timestamp * 1000 > recovery.startedAt
             && timestamp * 1000 <= Date.now() + 300000) {
@@ -479,7 +483,7 @@ export class Worker {
     // from a DM or substitute the parent channel for a topic.
     let result
     if ((before || meta.quoteId) && typeof this.api.recentMessages === 'function') {
-      try { result = await this.api.recentMessages(config, route, before, signal) }
+      try { result = await this.api.recentMessages(config, { ...route, ...(meta.directoryRecovery ?? {}) }, before, signal) }
       catch { signal.throwIfAborted(); this.log('channel_history_unavailable') }
     }
     const quote = meta.quoteId && result?.rows.find(row => row.messageId === meta.quoteId)
@@ -505,11 +509,13 @@ export class Worker {
     const host = this.host
     const channelType = job.channel_type
     const recipient = job.channel_id ?? job.sender
+    let meta = job.metadata ? JSON.parse(job.metadata) : {}
+    if (meta.directoryRecovery) job = { ...job, directoryRecovery: meta.directoryRecovery }
     if (!permitsRoute(config, job.sender, channelType, recipient)) {
       this.store.review(job.seq, 'route_not_allowed')
       return
     }
-    if (config.botKind === 'app' || job.ambient || config.senderPolicy === 'octo' || (channelType !== 1 && config.channelPolicy === 'joined')) {
+    if (job.directoryRecovery || config.botKind === 'app' || job.ambient || config.senderPolicy === 'octo' || (channelType !== 1 && config.channelPolicy === 'joined')) {
       try {
         if (!await this.api.allowsMessage(config, job, signal)) {
           this.store.discard(job.seq, 'octo_access_denied')
@@ -524,7 +530,6 @@ export class Worker {
       }
     }
     const route = { channel_id: recipient, channel_type: channelType }
-    let meta = job.metadata ? JSON.parse(job.metadata) : {}
     if (meta.deferredForm) job = { ...job, deferredForm: true }
     if (job.state !== 'queued' && (!/^[a-f0-9]{64}$/.test(meta.deliveryProfile ?? '')
       || meta.deliverables?.length && !/^[a-f0-9]{64}$/.test(meta.deliveryMediaProfile ?? ''))) {
@@ -635,7 +640,9 @@ export class Worker {
           ] : order
           const authorCard = safeCommand(config, job) && !attachments.length
             && /卡片|\bcard\b/iu.test(input)
-          const run = () => host.run(session, input, async () => {
+          const run = async () => {
+            if (job.directoryRecovery) await authorizeDelivery()
+            return host.run(session, input, async () => {
             if (!meta.deferredForm) this.store.sessionCreated(conversation)
             await this.attach?.(session.session_id, config.cwd)
           }, signal, rules,
@@ -766,6 +773,7 @@ export class Worker {
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
               ...(toolsAllowed && !meta.deferredForm && config.transport === 'websocket'
                 && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })
+          }
           try { reply = await run() }
           catch (error) {
             // The native session can be deleted between stat and resume. Only
@@ -806,6 +814,7 @@ export class Worker {
         if (!bounded) throw new Error('empty_reply')
         meta = meta.command || meta.cardAction ? meta : {
           ...(meta.deferredForm && { deferredForm: meta.deferredForm }),
+          ...(meta.directoryRecovery && { directoryRecovery: meta.directoryRecovery }),
           ...(deliverables?.length && { deliverables }), ...(merged.length && { merged }), ...(card && { displayCard: card.form }),
         }
         meta.deliveryProfile = profile
@@ -1006,6 +1015,8 @@ export class Worker {
     const signal = AbortSignal.any([lifetime, stop.signal])
     this.intakeSignal = signal
     if (this.config.botKind !== 'app' && this.inbox.enabled) this.store.activateEventRecovery?.()
+    const discovery = new DirectoryDiscovery({ api: this.api, store: this.store, config: () => this.config,
+      online: () => this.inbox.online, paused: () => this.stopIntake, log: this.log }).run(signal)
     const accept = m => {
       signal.throwIfAborted()
       const candidate = admit({ message: {
@@ -1021,10 +1032,10 @@ export class Worker {
     const cardEvents = this.pollCardEvents(signal)
     const recovery = this.inbox.run(signal)
     try {
-      await Promise.all([receiving, draining, cardEvents, recovery])
+      await Promise.all([receiving, draining, cardEvents, recovery, discovery])
     } finally {
       stop.abort()
-      await Promise.allSettled([receiving, draining, cardEvents, recovery])
+      await Promise.allSettled([receiving, draining, cardEvents, recovery, discovery])
       await this.appIntake
     }
   }

@@ -6,7 +6,10 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
 
 // AppBot is a separate fixture, not a relaxation of any USER-mode assertion.
-if (process.env.DSH_OCTO_FIXTURE_EVENT_RECOVERY === '1') {
+if (process.env.DSH_OCTO_FIXTURE_DIRECTORY_RECOVERY === '1') {
+  const { installDirectoryRecoveryFixture } = await import('./directory-recovery-fixture.mjs')
+  await installDirectoryRecoveryFixture()
+} else if (process.env.DSH_OCTO_FIXTURE_EVENT_RECOVERY === '1') {
   const { installEventRecoveryFixture } = await import('./event-recovery-fixture.mjs')
   await installEventRecoveryFixture()
 } else if (process.env.DSH_OCTO_FIXTURE_DEFERRED === '1') {
@@ -200,6 +203,11 @@ globalThis.fetch = async (input, init) => {
     if (url.pathname.endsWith('/groups') && url.searchParams.get('space_id') === 'fixture-space') {
       return json([{ group_no: group, space_id: 'fixture-space' }])
     }
+    // New background directory query only; keep all existing native/history
+    // and channel-tool assertions on their original paths.
+    if (init.method === 'GET' && url.pathname === '/api/v1/bot/groups/' + group + '/threads'
+      && url.searchParams.size === 2 && url.searchParams.get('page_index') === '1'
+      && ['1', '100'].includes(url.searchParams.get('page_size'))) return json({ count: 0, list: [] })
     if (delegatedSmoke && url.pathname.includes('/v1/bot/space/principals/')) {
       const uid = url.pathname.split('/').at(-1)
       if (!['fixture-user', 'fixture-bot', person.channel_id].includes(uid) || init.method !== 'GET'
@@ -234,7 +242,7 @@ globalThis.fetch = async (input, init) => {
       if (url.searchParams.get('name') !== 'Fixture') return new Response(null, { status: 400 })
       return json({ total: 1, truncated: false, candidates: [{ channel_id: group, channel_type: 2, kind: 'group', group_no: group, name: 'Fixture Group' }] })
     }
-    if (delegatedSmoke && url.pathname.endsWith('/groups/' + group + '/threads/' + thread)) {
+    if (init.method === 'GET' && url.pathname === '/api/v1/bot/groups/' + group + '/threads/' + thread) {
       return json({ group_no: group, short_id: thread, channel_id: group + '____' + thread, channel_type: 5,
         name: 'Fixture Topic', status: 1, creator_uid: 'fixture-user' })
     }

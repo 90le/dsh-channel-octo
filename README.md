@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.19.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.20.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -60,6 +60,14 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 需要为测试 profile 设置可用的 DSH 模型。使用独立 Bot，不与其他连接程序同时消费其事件；启用后会确认该 Bot 收到的事件，超出当前支持范围的事件不进入模型。暂停时将 `enabled` 改回 `false` 并按环境流程重载 Web；本地状态和会话保留。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
+
+## 0.20.0
+
+免 @ 模式新增群与活跃子区目录恢复：User Bot 离线期间在尚未登记的群或子区收到消息，重新连接后可从目录发现，再读取当前历史处理。目录只确定地址，不直接作为消息执行；仍遵循当前空间、群/子区、成员及工具权限。无需额外加入或关注子区。
+
+首次启用记录时间界限，已有频道不重置；新增频道逐页检查现存历史，仅接纳启用后的消息。进度持久保存，各群轮流推进，失败会在账号页提示。目录扫描完成后至少等待一分钟；首次检查较长历史可能需要更多时间。已归档且未发现的子区、App 普通私聊、历史保留与时钟偏差等边界见[能力核对](OCTO-COVERAGE.md)。
+
+同时修复恢复任务执行前、交付前的权限复查与设置变化竞争；过滤附加历史和引用中的过期正文。App Bot 建连初期收信也按活跃人类及精确消息可见性校验。1735 项完整回归通过；原生联调与部署证据见[接入方案](PLAN.md)。
 
 ## 0.19.0
 
@@ -154,6 +162,8 @@ npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket /absolute/path/t
 ```
 
 浏览器验收默认与 IM Connect 1.0.30 共存。设置 `DSH_OCTO_SMOKE_WEBHOOK_UI=1` 加测 Webhook 独立管理窗口、确认与密钥清除，所有请求拦截到合成接口，不向正式频道发送测试。设置 `DSH_OCTO_SMOKE_CODEX_UI=2.0.19` 或 `DSH_OCTO_SMOKE_AUTOMATION` 可加测指定版本；可选的 `DSH_OCTO_SMOKE_SCREENSHOTS` 指向已存在的截图目录，截图只含测试账号和会话。
+
+设置 `DSH_OCTO_SMOKE_DIRECTORY_RECOVERY=1` 单独运行免 @ 目录恢复场景：同一临时状态目录启动三次真实 DSH 进程，模拟首次空目录、离线新增群/第二页子区、当前历史补收以及重启重放。确认每条任务只执行一次，实际写入并展示文件，核对完整说明和文件字节。Octo/模型使用合成接口，不使用生产 Bot 凭据。
 
 0.13.0 发布前：716 项完整回归通过、无跳过；中文进度名称补齐后 11 项进度测试通过。同版本 Debian 隔离 DSH 验证目标查找及群/子区原生提及发送、三类授权检索、绑定续页，并回归私聊/群聊提问、审批、文件及说明、表单、Webhook 工具和最终回复。所有新发送使用合成频道，未向正式群发送消息。
 

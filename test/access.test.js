@@ -44,6 +44,12 @@ test('Octo checks DM friendship and group participation; child uses parent prefe
   let enabled = true
   let groupAllows = true
   let joined = true
+  let groupStatus = 1
+  let activeParent = true
+  let topicStatus = 1
+  const root = '/api/v1/bot/groups/' + group
+  const topicInfo = () => ({ group_no: group, short_id: topic.split('____')[1],
+    channel_id: topic, channel_type: 5, status: topicStatus })
   const client = new OctoClient({
     apiBase: opts.apiBase, token: 'bf_fixture',
     fetchImpl: async (url, request) => {
@@ -60,6 +66,23 @@ test('Octo checks DM friendship and group participation; child uses parent prefe
         assert.equal(new URL(url).searchParams.get('space_id'), 'space')
         return Response.json(joined ? [{ group_no: group, space_id: 'space' }] : [])
       }
+      if (path === root) {
+        assert.equal(request.method, 'GET')
+        return Response.json({ group_no: group, status: groupStatus })
+      }
+      if (path === root + '/threads') {
+        assert.equal(request.method, 'GET')
+        assert.equal(new URL(url).searchParams.get('page_index'), '1')
+        assert.equal(new URL(url).searchParams.get('page_size'), '1')
+        // This endpoint proves active parent membership; the member DTO below
+        // deliberately has no status field and cannot stand in for this gate.
+        if (!activeParent) return new Response(null, { status: 403 })
+        return Response.json({ count: topicStatus === 1 ? 1 : 0, list: topicStatus === 1 ? [topicInfo()] : [] })
+      }
+      if (path === root + '/threads/' + topic.split('____')[1]) {
+        assert.equal(request.method, 'GET')
+        return Response.json(topicInfo())
+      }
       if (path.endsWith('/members')) return Response.json([
         { uid: 'bot', robot: 1 }, { uid: 'human', robot: 0 }, { uid: 'otherbot', robot: true }, { uid: 'unknown' },
       ])
@@ -71,9 +94,20 @@ test('Octo checks DM friendship and group participation; child uses parent prefe
   assert.equal(await client.allowsMessage(opts, job(2, group), signal), true)
   assert.equal(await client.allowsMessage(opts, job(5, topic, 'human', 1), signal), true)
   assert.ok(paths.includes('/api/v1/bot/groups/' + group + '/mention_pref'))
+  assert.ok(paths.indexOf(root + '/threads') < paths.indexOf(root + '/mention_pref'))
+  assert.ok(paths.indexOf(root + '/threads/' + topic.split('____')[1]) < paths.indexOf(root + '/mention_pref'))
   assert.equal(await client.allowsMessage(opts, job(5, topic, 'stranger', 1), signal), false)
   assert.equal(await client.allowsMessage(opts, job(5, topic, 'otherbot', 1), signal), false)
   assert.equal(await client.allowsMessage(opts, job(5, topic, 'unknown', 1), signal), false)
+  activeParent = false
+  await assert.rejects(client.allowsMessage(opts, job(5, topic, 'human', 1), signal), /http_403/)
+  activeParent = true
+  groupStatus = 2
+  assert.equal(await client.allowsMessage(opts, job(2, group, 'human', 1), signal), false)
+  groupStatus = 1
+  topicStatus = 2
+  assert.equal(await client.allowsMessage(opts, job(5, topic, 'human', 1), signal), false)
+  topicStatus = 1
   enabled = false
   assert.equal(await client.allowsMessage(opts, job(5, topic, 'human', 1), signal), false)
   assert.equal(await client.allowsMessage(opts, job(5, topic), signal), true) // explicit @ still works

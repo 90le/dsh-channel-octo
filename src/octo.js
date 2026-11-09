@@ -11,6 +11,41 @@ export { OctoError } from './api-errors.js'
 
 const maxBody = 1024 * 1024
 const flag = (value) => value === 1 || value === true
+const directoryGroupId = /^[a-fA-F0-9]{32}$/
+const directoryPageSize = 100
+const maxDirectoryGroups = 1000
+// Local work bound, not an upstream limit. Exceeding it is an error, never EOF.
+const maxDirectoryPages = 10_000
+const directoryBot = (config, token) => token.startsWith('bf_') && validBotIdentity(config) && config.botKind !== 'app'
+const directoryEligible = (config, token) => directoryBot(config, token)
+  && config.transport === 'websocket' && config.mentionPolicy === 'octo'
+const directoryGroupAllowed = (config, group) => config.channelPolicy === 'joined'
+  || config.groups?.has(group) === true
+  || [...(config.threads ?? [])].some(id => ruleScope(5, id)?.group === group)
+const directoryRange = (route, seq) => route.directory_all === 1
+  || !!channelSequence(route.prefix_until_seq) && seq <= route.prefix_until_seq
+const recoverySince = (bounds, seq) => Math.max(bounds.since_ms || 0,
+  seq <= bounds.prefix_until_seq ? bounds.prefix_since_ms || 0 : 0)
+function recoveryBounds(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new OctoError('invalid_directory_recovery')
+  const bounds = {}
+  for (const key of ['since_ms', 'prefix_since_ms', 'prefix_until_seq']) {
+    const number = value[key] ?? 0
+    if (!Number.isSafeInteger(number) || number < 0 || key === 'prefix_until_seq' && number > 0xffffffff) {
+      throw new OctoError('invalid_directory_recovery')
+    }
+    bounds[key] = number
+  }
+  return bounds
+}
+function directoryProvenance(job) {
+  let value = job.directoryRecovery
+  if (value === undefined && job.metadata) {
+    try { value = (typeof job.metadata === 'string' ? JSON.parse(job.metadata) : job.metadata)?.directoryRecovery }
+    catch { throw new OctoError('invalid_directory_recovery') }
+  }
+  return value === undefined ? undefined : recoveryBounds(value)
+}
 const memberList = (value, field) => {
   if (Array.isArray(value) || value === null) return value ?? []
   if (Array.isArray(value?.[field])) return value[field]
@@ -165,6 +200,13 @@ export class OctoClient {
     return { robot_id: botUid, im_token: data.im_token, ws_url: data.ws_url }
   }
 
+  async #appHuman(sender, signal) {
+    const people = await this.#request('/v1/bot/users/batch', JSON.stringify({ uids: [sender] }), signal, { timeout: 5000 })
+    return Array.isArray(people?.users) && people.users.length === 1 && Array.isArray(people.missing_uids)
+      && people.missing_uids.length === 0 && people.users[0]?.uid === sender
+      && people.users[0].status === 1 && people.users[0].robot === 0
+  }
+
   async allowsMessage(config, job, signal) {
     const { sender, channel_type: type, ambient } = job
     const address = job.channel_id ?? sender
@@ -173,12 +215,7 @@ export class OctoClient {
     if (type === 1) {
       if (config.senderPolicy !== 'octo' && !app) return true
       if (sender.includes('@')) return false // Octo's internal DM channel separator
-      if (app) {
-        const people = await this.#request('/v1/bot/users/batch', JSON.stringify({ uids: [sender] }), signal, { timeout: 5000 })
-        if (!Array.isArray(people?.users) || people.users.length !== 1 || !Array.isArray(people.missing_uids)
-          || people.missing_uids.length || people.users[0]?.uid !== sender
-          || people.users[0].status !== 1 || people.users[0].robot !== 0) return false
-      }
+      if (app && !await this.#appHuman(sender, signal)) return false
       // Use the bot's ordinary history gate: it enforces friend/owner policy
       // without OBO. Request at most one record and never use its content.
       const result = await this.#request('/v1/bot/messages/sync', JSON.stringify({
@@ -206,8 +243,11 @@ export class OctoClient {
     const scope = ruleScope(type, address)
     if (!scope) return false
     const root = '/v1/bot/groups/' + encodeURIComponent(scope.group)
+    const directoryRecovery = directoryProvenance(job)
+    if (ambient && config.mentionPolicy !== 'octo') return false
+    if ((ambient || directoryRecovery) && !await this.inboxDirectoryAccess(config,
+      { channel_type: type, channel_id: address }, signal)) return false
     if (ambient) {
-      if (config.mentionPolicy !== 'octo') return false
       const pref = await this.#request(root + '/mention_pref', undefined, signal, { timeout: 3000 })
       if ((pref?.group_allow_no_mention !== undefined && !flag(pref.group_allow_no_mention))
         || !flag(pref?.effective ?? pref?.no_mention)) return false
@@ -217,14 +257,119 @@ export class OctoClient {
       const groups = memberList(await this.#request('/v1/bot/groups?' + query, undefined, signal, { timeout: 5000 }), 'groups')
       if (!groups.some(g => g?.group_no === scope.group && g.space_id === config.spaceId)) return false
     }
-    if (ambient || config.senderPolicy === 'octo' || config.channelPolicy === 'joined') {
+    if (ambient || directoryRecovery || config.senderPolicy === 'octo' || config.channelPolicy === 'joined') {
       const members = memberList(await this.#request(root + '/members', undefined, signal, { timeout: 5000 }), 'members')
       const actor = members.find(m => m?.uid === sender)
       // Do not auto-trigger other bots or unknown member kinds.
-      if (!actor || ((ambient || config.senderPolicy === 'octo') && actor.robot !== 0 && actor.robot !== false)
+      if (!actor || ((ambient || directoryRecovery || config.senderPolicy === 'octo') && actor.robot !== 0 && actor.robot !== false)
         || !members.some(m => m?.uid === config.botUid)) return false
     }
     return true
+  }
+
+  async inboxDirectoryGroups(config, signal) {
+    if (!directoryEligible(config, this.#token)) return []
+    return this.#directoryGroups(config, signal)
+  }
+
+  async #directoryGroups(config, signal) {
+    const query = new URLSearchParams({ space_id: config.spaceId })
+    const data = await this.#request('/v1/bot/groups?' + query, undefined, signal, { timeout: 5000 })
+    // The official Go slice may encode an empty directory as null. Validate ALL
+    // rows before applying the local allowlist, including rows we would omit.
+    if (data !== null && !Array.isArray(data) || data?.length > maxDirectoryGroups) throw new OctoError('invalid_directory_response')
+    const groups = new Set()
+    for (const row of data ?? []) {
+      if (!row || typeof row.group_no !== 'string' || !directoryGroupId.test(row.group_no)
+        || row.space_id !== config.spaceId) throw new OctoError('invalid_directory_response')
+      if (directoryGroupAllowed(config, row.group_no)) groups.add(row.group_no)
+    }
+    return [...groups].sort()
+  }
+
+  async #directoryParent(config, group, signal) {
+    if (!(await this.#directoryGroups(config, signal)).includes(group)) return false
+    const info = await this.#request('/v1/bot/groups/' + encodeURIComponent(group), undefined, signal, { timeout: 5000 })
+    if (info === null) return false
+    if (info?.group_no !== group || !Number.isInteger(info.status)) throw new OctoError('invalid_directory_response')
+    return info.status === 1
+  }
+
+  #directoryThread(row, group) {
+    const scope = ruleScope(5, row?.channel_id)
+    if (!scope || row.group_no !== group || scope.group !== group || row.short_id !== scope.thread
+      || row.channel_type !== 5 || row.status !== 1) throw new OctoError('invalid_directory_response')
+    return { channel_type: 5, channel_id: row.channel_id }
+  }
+
+  async #directoryThreads(group, page, size, signal) {
+    const query = new URLSearchParams({ page_index: String(page), page_size: String(size) })
+    const data = await this.#request('/v1/bot/groups/' + encodeURIComponent(group) + '/threads?' + query,
+      undefined, signal, { timeout: 5000 })
+    const offset = (page - 1) * size
+    if (!Number.isSafeInteger(data?.count) || data.count < 0 || data.count > maxDirectoryPages * directoryPageSize
+      || !Array.isArray(data.list) || data.list.length !== Math.max(0, Math.min(size, data.count - offset))) {
+      throw new OctoError('invalid_directory_response')
+    }
+    const seen = new Set()
+    const routes = data.list.map(row => {
+      const route = this.#directoryThread(row, group)
+      if (seen.has(route.channel_id)) throw new OctoError('invalid_directory_response')
+      seen.add(route.channel_id)
+      return route
+    })
+    return { routes, nextPage: offset + data.list.length < data.count ? page + 1 : null }
+  }
+
+  async inboxDirectoryAccess(config, route, signal) {
+    const type = route?.channel_type, id = route?.channel_id
+    const scope = ruleScope(type, id)
+    if (!directoryBot(config, this.#token) || !scope || !directoryGroupId.test(scope.group)
+      || !(config.channelPolicy === 'joined' || (type === 2 ? config.groups?.has(id) : config.threads?.has(id)))) return false
+    if (!await this.#directoryParent(config, scope.group, signal)) return false
+    // This Bot endpoint checks active parent membership even when it returns no
+    // topics. No user/follow API or missing member-status field is substituted.
+    await this.#directoryThreads(scope.group, 1, 1, signal)
+    if (type === 5) {
+      const detail = await this.#request('/v1/bot/groups/' + encodeURIComponent(scope.group) + '/threads/' + scope.thread,
+        undefined, signal, { timeout: 5000 })
+      if (detail === null) return false
+      if (detail.status !== 1) {
+        if (!Number.isInteger(detail.status)) throw new OctoError('invalid_directory_response')
+        return false
+      }
+      if (this.#directoryThread(detail, scope.group).channel_id !== id) throw new OctoError('invalid_directory_response')
+    }
+    return true
+  }
+
+  async #directoryPreference(group, signal) {
+    const pref = await this.#request('/v1/bot/groups/' + encodeURIComponent(group) + '/mention_pref', undefined, signal, { timeout: 3000 })
+    const effective = pref?.effective ?? pref?.no_mention
+    if (!pref || ![true, false, 0, 1].includes(effective)
+      || pref.group_allow_no_mention !== undefined && ![true, false, 0, 1].includes(pref.group_allow_no_mention)) {
+      throw new OctoError('invalid_directory_response')
+    }
+    return flag(effective) && (pref.group_allow_no_mention === undefined || flag(pref.group_allow_no_mention))
+  }
+
+  async inboxDirectoryPage(config, group, page, signal) {
+    if (typeof group !== 'string' || !directoryGroupId.test(group)
+      || !Number.isSafeInteger(page) || page < 1 || page > maxDirectoryPages) {
+      throw new OctoError('invalid_directory_scope')
+    }
+    const empty = { routes: [], nextPage: null }
+    if (!directoryEligible(config, this.#token) || !directoryGroupAllowed(config, group)) return empty
+    if (!await this.#directoryParent(config, group, signal)) return empty
+    if (!await this.#directoryPreference(group, signal)) return empty
+    // threads.go:22-54 is the active-parent-member gate. It is mandatory even
+    // for a main-only allowlist; groups/info/sync alone exclude only deleted members.
+    const result = await this.#directoryThreads(group, page, directoryPageSize, signal)
+    const routes = result.routes.filter(route => config.channelPolicy === 'joined' || config.threads?.has(route.channel_id) === true)
+    if (page === 1 && (config.channelPolicy === 'joined' || config.groups?.has(group) === true)) {
+      routes.unshift({ channel_type: 2, channel_id: group })
+    }
+    return { routes, nextPage: result.nextPage }
   }
 
   async recentMessages(config, route, before, signal) {
@@ -233,10 +378,12 @@ export class OctoClient {
       throw new OctoError('invalid_history_scope')
     }
     const end = channelSequence(before)
+    const bounds = ['since_ms', 'prefix_since_ms', 'prefix_until_seq'].some(key => Object.hasOwn(route, key))
+      ? recoveryBounds(route) : undefined
     if (config.botKind === 'app' && type !== 1) throw new OctoError('invalid_history_scope')
     if (end === 1) return { rows: [], more: false }
     const data = await this.#request('/v1/bot/messages/sync', JSON.stringify({
-      ...route, start_message_seq: end ? end - 1 : 0, end_message_seq: 0, pull_mode: 0, limit: 20,
+      channel_type: type, channel_id: id, start_message_seq: end ? end - 1 : 0, end_message_seq: 0, pull_mode: 0, limit: 20,
     }), signal, { timeout: 4500 })
     if (data?.messages !== null && !Array.isArray(data?.messages)) throw new OctoError('invalid_history_response')
     const rows = []
@@ -248,6 +395,10 @@ export class OctoClient {
         || type !== 1 && item.channel_id != null && item.channel_id !== id
         || type === 1 && item.from_uid !== id && item.from_uid !== config.botUid
         || [item.revoke, item.revoked, item.is_deleted, item.extra?.revoke, item.message_extra?.revoke].some(flag)) continue
+      const since = bounds ? recoverySince(bounds, seq) : 0
+      // Reject old/unknown timestamps before decoding any context or quote body.
+      if (since > 0 && (!Number.isSafeInteger(item.timestamp) || item.timestamp <= 0
+        || item.timestamp * 1000 > Date.now() + 300000 || item.timestamp * 1000 <= since)) continue
       if (config.botKind === 'app') {
         const verified = await this.channel.appMessage(route, id, messageId, signal)
         if (verified.text.trim()) rows.push({ seq: verified.message_seq, messageId, sender: verified.from_uid,
@@ -278,10 +429,34 @@ export class OctoClient {
     if (![1, 2, 5].includes(type) || (type === 1 ? !validUid(id) || id.includes('@') : !ruleScope(type, id))
       || !Number.isInteger(start) || start < 0 || start > 0xffffffff
       || through != null && (!channelSequence(through) || start > through)) throw new OctoError('invalid_inbox_scope')
+    const app = this.#token.startsWith('app_')
+    if (app && (type !== 1 || id === config.botUid || !this.channel
+      || !await this.#appHuman(id, signal))) throw new OctoError('app_inbox_access_denied')
+    const prefix = channelSequence(route.prefix_until_seq) ?? 0
     const latest = through == null
+    const all = type !== 1 && route.directory_all === 1
+    const readsPrefix = type !== 1 && !all && !latest && prefix > 0 && start <= prefix
+    // A newly authorized prefix gets its own page. The caller's next start can
+    // enter the previously accepted upper range without inheriting its pref gate.
+    const pageThrough = readsPrefix ? Math.min(through, prefix) : through
+    if (all || readsPrefix) {
+      const skip = () => ({ last: 0, count: 0, messages: [], observed: [], suppressed: [], skippedThrough: pageThrough })
+      if (!directoryEligible(config, this.#token)) {
+        if (readsPrefix) return skip()
+        throw new OctoError('directory_preference_denied')
+      }
+      if (!await this.inboxDirectoryAccess(config, route, signal)) {
+        if (readsPrefix) return skip()
+        throw new OctoError('directory_access_denied')
+      }
+      if (!await this.#directoryPreference(ruleScope(type, id).group, signal)) {
+        if (readsPrefix) return skip()
+        throw new OctoError('directory_preference_denied')
+      }
+    }
     const data = await this.#request('/v1/bot/messages/sync', JSON.stringify({
       channel_type: type, channel_id: id, start_message_seq: latest ? 0 : start,
-      end_message_seq: latest || through === 0xffffffff ? 0 : through + 1,
+      end_message_seq: latest || pageThrough === 0xffffffff ? 0 : pageThrough + 1,
       pull_mode: latest ? 0 : 1, limit: latest ? 1 : 100,
     }), signal, { timeout: 8000 })
     if (!data || data.messages !== null && !Array.isArray(data.messages)
@@ -290,17 +465,18 @@ export class OctoClient {
     let last = 0
     for (const row of data.messages ?? []) {
       const seq = channelSequence(row?.message_seq), messageId = decimalId(row?.message_id)
-      if (!seq || !messageId || seen.has(seq) || ids.has(messageId) || !latest && (seq < start || seq > through)
+      if (!seq || !messageId || seen.has(seq) || ids.has(messageId) || !latest && (seq < start || seq > pageThrough)
         || row.channel_type != null && row.channel_type !== type
         || type !== 1 && row.channel_id != null && row.channel_id !== id
         || type === 1 && row.from_uid !== id && row.from_uid !== config.botUid) throw new OctoError('invalid_inbox_response')
       seen.add(seq); ids.add(messageId); last = Math.max(last, seq)
       if (latest) continue
-      if (route.since_ms > 0) {
+      const effectiveSince = recoverySince(route, seq)
+      if (effectiveSince > 0) {
         if (!Number.isSafeInteger(row.timestamp) || row.timestamp <= 0 || row.timestamp * 1000 > Date.now() + 300000) {
           throw new OctoError('invalid_inbox_timestamp')
         }
-        if (row.timestamp * 1000 <= route.since_ms) { suppressed.push(messageId); continue }
+        if (row.timestamp * 1000 <= effectiveSince) { suppressed.push(messageId); continue }
       }
       if ([row.revoke, row.revoked, row.is_deleted, row.extra?.revoke, row.message_extra?.revoke].some(flag)) { suppressed.push(messageId); continue }
       let payload = row.message_extra?.content_edit ?? row.extra?.content_edit ?? row.payload
@@ -311,10 +487,22 @@ export class OctoClient {
       }
       const m = admit({ message: { message_id: messageId, message_seq: seq, from_uid: row.from_uid,
         channel_type: type, channel_id: id, payload } }, config)
-      if (m) messages.push(m)
+      if (m) {
+        // A RECV can share the CONNACK frame and enter recovery before live
+        // admission. Sync alone does not enforce the App's server-managed Space.
+        if (app) {
+          const verified = await this.channel.appMessage({ channel_type: type, channel_id: id }, id, messageId, signal)
+          if (verified.message_seq !== seq || verified.from_uid !== row.from_uid) throw new OctoError('invalid_inbox_response')
+        }
+        if (type !== 1 && directoryRange(route, seq)) m.directoryRecovery = recoveryBounds(route)
+        messages.push(m)
+      }
       else suppressed.push(messageId)
     }
-    return { last, messages: messages.sort((a, b) => a.messageSeq - b.messageSeq), count: seen.size, observed: [...ids], suppressed }
+    // Empty prefix is only EOF for this segment; Inbox must resume at its end,
+    // not checkpoint the original upper bound. No synthetic message count/seq.
+    return { last, messages: messages.sort((a, b) => a.messageSeq - b.messageSeq), count: seen.size, observed: [...ids], suppressed,
+      ...(!latest && pageThrough < through && !seen.size && { scannedThrough: pageThrough }) }
   }
 
   async events(signal, cursor = '0', options = {}) {

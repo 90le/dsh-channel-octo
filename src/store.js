@@ -7,6 +7,10 @@ function isDecimalInt64(id) {
   return typeof id === 'string' && /^[1-9]\d{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n
 }
 
+function isDirectoryGroup(id) {
+  return typeof id === 'string' && id.length === 32 && /^[a-fA-F0-9]{32}$/.test(id)
+}
+
 export class Store {
   constructor(dir, identity) {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -70,6 +74,8 @@ export class Store {
           blocked INTEGER NOT NULL DEFAULT 0, checked_ms INTEGER NOT NULL DEFAULT 0,
           retry_ms INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
           since_ms INTEGER NOT NULL DEFAULT 0,
+          directory_at INTEGER NOT NULL DEFAULT 0, directory_all INTEGER NOT NULL DEFAULT 0, prefix_until_seq INTEGER NOT NULL DEFAULT 0,
+          prefix_since_ms INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(channel_type, channel_id)
         );
         CREATE TABLE IF NOT EXISTS inbox_staged (
@@ -81,6 +87,16 @@ export class Store {
           id INTEGER PRIMARY KEY CHECK(id=1), ready INTEGER NOT NULL DEFAULT 0,
           baseline TEXT NOT NULL DEFAULT '0', bootstrap_cursor TEXT NOT NULL DEFAULT '0',
           failed INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS directory_recovery (
+          id INTEGER PRIMARY KEY CHECK(id=1), started_at INTEGER NOT NULL DEFAULT 0,
+          ready INTEGER NOT NULL DEFAULT 0, completed_at INTEGER NOT NULL DEFAULT 0,
+          failed INTEGER NOT NULL DEFAULT 0, listed_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS directory_groups (
+          group_no TEXT PRIMARY KEY NOT NULL, page INTEGER NOT NULL DEFAULT 1,
+          done INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+          checked_ms INTEGER NOT NULL DEFAULT 0, retry_ms INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS message_event_acks (
           event_id TEXT PRIMARY KEY NOT NULL, message_id TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0,
@@ -99,13 +115,21 @@ export class Store {
         CREATE INDEX IF NOT EXISTS jobs_route_order ON jobs(channel_type, COALESCE(channel_id,sender),route_order,seq)
           WHERE state IN ('queued','ready','running','sending');
       `)
-      if (!this.db.prepare('PRAGMA table_info(inbox_routes)').all().some(row => row.name === 'since_ms')) {
-        this.db.exec('ALTER TABLE inbox_routes ADD COLUMN since_ms INTEGER NOT NULL DEFAULT 0')
+      const routeColumns = new Set(this.db.prepare('PRAGMA table_info(inbox_routes)').all().map(row => row.name))
+      for (const column of ['since_ms', 'directory_at', 'directory_all', 'prefix_until_seq', 'prefix_since_ms']) {
+        if (!routeColumns.has(column)) this.db.exec(`ALTER TABLE inbox_routes ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`)
+      }
+      if (!this.db.prepare('PRAGMA table_info(directory_groups)').all().some(row => row.name === 'retry_ms')) {
+        this.db.exec('ALTER TABLE directory_groups ADD COLUMN retry_ms INTEGER NOT NULL DEFAULT 0')
+      }
+      if (!this.db.prepare('PRAGMA table_info(directory_recovery)').all().some(row => row.name === 'listed_at')) {
+        this.db.exec('ALTER TABLE directory_recovery ADD COLUMN listed_at INTEGER NOT NULL DEFAULT 0')
       }
       const ackColumns = new Set(this.db.prepare('PRAGMA table_info(message_event_acks)').all().map(row => row.name))
       if (!ackColumns.has('attempt')) this.db.exec('ALTER TABLE message_event_acks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0')
       if (!ackColumns.has('retry_ms')) this.db.exec('ALTER TABLE message_event_acks ADD COLUMN retry_ms INTEGER NOT NULL DEFAULT 0')
       this.db.prepare('INSERT OR IGNORE INTO event_recovery(id,started_at) VALUES (1,0)').run()
+      this.db.prepare('INSERT OR IGNORE INTO directory_recovery(id) VALUES (1)').run()
       this.db.exec('COMMIT')
       this.db.exec("UPDATE jobs SET state='review', issue='interrupted_' || state WHERE state IN ('running','sending')")
     } catch (error) {
@@ -119,9 +143,9 @@ export class Store {
       INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient,metadata,message_seq,route_order) VALUES (?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(message_id) DO NOTHING
     `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender, m.ambient ? 1 : 0,
-      m.attachment || m.attachments || m.parts || m.quoteId || m.command || m.cardAction || m.deferredForm ? JSON.stringify({
+      m.attachment || m.attachments || m.parts || m.quoteId || m.command || m.cardAction || m.deferredForm || m.directoryRecovery ? JSON.stringify({
         attachment: m.attachment, attachments: m.attachments, parts: m.parts, quoteId: m.quoteId, command: m.command, cardAction: m.cardAction,
-        deferredForm: m.deferredForm,
+        deferredForm: m.deferredForm, directoryRecovery: m.directoryRecovery,
       }) : null, m.messageSeq ?? null, m.messageSeq ??
         (this.db.prepare('SELECT MAX(message_seq) AS n FROM jobs WHERE channel_type=? AND COALESCE(channel_id,sender)=?')
           .get(m.channelType ?? 1, m.channelId ?? m.sender).n ?? 0) + 0.5)
@@ -133,7 +157,22 @@ export class Store {
     this.db.prepare(`INSERT INTO inbox_routes(channel_type,channel_id,floor_seq,checkpoint,blocked,checked_ms)
       VALUES (?,?,?,?,?,?) ON CONFLICT(channel_type,channel_id) DO NOTHING`)
       .run(m.channelType, m.channelId, m.messageSeq - 1, m.messageSeq - 1, blocked ? 1 : 0, Date.now())
+    this.promoteDirectoryRoute(m, 0)
     return this.inboxRoute(m.channelType, m.channelId)
+  }
+
+  // Actual delivery/events establish an accepted upper range independently of
+  // directory auto-discovery. Replays of already handled rows do not expand it.
+  promoteDirectoryRoute(m, since) {
+    if (![2, 5].includes(m.channelType) || !Number.isSafeInteger(m.messageSeq)
+      || m.messageSeq < 1 || m.messageSeq > 0xffffffff || this.inboxSeen(m.messageId)) return false
+    return this.db.prepare(`UPDATE inbox_routes SET
+      prefix_since_ms=MAX(since_ms,prefix_since_ms,directory_at),prefix_until_seq=?,
+      since_ms=CASE WHEN directory_all=1 THEN ? ELSE MIN(since_ms,?) END,
+      directory_all=0,checkpoint=MIN(checkpoint,?),blocked=1,retry_ms=0,checked_ms=0
+      WHERE channel_type=? AND channel_id=? AND (directory_all=1 OR prefix_until_seq>=?)`)
+      .run(m.messageSeq - 1, since, since, m.messageSeq - 1,
+        m.channelType, m.channelId, m.messageSeq).changes > 0
   }
   inboxRoute(type, id) {
     return this.db.prepare('SELECT * FROM inbox_routes WHERE channel_type=? AND channel_id=?').get(type, id)
@@ -227,6 +266,134 @@ export class Store {
     this.db.prepare('UPDATE event_recovery SET failed=? WHERE id=1').run(failed ? 1 : 0)
   }
 
+  directoryRecovery() {
+    const row = this.db.prepare(`SELECT started_at,ready,completed_at,failed,
+      (SELECT COUNT(*) FROM directory_groups WHERE done=0) AS pending_groups
+      FROM directory_recovery WHERE id=1`).get()
+    return { startedAt: row.started_at, ready: !!row.ready, completedAt: row.completed_at,
+      failed: !!row.failed, pendingGroups: row.pending_groups }
+  }
+
+  activateDirectoryRecovery(now = Date.now()) {
+    if (!Number.isSafeInteger(now) || now <= 0) return false
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const activated = this.db.prepare('UPDATE directory_recovery SET started_at=? WHERE id=1 AND started_at=0')
+        .run(now).changes > 0
+      // Only routes present at first activation retain their original recovery
+      // range. Later WS/event discoveries need the directory prefix below.
+      if (activated) this.db.prepare('UPDATE inbox_routes SET directory_at=? WHERE channel_type IN (2,5)').run(now)
+      this.db.exec('COMMIT')
+      return activated
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  beginDirectoryScan(groupIds, now = Date.now()) {
+    if (this.directoryRecovery().pendingGroups) return false
+    return this.mergeDirectoryScan(groupIds, now)
+  }
+
+  directoryListedAt() {
+    // Scheduling metadata stays out of the public account recovery status.
+    return this.db.prepare('SELECT listed_at FROM directory_recovery WHERE id=1').get().listed_at
+  }
+
+  mergeDirectoryScan(groupIds, now = Date.now()) {
+    // Match the bounded group listing; reject a malformed/partial list before
+    // merging any durable scan. Exact IDs are kept, without case rewriting.
+    if (!Array.isArray(groupIds) || groupIds.length > 1000 || !Number.isSafeInteger(now) || now <= 0) return false
+    const ids = new Set(groupIds)
+    if (ids.size !== groupIds.length || [...ids].some(id => !isDirectoryGroup(id))) return false
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const recovery = this.directoryRecovery()
+      if (!recovery.startedAt) { this.db.exec('ROLLBACK'); return false }
+      this.db.prepare('DELETE FROM directory_groups WHERE group_no NOT IN (SELECT value FROM json_each(?))')
+        .run(JSON.stringify(groupIds))
+      // Pending pages retain their exact deadline and position. Completed
+      // groups restart at page 1, retaining their last turn for fair scheduling.
+      const insert = this.db.prepare(`INSERT INTO directory_groups(group_no) VALUES (?)
+        ON CONFLICT(group_no) DO UPDATE SET page=1,done=0,failed=0,retry_ms=0 WHERE directory_groups.done=1`)
+      for (const id of ids) insert.run(id)
+      this.db.prepare(`UPDATE directory_recovery SET ready=?,completed_at=?,listed_at=?,
+        failed=EXISTS(SELECT 1 FROM directory_groups WHERE failed=1) WHERE id=1`)
+        .run(ids.size ? 0 : 1, ids.size ? 0 : now, now)
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  nextDirectoryGroup(now = Date.now()) {
+    return this.db.prepare('SELECT * FROM directory_groups WHERE done=0 AND retry_ms<=? ORDER BY checked_ms,group_no LIMIT 1').get(now)
+  }
+
+  retryDirectoryStep(group, retryAt, now = Date.now()) {
+    if (!isDirectoryGroup(group) || !Number.isSafeInteger(now) || now <= 0
+      || !Number.isSafeInteger(retryAt) || retryAt <= now) return false
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      // Keep the failed page pending across restarts. Other due groups can run
+      // while this one waits; it must not trigger a replacement catalog scan.
+      const changed = this.db.prepare(`UPDATE directory_groups SET failed=1,retry_ms=?,checked_ms=?
+        WHERE group_no=? AND done=0`).run(retryAt, now, group).changes > 0
+      if (changed) this.db.exec('UPDATE directory_recovery SET failed=1 WHERE id=1')
+      this.db.exec('COMMIT')
+      return changed
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  completeDirectoryStep(group, nextPage = null, failed = false, now = Date.now()) {
+    if (!isDirectoryGroup(group) || nextPage !== null && (!Number.isSafeInteger(nextPage) || nextPage <= 0)
+      || !Number.isSafeInteger(now) || now <= 0) return false
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const changed = this.db.prepare(`UPDATE directory_groups
+        SET page=COALESCE(?,page),done=?,failed=?,retry_ms=0,checked_ms=? WHERE group_no=? AND done=0`)
+        .run(nextPage, nextPage === null ? 1 : 0, failed ? 1 : 0, now, group).changes > 0
+      if (changed) this.db.exec(`UPDATE directory_recovery SET
+        failed=EXISTS(SELECT 1 FROM directory_groups WHERE failed=1) WHERE id=1`)
+      if (changed) this.db.prepare(`UPDATE directory_recovery SET ready=1,completed_at=?,
+        failed=EXISTS(SELECT 1 FROM directory_groups WHERE failed=1)
+        WHERE id=1 AND NOT EXISTS(SELECT 1 FROM directory_groups WHERE done=0)`).run(now)
+      this.db.exec('COMMIT')
+      return changed
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  directoryRecoveryFailed(failed) {
+    this.db.prepare('UPDATE directory_recovery SET failed=? WHERE id=1').run(failed ? 1 : 0)
+  }
+
+  seedDirectoryRoute(type, id) {
+    if (!(type === 2 ? isDirectoryGroup(id) : type === 5 && typeof id === 'string'
+      && id === id.trim() && /^[a-fA-F0-9]{32}____[0-9]{15,20}$/.test(id))) return false
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const startedAt = this.directoryRecovery().startedAt
+      if (!startedAt) { this.db.exec('ROLLBACK'); return false }
+      let changed = this.db.prepare(`INSERT INTO inbox_routes
+        (channel_type,channel_id,floor_seq,checkpoint,blocked,since_ms,directory_at,directory_all)
+        VALUES (?,?,0,0,1,?,?,1) ON CONFLICT(channel_type,channel_id) DO NOTHING`)
+        .run(type, id, startedAt, startedAt).changes > 0
+      if (!changed) {
+        // WS/events raced after activation. Bound only the newly added prefix
+        // by directory time, retaining since_ms for the original upper range.
+        changed = this.db.prepare(`UPDATE inbox_routes SET
+          prefix_until_seq=CASE WHEN floor_seq>0 THEN floor_seq ELSE prefix_until_seq END,
+          prefix_since_ms=CASE WHEN floor_seq>0 THEN ? ELSE prefix_since_ms END,
+          checkpoint=CASE WHEN floor_seq>0 THEN 0 ELSE checkpoint END,
+          blocked=CASE WHEN floor_seq>0 THEN 1 ELSE blocked END,
+          retry_ms=CASE WHEN floor_seq>0 THEN 0 ELSE retry_ms END,
+          checked_ms=CASE WHEN floor_seq>0 THEN 0 ELSE checked_ms END,
+          floor_seq=0,directory_at=?
+          WHERE channel_type=? AND channel_id=? AND directory_at=0`)
+          .run(startedAt, startedAt, type, id).changes > 0
+      }
+      this.db.exec('COMMIT')
+      return changed
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
   queueMessageEventAck(eventId, messageId) {
     if (!isDecimalInt64(eventId) || !isDecimalInt64(messageId)) return false
     // Receipt validation and insertion share a statement (and any caller transaction).
@@ -289,6 +456,7 @@ export class Store {
       let enrolled = this.db.prepare(`INSERT INTO inbox_routes(channel_type,channel_id,floor_seq,checkpoint,blocked,checked_ms,since_ms)
         VALUES (?,?,?,?,1,?,?) ON CONFLICT(channel_type,channel_id) DO NOTHING`)
         .run(m.channelType, m.channelId, m.messageSeq - 1, m.messageSeq - 1, Date.now(), startedAt).changes > 0
+      if (!enrolled) enrolled = this.promoteDirectoryRoute(m, startedAt)
       // A smaller sequence may arrive after the first discovery. Only these
       // time-bounded routes can lower their floor; legacy live-route floors stay
       // intact. Existing message receipts suppress already handled rows.
@@ -623,10 +791,12 @@ export class Store {
       this.db.prepare("UPDATE jobs SET state='review', issue='account_removed', input='', reply=NULL, metadata=NULL WHERE state IN ('queued','ready')").run()
       // A staged/discovered message may already be ACKed. Retain its receipt
       // before retiring it, including for older versions that only consult inbox_seen.
-      // Recovery state and pending/completed ACK mappings deliberately survive.
+      // Activation boundaries and pending/completed ACK mappings survive. A
+      // re-added account needs a fresh directory scan, not abandoned page work.
       this.db.exec(`INSERT OR IGNORE INTO inbox_seen(message_id) SELECT message_id FROM inbox_staged;
         INSERT OR IGNORE INTO inbox_seen(message_id) SELECT message_id FROM inbox_event_discoveries;
-        DELETE FROM inbox_staged; DELETE FROM inbox_routes; COMMIT;`)
+        DELETE FROM inbox_staged; DELETE FROM inbox_routes; DELETE FROM directory_groups;
+        UPDATE directory_recovery SET ready=0,completed_at=0,failed=0,listed_at=0 WHERE id=1; COMMIT;`)
     } catch (error) { this.db.exec('ROLLBACK'); throw error }
   }
   hasPending() {
