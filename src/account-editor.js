@@ -63,7 +63,7 @@ const copy = {
   sendMode: ['发送方式', 'Send mode'],
   sendQueue: ['排队发送', 'Queue'],
   sendSteer: ['插话发送', 'Steer'],
-  sendSteerNote: ['实时连接下，同一白名单用户可向正在运行的 Octo 私聊任务补充文字指令。其他消息仍按队列发送。', 'The same allowlisted user can steer an active Octo-owned WebSocket DM. Other messages are queued.'],
+  sendSteerNote: ['实时连接下，同一获准使用工具的私聊用户可补充文字指令，附件准备中的补充会与附件一起处理。其他消息仍按队列发送。', 'Over WebSocket, the same DM user authorized for tools can add instructions, including while attachments are being prepared. Other messages are queued.'],
   dmCommands: ['私聊命令', 'DM commands'],
   groupCommands: ['群聊命令', 'Group commands'],
   commandsOff: ['仅正常对话', 'Conversation only'],

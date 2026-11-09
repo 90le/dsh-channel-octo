@@ -49,6 +49,7 @@ export class Store {
       if (!columns.has('ambient')) this.db.exec('ALTER TABLE jobs ADD COLUMN ambient INTEGER NOT NULL DEFAULT 0')
       if (!columns.has('metadata')) this.db.exec('ALTER TABLE jobs ADD COLUMN metadata TEXT')
       if (!columns.has('session_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN session_id TEXT')
+      if (!columns.has('message_seq')) this.db.exec('ALTER TABLE jobs ADD COLUMN message_seq INTEGER')
       this.db.exec('CREATE INDEX IF NOT EXISTS jobs_by_session ON jobs(session_id, seq)')
       this.db.exec(`
         CREATE INDEX IF NOT EXISTS jobs_by_route
@@ -65,10 +66,12 @@ export class Store {
 
   add(eventId, m) {
     return this.db.prepare(`
-      INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient,metadata) VALUES (?,?,?,?,?,?,?,?)
+      INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient,metadata,message_seq) VALUES (?,?,?,?,?,?,?,?,?)
       ON CONFLICT(message_id) DO NOTHING
     `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender, m.ambient ? 1 : 0,
-      m.attachment || m.command || m.cardAction ? JSON.stringify({ attachment: m.attachment, command: m.command, cardAction: m.cardAction }) : null)
+      m.attachment || m.attachments || m.parts || m.quoteId || m.command || m.cardAction ? JSON.stringify({
+        attachment: m.attachment, attachments: m.attachments, parts: m.parts, quoteId: m.quoteId, command: m.command, cardAction: m.cardAction,
+      }) : null, m.messageSeq ?? null)
   }
 
   rememberAnswer(eventId, message, sessionId) {

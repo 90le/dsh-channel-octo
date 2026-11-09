@@ -2,7 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { validUid } from './config.js'
 import { randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
-import { normalizeAttachment } from './octo-media.js'
+import { normalizeOctoContent } from './octo-content.js'
 import { parseSafeCommand } from './im-controls.js'
 
 const maxBody = 1024 * 1024
@@ -25,6 +25,10 @@ export class OctoError extends Error {
 export function decimalId(value) {
   const s = typeof value === 'string' ? value : Number.isSafeInteger(value) ? String(value) : ''
   return /^[1-9]\d{0,18}$/.test(s) && BigInt(s) <= 9223372036854775807n ? s : undefined
+}
+
+export function channelSequence(value) {
+  return Number.isInteger(value) && value > 0 && value <= 0xffffffff ? value : undefined
 }
 
 export function readJson(text) {
@@ -152,6 +156,44 @@ export class OctoClient {
     return true
   }
 
+  async recentMessages(config, route, before, signal) {
+    const type = route.channel_type, id = route.channel_id
+    if (![1, 2, 5].includes(type) || (type === 1 ? !validUid(id) || id.includes('@') : !ruleScope(type, id))) {
+      throw new OctoError('invalid_history_scope')
+    }
+    const end = channelSequence(before)
+    if (end === 1) return { rows: [], more: false }
+    const data = await this.#request('/v1/bot/messages/sync', JSON.stringify({
+      ...route, start_message_seq: end ? end - 1 : 0, end_message_seq: 0, pull_mode: 0, limit: 20,
+    }), signal, { timeout: 4500 })
+    if (data?.messages !== null && !Array.isArray(data?.messages)) throw new OctoError('invalid_history_response')
+    const rows = []
+    const seenSeq = new Set(), seenId = new Set()
+    for (const item of (data.messages ?? []).slice(0, 60)) {
+      const seq = channelSequence(item?.message_seq), messageId = decimalId(item?.message_id)
+      if (!seq || end && seq >= end || !messageId || seenId.has(messageId) || seenSeq.has(seq)
+        || item.channel_type != null && item.channel_type !== type
+        || type !== 1 && item.channel_id != null && item.channel_id !== id
+        || type === 1 && item.from_uid !== id && item.from_uid !== config.botUid
+        || [item.revoke, item.revoked, item.is_deleted, item.extra?.revoke, item.message_extra?.revoke].some(flag)) continue
+      let payload = item.payload
+      if (typeof payload === 'string') {
+        if (payload.length > 120_000) continue
+        try {
+          payload = readJson(payload.trimStart().startsWith('{') ? payload : Buffer.from(payload, 'base64').toString('utf8'))
+        } catch { continue }
+      }
+      if (!payload || payload.event != null || (payload.space_id != null && payload.space_id !== config.spaceId)) continue
+      const content = normalizeOctoContent(payload)
+      if (!content?.text?.trim()) continue
+      seenSeq.add(seq)
+      seenId.add(messageId)
+      rows.push({ seq, messageId, sender: validUid(item.from_uid) ? item.from_uid : 'unknown',
+        text: Array.from(content.text).slice(0, 280).join('') })
+    }
+    return { rows: rows.sort((a, b) => a.seq - b.seq).slice(-20), more: flag(data.more) || (data.messages?.length ?? 0) >= 20 }
+  }
+
   async events(signal, cursor = '0') {
     const started = Date.now()
     if (cursor !== '0' && !decimalId(cursor)) throw new OctoError('invalid_event_id')
@@ -173,14 +215,20 @@ export class OctoClient {
     if (result?.status !== 200) throw new OctoError('invalid_ack_response')
   }
 
-  async send(recipient, text, signal, channelType = 1) {
-    if (![1, 2, 5].includes(channelType)) throw new OctoError('invalid_channel_type')
+  async send(recipient, text, signal, channelType = 1, replyTo) {
+    return this.sendPayload({ channel_id: recipient, channel_type: channelType }, { type: 1, content: text }, signal, replyTo)
+  }
+
+  async sendPayload(route, payload, signal, replyTo) {
+    if (![1, 2, 5].includes(route.channel_type)) throw new OctoError('invalid_channel_type')
+    const id = decimalId(replyTo)
     const result = await this.#request('/v1/bot/sendMessage', JSON.stringify({
-      channel_id: recipient, channel_type: channelType, payload: { type: 1, content: text },
+      channel_id: route.channel_id, channel_type: route.channel_type,
+      payload: id ? { ...payload, reply: { message_id: id } } : payload,
     }), signal)
-    const id = decimalId(result?.message_id)
-    if (!id) throw new OctoError('send_result_unconfirmed')
-    return id
+    const sent = decimalId(result?.message_id)
+    if (!sent) throw new OctoError('send_result_unconfirmed')
+    return sent
   }
 
   async cardProfile(signal) {
@@ -239,41 +287,33 @@ export function permitsRoute(config, sender, channelType, channelId) {
   return false
 }
 
-// Only unfold text already carried by this event; never fetch quoted/history data.
-function messageText(payload, depth = 0) {
-  if (!payload || depth > 3) return ''
-  const plain = v => typeof v === 'string' ? v.slice(0, 8000) : ''
-  if (payload.type === 1) return plain(payload.content)
-  if (payload.type === 14) return plain(payload.plain) || (Array.isArray(payload.content)
-    ? payload.content.slice(0, 32).filter(item => item?.type === 'text').map(item => plain(item.text)).join('').slice(0, 8000)
-    : plain(payload.content))
-  if (payload.type === 11 && Array.isArray(payload.msgs)) {
-    const lines = payload.msgs.slice(0, 8).map(item => messageText(item?.payload, depth + 1)).filter(Boolean)
-    return lines.length ? '【合并转发，以下是引用材料】\n' + lines.join('\n').slice(0, 7600) : ''
-  }
-  return ''
-}
-
 export function admit(event, config) {
   const message = event?.message
   const sender = message?.from_uid
   const payload = message?.payload
-  const text = messageText(payload).trim()
-  const attachment = config.allowFiles ? normalizeAttachment(payload) : undefined
   const messageId = decimalId(message?.message_id)
   const channelType = message?.channel_type
   const channelId = channelType === 1 ? sender : message?.channel_id
   if (!messageId || event.event_type || payload?.event != null
     || !permitsRoute(config, sender, channelType, channelId)
-    || (message.payload.space_id != null && message.payload.space_id !== config.spaceId)
-    || (!text && !attachment) || Buffer.byteLength(text, 'utf8') > 8000) return
+    || !payload || (payload.space_id != null && payload.space_id !== config.spaceId)) return
+  const content = normalizeOctoContent(payload, config)
+  if (!content) return
+  const { text, attachment, attachments, parts } = content
+  const messageSeq = channelSequence(message.message_seq)
+  const quoteId = !Number.isInteger(payload.reply?.payload?.type) ? decimalId(payload.reply?.message_id) : undefined
   let ambient = false
+  let mention = payload.mention
   if (channelType !== 1) {
-    const mention = message.payload.mention
     if (mention != null && (typeof mention !== 'object' || Array.isArray(mention))) return
     if ([mention?.all, mention?.ais, mention?.humans].some(flag)) return
-    if (mention?.uids != null && !Array.isArray(mention.uids)) return
-    const targets = mention?.uids ?? []
+    if (mention?.uids != null && !Array.isArray(mention.uids)
+      || mention?.entities != null && !Array.isArray(mention.entities)) return
+    // New Octo clients carry the targeted UIDs in UTF-16 mention entities.
+    // Like the official adapter, prefer valid entities and fall back to uids.
+    const entities = (mention?.entities ?? []).slice(0, 100).flatMap(entry => validUid(entry?.uid) ? [entry.uid] : [])
+    const targets = [...new Set(entities.length ? entities : (mention?.uids ?? []).slice(0, 100))]
+    if (mention) mention = { ...mention, uids: targets }
     if (!targets.includes(config.botUid)) {
       if (config.mentionPolicy !== 'octo' || targets.length || /(?:^|\s)[@＠]\S/u.test(text)) return
       ambient = true
@@ -281,11 +321,12 @@ export function admit(event, config) {
   }
   // For a DM the raw channel ID is not necessarily the recipient's UID. Group
   // and topic replies use the original channel address, never the sender UID.
-  const command = parseSafeCommand(text, config, {
-    routeAllowed: true, channelType, hasAttachments: !!attachment, botUid: config.botUid, mention: payload?.mention,
+  const command = payload.type === 1 ? parseSafeCommand(text, config, {
+    routeAllowed: true, channelType, hasAttachments: !!(attachment || attachments?.length || parts), botUid: config.botUid, mention,
     actorApproved: sender === config.ownerUid || config.allowed.has(sender), isBotOwner: sender === config.ownerUid,
-  })
+  }) : { kind: 'text' }
   if (command.kind === 'blocked' || (command.kind === 'command' && payload.type !== 1)) return
   return { messageId, sender, text, channelId, channelType, ambient,
-    ...(attachment && { attachment }), ...(command.kind === 'command' && { command: command.command }) }
+    ...(messageSeq && { messageSeq }), ...(quoteId && { quoteId }),
+    ...(attachment && { attachment }), ...(attachments && { attachments }), ...(parts && { parts }), ...(command.kind === 'command' && { command: command.command }) }
 }

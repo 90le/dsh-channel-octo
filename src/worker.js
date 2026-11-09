@@ -1,10 +1,10 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { isAbsolute, relative } from 'node:path'
-import { admit, decimalId, OctoError, permitsRoute } from './octo.js'
+import { admit, channelSequence, decimalId, OctoError, permitsRoute } from './octo.js'
 import { receiveRealtime } from './realtime.js'
 import { Progress } from './progress.js'
 import { QuestionBridge } from './questions.js'
-import { downloadAttachment, uploadAttachment } from './octo-media.js'
+import { downloadAttachment, prepareAttachment, uploadAttachment } from './octo-media.js'
 import { readDeliverable } from './dsh-media.js'
 import { createCard, parseCardAction, resolveCardAction, sendCard } from './octo-cards.js'
 
@@ -19,6 +19,30 @@ function authorizedToolDm(config, job) {
 }
 function asksForFile(input) {
   return /(?:发送|发给|发我|回传|传给|交付|附上).{0,14}(?:文件|附件)|(?:文件|附件).{0,14}(?:发送|发给|发我|回传|传给|交付)|\b(?:send|attach|deliver)\b.{0,24}\b(?:file|attachment)\b/iu.test(input)
+}
+async function materializeInput(config, meta, signal) {
+  const descriptors = meta.attachments ?? (meta.attachment ? [meta.attachment] : [])
+  if (!descriptors.length) return { attachments: [], order: meta.parts }
+  const attachments = [], indices = new Map()
+  const budget = AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+  let total = 0
+  for (const [i, descriptor] of descriptors.entries()) {
+    try {
+      budget.throwIfAborted()
+      if (total + (descriptor.size ?? 0) > 40 * 1024 * 1024) continue
+      const attachment = await downloadAttachment(config, descriptor, budget)
+      if (total + attachment.bytes.length > 40 * 1024 * 1024) continue
+      total += attachment.bytes.length
+      indices.set(i, attachments.length)
+      attachments.push(attachment)
+    } catch {
+      signal.throwIfAborted()
+    }
+  }
+  const unavailable = { text: '【附件未能读取】' }
+  if (!meta.parts && !attachments.length) throw new OctoError('attachment_unavailable')
+  return { attachments, order: meta.parts?.map(part =>
+    Number.isInteger(part.media) ? (indices.has(part.media) ? { media: indices.get(part.media) } : unavailable) : part) }
 }
 const cardForm = command => command === 'card'
   ? { title: 'DSH · Octo', text: '这是 Octo 展示卡片。输入 /choose 可以试用带按钮的交互卡片。' }
@@ -59,6 +83,7 @@ export class Worker {
     this.progress = new Progress(api, log)
     this.questions = new QuestionBridge({ api, store, log })
     this.cursor = '0'
+    this.steering = new Set()
   }
 
   reconfigure(config, host) {
@@ -74,23 +99,35 @@ export class Worker {
   }
 
   acceptInbound(eventId, message) {
-    const question = !message.attachment && !message.command && this.questions.match(message)
+    const question = !message.attachment && !message.attachments?.length && !message.command && message.text.trim() && this.questions.match(message)
     if (question && authorizedToolDm(this.config, { sender: message.sender, channel_type: message.channelType })) {
       if (this.store.rememberAnswer(eventId, message, question.sessionId)) this.questions.text(question, message.text)
       return
     }
     if (this.stopIntake) return
     const inserted = this.store.add(eventId, message)
-    if (inserted.changes && !this.paused) this.attemptSteering(message.messageId)
+    const active = this.steerActive?.job ?? this.currentJob
+    if (inserted.changes && !this.paused && active && this.config.sendMode === 'steer'
+      && message.channelType === 1 && message.sender === active.sender && message.channelId === active.sender
+      && !message.command && !message.parts && !message.attachment && !message.attachments?.length
+      && message.text.trim() && this.steering.size < 32) {
+      this.steering.add(message.messageId)
+      this.attemptSteering()
+    }
   }
 
   async drain(signal) {
     while (!signal.aborted) {
       const job = !this.paused && this.store.next(Date.now())
       if (!job) { await delay(150, undefined, { signal }); continue }
+      this.currentJob = job
       const work = this.process(job, signal)
       this.inFlight = work
-      try { await work } finally { if (this.inFlight === work) this.inFlight = undefined }
+      try { await work } finally {
+        this.currentJob = undefined
+        this.steering.clear()
+        if (this.inFlight === work) this.inFlight = undefined
+      }
     }
   }
 
@@ -133,17 +170,42 @@ export class Worker {
     }
   }
 
-  attemptSteering(messageId) {
+  attemptSteering() {
     const active = this.steerActive
     if (!active || this.config.sendMode !== 'steer' || this.questions.current
       || this.config.sessionProfile !== active.profile
       || !authorizedToolDm(this.config, active.job)) return
     const next = this.store.steerCandidate(active.job)
-    if (!next || next.message_id !== messageId || next.sender !== active.job.sender || next.metadata || !next.input) return
+    if (!next || !this.steering.has(next.message_id) || next.sender !== active.job.sender || next.metadata || !next.input) return
     active.offer(next.input, () => {
       this.store.running(next.seq, active.sessionId)
       active.merged.push(next.seq)
+      this.steering.delete(next.message_id)
     })
+  }
+
+  async channelContext(config, route, job, meta, signal) {
+    const group = route.channel_type === 2 || route.channel_type === 5
+    const before = channelSequence(job.message_seq)
+    const source = group ? (route.channel_type === 2 ? '当前群主区' : '当前子区') : '当前私聊'
+    if ((!group && !meta.quoteId) || typeof this.api.recentMessages !== 'function') return
+    // Only the originating route is ever queried. Never resolve group history
+    // from a DM or substitute the parent channel for a topic.
+    let result
+    if (before || meta.quoteId) {
+      try { result = await this.api.recentMessages(config, route, before, signal) }
+      catch { signal.throwIfAborted(); this.log('channel_history_unavailable') }
+    }
+    const quote = meta.quoteId && result?.rows.find(row => row.messageId === meta.quoteId)
+    let rows = group && before ? (result?.rows ?? []).filter(row =>
+      row.seq < before && row.messageId !== job.message_id && row.messageId !== meta.quoteId && row.sender !== config.botUid) : []
+    rows = rows.slice(-12)
+    return {
+      source, status: !group ? 'quote-only' : !before ? 'position-unavailable' : !result ? 'unavailable'
+        : rows.length ? 'recent-only' : 'empty',
+      ...(quote && { quote: { sender: quote.sender, text: quote.text } }),
+      ...(group && { history: rows.map(({ seq, sender, text }) => ({ seq, sender, text })) }),
+    }
   }
 
   async process(job, signal) {
@@ -175,7 +237,7 @@ export class Worker {
       this.store.discard(job.seq, 'command_not_allowed')
       return
     }
-    if (meta.attachment && !config.allowFiles) {
+    if ((meta.attachment || meta.attachments?.length) && !config.allowFiles) {
       this.store.discard(job.seq, 'files_disabled')
       return
     }
@@ -216,25 +278,56 @@ export class Worker {
             ? '已确认：选项 ' + meta.cardAction.selection + '。' : '已确认。'
         } else {
           progress = this.progress.start(job, config.progress, signal)
-          const attachments = meta.attachment ? [await downloadAttachment(config, meta.attachment, signal)] : []
+          const [material, channelContext] = await Promise.all([
+            materializeInput(config, meta, signal),
+            this.channelContext(config, route, job, meta, signal),
+          ])
+          const { attachments, order } = material
           let session = this.store.session(conversation, config.idleMinutes)
           if (this.isArchived?.(session.session_id)) session = this.store.session(conversation, config.idleMinutes, Date.now(), true)
           this.store.running(job.seq, session.session_id)
+          const isFileOnly = attachments.length > 0 && !job.input.trim()
+          const canMerge = () => config.transport === 'websocket' && !this.paused && this.config.sendMode === 'steer'
+            && this.config.sessionProfile === config.sessionProfile && authorizedToolDm(this.config, job)
+          // A file sent without a caption is often followed by its instructions
+          // in a separate message. Give that text a short chance to join.
+          if (isFileOnly && canMerge() && !this.steering.size) await delay(1000, undefined, { signal })
+          const instructions = []
+          if (canMerge()) {
+            for (let i = 0; i < 4; i++) {
+              const next = this.store.steerCandidate(job)
+              if (!next || next.sender !== job.sender || next.metadata || !this.steering.has(next.message_id)) break
+              this.store.running(next.seq, session.session_id)
+              this.steering.delete(next.message_id)
+              merged.push(next.seq)
+              instructions.push(next.input)
+            }
+          }
+          const supplement = instructions.length ? '\n\n【同一用户补充的要求】\n' + instructions.join('\n') : ''
+          const input = job.input + supplement
+          const inputOrder = supplement ? [
+            ...(order ?? [...(job.input.trim() ? [{ text: job.input }] : []), ...attachments.map((_, media) => ({ media }))]),
+            { text: supplement },
+          ] : order
           const authorCard = safeCommand(config, job) && !attachments.length
-            && /卡片|\bcard\b/iu.test(job.input)
-          reply = await host.run(session, job.input, async () => {
+            && /卡片|\bcard\b/iu.test(input)
+          reply = await host.run(session, input, async () => {
             this.store.sessionCreated(conversation)
             await this.attach?.(session.session_id, config.cwd)
           }, signal, rules,
-            phase => { if (phase === 'reused') this.log('dsh_session_reused'); else progress.stage(phase) }, config.timeoutMs, toolsAllowed,
-            { attachments, authorCard, taskContext: channelType === 1, onTrace: trace => progress.trace(trace),
+            phase => {
+              if (phase === 'reused') this.log('dsh_session_reused')
+              else progress.stage(phase)
+              if (phase === 'running') queueMicrotask(() => this.attemptSteering())
+            }, config.timeoutMs, toolsAllowed,
+            { attachments, order: inputOrder, authorCard, channelContext, taskContext: channelType === 1, onTrace: trace => progress.trace(trace),
               ...(toolsAllowed && { onQuestion: (questions, askSignal) => this.questions.ask(questions,
                 { ...job, session_id: session.session_id }, config, askSignal,
                 waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' })) }),
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
-              ...(toolsAllowed && config.transport === 'websocket' && !attachments.length
+              ...(toolsAllowed && config.transport === 'websocket'
                 && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })
-          if (channelType === 1 && asksForFile(job.input) && !deliverables?.length) {
+          if (channelType === 1 && asksForFile(input) && !deliverables?.length) {
             const issue = !config.allowFiles ? 'files_disabled' : !toolsAllowed || config.toolPermission === 'text-only'
               ? 'file_tools_unavailable' : 'file_not_presented'
             this.store.review(job.seq, issue)
@@ -281,15 +374,25 @@ export class Worker {
     this.store.sending(job.seq)
     progress?.stage('delivering')
     let confirmed = false
+    const replyTo = decimalId(job.message_id)
+    const markMedia = (id, count = 1) => {
+      confirmed = true
+      this.store.recordDelivery(job.seq, id)
+      for (let i = 0; i < count; i++) progress?.trace({ kind: 'file-sent' })
+    }
     try {
+      const images = []
       if (meta.deliverables?.length) {
         if (!config.allowFiles || !authorizedToolDm(config, job) || config.toolPermission === 'text-only') throw new Error('files_not_authorized')
         for (const path of meta.deliverables) {
           const file = await readDeliverable(config.cwd, isAbsolute(path) ? relative(config.cwd, path) : path, signal)
-          const delivered = await uploadAttachment(config, route, file, signal)
-          confirmed = true
-          this.store.recordDelivery(job.seq, delivered)
-          progress?.trace({ kind: 'file-sent' })
+          if (typeof this.api.sendPayload !== 'function') {
+            markMedia(await uploadAttachment(config, route, file, signal))
+            continue
+          }
+          const payload = await prepareAttachment(config, file, signal)
+          if (!meta.displayCard && payload.type === 2 && payload.width > 0 && payload.height > 0) images.push(payload)
+          else markMedia(await this.api.sendPayload(route, payload, signal, replyTo))
         }
       }
       let resultId
@@ -305,8 +408,25 @@ export class Worker {
       }
       if (!resultId) {
         const chunks = segments(job.reply)
+        if (images.length && chunks.length) {
+          const payload = { type: 14, content: [{ type: 'text', text: chunks[0] },
+            ...images.map(({ url, width, height }) => ({ type: 'image', url, width, height }))] }
+          if (Buffer.byteLength(JSON.stringify(payload)) <= 48 * 1024) {
+            try {
+              resultId = await this.api.sendPayload(route, payload, signal, replyTo)
+              chunks.shift()
+              markMedia(resultId, images.length)
+              images.length = 0
+            } catch (error) {
+              // A definitive unsupported/invalid response can downgrade to native
+              // images without re-uploading. An ambiguous response is never replayed.
+              if (!(error instanceof OctoError) || ![400, 415, 422].includes(error.status)) throw error
+            }
+          }
+          for (const image of images) markMedia(await this.api.sendPayload(route, image, signal, replyTo))
+        }
         for (const chunk of chunks) {
-          const delivered = await this.api.send(recipient, chunk, signal, channelType)
+          const delivered = await this.api.send(recipient, chunk, signal, channelType, replyTo)
           confirmed = true
           resultId ??= delivered
           if (chunks.length > 1 || meta.deliverables?.length) this.store.recordDelivery(job.seq, resultId)
@@ -365,7 +485,7 @@ export class Worker {
     const accept = m => {
       signal.throwIfAborted()
       const candidate = admit({ message: {
-        message_id: m.messageId, from_uid: m.fromUid, channel_type: m.channelType,
+        message_id: m.messageId, message_seq: m.messageSeq, from_uid: m.fromUid, channel_type: m.channelType,
         channel_id: m.channelId, payload: m.payload,
       } }, this.config)
       if (candidate) this.acceptInbound('ws:' + candidate.messageId, candidate)

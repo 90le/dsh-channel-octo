@@ -109,7 +109,7 @@ export function apply(ctx) {
       version: 1, endpoint: 'https://octo-fixture.invalid/api', accounts: [{
         id: 'legacy', botUid: 'fixture-bot', spaceId: 'fixture-space', cwd: home,
         label: 'Octo Bot', enabled: true, permission: 'workspace-write', agentPreset: 'standard',
-        senderPolicy: 'octo', transport: 'websocket', allowFiles: true,
+        senderPolicy: 'octo', transport: 'websocket', allowFiles: true, sendMode: 'steer',
       }],
     }), { mode: 0o600 })
   }
@@ -123,7 +123,7 @@ export function apply(ctx) {
       : ['    allowedUids: [fixture-user]',
         '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
         '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]']),
-    '    threadRuleMode: inherit-group',
+    '    threadRuleMode: inherit-group', '    allowFiles: true',
     '    hostPermissions: [read-only, workspace-write, danger-full-access, auto]',
     ...(ownerSmoke ? ['    mediaDownloadOrigins: ["https://files-fixture.invalid"]',
       '    mediaUploadOrigins: ["https://storage-fixture.invalid"]'] : []),
@@ -327,8 +327,9 @@ export function apply(ctx) {
   }
   // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
   const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
-  while (Date.now() < replyDeadline && child.exitCode === null && sentCount() !== 5) await delay(200)
-  if (sentCount() !== 5) {
+  const expectedReceipts = ownerSmoke ? 6 : 5
+  while (Date.now() < replyDeadline && child.exitCode === null && sentCount() !== expectedReceipts) await delay(200)
+  if (sentCount() !== expectedReceipts) {
     let jobs = []
     try {
       const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
@@ -350,7 +351,16 @@ export function apply(ctx) {
   if (ownerSmoke && (readFileSync(join(home, 'octo-tool-fixture.txt'), 'utf8') !== 'written by native DSH'
     || !output.includes('FIXTURE_FILE_OK') || !output.includes('FIXTURE_QUESTION_ANSWERED'))) throw new Error('Native write/present/delivery failed: '
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
-  if (ownerSmoke) console.log('PASS: native question resumed from an Octo reply, then DSH wrote and delivered identical file bytes.')
+  if (!output.includes('FIXTURE_RICH_IMAGE_DOWNLOADED') || output.includes('FIXTURE_SYNC_SCOPE_WRONG')) throw new Error('Missing scoped rich media/history')
+  if (ownerSmoke) {
+    const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
+    try {
+      const rows = db.prepare("SELECT message_id,result_id,session_id FROM jobs WHERE state='sent' AND message_id IN ('1','902')").all()
+      if (rows.length !== 2 || !rows[0].result_id || rows[0].result_id !== rows[1].result_id
+        || !rows[0].session_id || rows[0].session_id !== rows[1].session_id) throw new Error('File and follow-up did not share one confirmed reply')
+    } finally { db.close() }
+    console.log('PASS: file and follow-up shared one round; native question resumed from Octo, then DSH wrote and delivered identical file bytes.')
+  }
   if (!ownerSmoke) {
     const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')
     if (!imLog.includes('API 已注册') || !imLog.includes('attachMappedSessions')) throw new Error('IM Connect did not initialize')

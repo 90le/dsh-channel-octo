@@ -81,7 +81,7 @@ function whileActive(operation, signal) {
  * DSH, rather than the current Agent selection, projects saved images for the
  * model route that actually runs. This does not enqueue a message or use Web receipts.
  */
-export async function prepareInput(ctx, _agent, text, attachments = [], signal) {
+export async function prepareInput(ctx, _agent, text, attachments = [], signal, order) {
   signal?.throwIfAborted()
   if (typeof text !== 'string' || !Array.isArray(attachments)) throw failure('invalid_dsh_input')
   if (attachments.length > maxFiles) throw failure('dsh_attachment_limit')
@@ -113,20 +113,48 @@ export async function prepareInput(ctx, _agent, text, attachments = [], signal) 
 
   if (!text.trim() && !parts.length) throw failure('empty_dsh_input')
   const store = parts.some(part => part.type !== 'text') ? ctx?.get?.('attachments') ?? ctx?.attachments : undefined
-  if ((images.length && typeof store?.saveImages !== 'function') ||
-      (parts.some(part => part.type === 'file') && typeof store?.saveFile !== 'function')) {
+  if (order === undefined && ((images.length && typeof store?.saveImages !== 'function') ||
+      (parts.some(part => part.type === 'file') && typeof store?.saveFile !== 'function'))) {
     throw failure('dsh_attachment_storage_unavailable')
   }
 
   try {
     // The native batch checks deployment-wide image count, byte, and raster limits.
-    const refs = images.length ? await whileActive(store.saveImages(images), signal) : []
-    const content = text.trim() ? [{ type: 'text', text }] : []
-    for (const part of parts) {
+    let refs = []
+    if (images.length && typeof store?.saveImages === 'function') {
+      try { refs = await whileActive(store.saveImages(images), signal) }
+      catch (error) {
+        signal?.throwIfAborted()
+        if (order === undefined) throw error
+        // The native validator rejected a member. Keep other blocks readable.
+        // Never retry one-by-one on native quota/limit failures.
+        if (error?.code === 'INVALID_IMAGE') {
+          for (const [i, image] of images.entries()) {
+            try { [refs[i]] = await whileActive(store.saveImages([image]), signal) }
+            catch { signal?.throwIfAborted() }
+          }
+        }
+      }
+    }
+    const ordered = order === undefined
+      ? [...(text.trim() ? [{ type: 'text', text }] : []), ...parts]
+      : order.map(part => Number.isInteger(part?.media)
+        ? parts[part.media] : typeof part?.text === 'string' && { type: 'text', text: part.text }).filter(Boolean)
+    const content = []
+    for (const part of ordered) {
       signal?.throwIfAborted()
       if (part.type === 'text') content.push(part)
-      else if (part.type === 'image') content.push({ type: 'image', attachment: refs[part.index] })
-      else content.push({ type: 'file', attachment: await whileActive(store.saveFile(part.input), signal) })
+      else if (part.type === 'image') {
+        if (refs[part.index]) content.push({ type: 'image', attachment: refs[part.index] })
+        else content.push({ type: 'text', text: '【此图片未能进入 DSH】' })
+      } else {
+        try { content.push({ type: 'file', attachment: await whileActive(store.saveFile(part.input), signal) }) }
+        catch (error) {
+          signal?.throwIfAborted()
+          if (order === undefined) throw error
+          content.push({ type: 'text', text: '【此文件未能进入 DSH】' })
+        }
+      }
     }
     signal?.throwIfAborted()
     return content

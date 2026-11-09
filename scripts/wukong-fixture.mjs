@@ -62,8 +62,8 @@ export async function wirePeer({ bot = 'fixture-bot', token = 'fixture-im-secret
           const cipher = createCipheriv('aes-128-cbc', Buffer.from(md5(shared).slice(0, 16)), Buffer.from(salt))
           return Buffer.concat([cipher.update(content), cipher.final()]).toString('base64')
         }
-        peer.send = ({ messageId, channelId, channelType, sender, payload }) => {
-          const seq = 1, timestamp = Math.floor(Date.now() / 1000), client = 'fixture-client'
+        peer.send = ({ messageId, channelId, channelType, sender, payload, seq = 1 }) => {
+          const timestamp = Math.floor(Date.now() / 1000), client = 'fixture-client'
           const body = encrypt(JSON.stringify(payload))
           const key = md5(encrypt('' + messageId + seq + client + timestamp + sender + channelId + channelType + body))
           socket.send(packet(5, [

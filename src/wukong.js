@@ -3,6 +3,7 @@
 // Changed: JavaScript port, registration handled separately, removed position and rules hooks.
 import { createCipheriv, createDecipheriv, createHash, createPublicKey, diffieHellman, generateKeyPairSync, randomUUID } from "node:crypto";
 import WebSocket from "ws";
+import { readJson } from "./octo.js";
 const LIMIT = 1 << 20;
 const md5 = (value) => createHash("md5").update(value).digest("hex");
 class ImConnectionError extends Error {
@@ -271,7 +272,7 @@ class WukongConnection {
       decipher.update(Buffer.from(encrypted, "base64")),
       decipher.final()
     ]);
-    const payload = JSON.parse(plain.toString());
+    const payload = readJson(plain.toString());
     if (!payload || typeof payload !== "object" || Array.isArray(payload))
       throw new Error("IM_PAYLOAD_INVALID");
     const message = {

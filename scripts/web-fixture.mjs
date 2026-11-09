@@ -19,10 +19,16 @@ function nextMessage() {
   const [type, address] = routes[received]
   received++
   return {
-    messageId: String(received), sender: 'fixture-user', channelType: type, channelId: address,
-    payload: {
-      type: 1, content: 'fixture prompt ' + received + (ownerSmoke && received === 1 ? ' send a file' : ''),
-      ...(!peer || received === 3 ? { mention: { uids: ['fixture-bot'] } } : {}),
+    messageId: String(received), sender: 'fixture-user', channelType: type, channelId: address, seq: 10 * received,
+    payload: ownerSmoke && received === 1 ? { type: 8, url: 'file/preview/chat/fixture/note.txt', name: 'note.txt' }
+      : received === 3 ? {
+        type: 14,
+        content: [{ type: 'text', text: 'fixture prompt 3' }, { type: 'image', url: '/api/v1/file/preview/chat/fixture/test.png' }],
+        mention: { entities: [{ uid: 'fixture-bot', offset: 0, length: 3 }] },
+      } : {
+      type: 1, content: 'fixture prompt ' + received,
+      ...(!peer ? { mention: { uids: ['fixture-bot'] } } : {}),
+      ...(received === 4 && { reply: { message_id: '605' } }),
     },
   }
 }
@@ -49,8 +55,33 @@ globalThis.fetch = async (input, init) => {
     }
     if (url.pathname.endsWith('/messages/sync')) {
       const request = JSON.parse(init.body)
-      return request.channel_id === 'fixture-user' && request.channel_type === 1 && request.limit === 1
-        ? json({ messages: [] }) : new Response(null, { status: 403 })
+      if (request.channel_type === 1 && request.channel_id === 'fixture-user' && request.limit === 1) return json({ messages: [] })
+      const [type, id] = routes[received - 1] ?? []
+      if (type < 2 || request.channel_id !== id || request.channel_type !== type
+        || request.start_message_seq !== received * 10 - 1 || request.pull_mode !== 0 || request.limit !== 20) {
+        console.error('FIXTURE_SYNC_SCOPE_WRONG')
+        return new Response(null, { status: 403 })
+      }
+      const row = (msgId, seq, content, channelId = id) => ({ message_id: msgId, message_seq: seq,
+        from_uid: 'history-user', channel_id: channelId, channel_type: type,
+        payload: Buffer.from(JSON.stringify({ type: 1, content })).toString('base64') })
+      return json({ messages: [
+        row('601', received * 10 - 1, type === 2 ? 'GROUP-HISTORY-FIXTURE' : 'TOPIC-HISTORY-FIXTURE'),
+        ...(type === 5 ? [row('605', received * 10 - 2, 'TOPIC-QUOTE-FIXTURE')] : []),
+        row('603', received * 10, 'FUTURE-HISTORY-FIXTURE'),
+        row('604', received * 10 - 3, 'WRONG-ROUTE-FIXTURE', type === 5 ? group : group + '____' + thread),
+      ] })
+    }
+    if (ownerSmoke && url.pathname.endsWith('/file/download/chat/fixture/note.txt')) {
+      setTimeout(() => peer.send({ messageId: '902', sender: 'fixture-user', channelType: 1,
+        channelId: 'fixture-user', payload: { type: 1, content: 'fixture prompt 1 send a file' } }), 100).unref()
+      await delay(450)
+      return new Response('INPUT-FILE-FIXTURE', { headers: { 'Content-Type': 'text/plain' } })
+    }
+    if (url.pathname.endsWith('/file/download/chat/fixture/test.png')) {
+      console.log('FIXTURE_RICH_IMAGE_DOWNLOADED')
+      return new Response(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/eioAAAAASUVORK5CYII=', 'base64'),
+        { headers: { 'Content-Type': 'image/png' } })
     }
     if (url.pathname.endsWith('/groups') && url.searchParams.get('space_id') === 'fixture-space') {
       return json([{ group_no: group, space_id: 'fixture-space' }])
@@ -119,7 +150,8 @@ globalThis.fetch = async (input, init) => {
         return json({ message_id: 200 })
       }
       const [type, address] = routes[sent] ?? []
-      if (body.channel_id !== address || body.channel_type !== type || body.payload.content !== 'fixture response ' + (sent + 1)) {
+      if (body.channel_id !== address || body.channel_type !== type || body.payload.content !== 'fixture response ' + (sent + 1)
+        || type >= 2 && body.payload.reply?.message_id !== String(sent + 1)) {
         console.error('FIXTURE_REPLY_MISMATCH')
         return new Response(null, { status: 400 })
       }
@@ -132,7 +164,7 @@ globalThis.fetch = async (input, init) => {
       if (received < routes.length && received === sent) {
         const m = nextMessage()
         return json({status:1, results:[{event_id:received, message:{
-          message_id:m.messageId, from_uid:m.sender, channel_type:m.channelType, channel_id:m.channelId,
+          message_id:m.messageId, message_seq:m.seq, from_uid:m.sender, channel_type:m.channelType, channel_id:m.channelId,
           payload:m.payload,
         }}]})
       }
@@ -152,6 +184,10 @@ globalThis.fetch = async (input, init) => {
         return new Response(null, { status: 400 })
       }
       const step = ownerStep++
+      if (step === 0 && (!history.includes('INPUT-FILE-FIXTURE') || !history.includes('同一用户补充的要求'))) {
+        console.error('FIXTURE_STEER_INPUT_MISSING')
+        return new Response(null, { status: 400 })
+      }
       if (step === 1) {
         questionAnswered = history.includes('Fixture answer one')
         if (!questionAnswered) return new Response(null, { status: 400 })
@@ -183,8 +219,12 @@ globalThis.fetch = async (input, init) => {
       : round === 3 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && !snapshot.includes('THREAD-FIXTURE')
         : round === 4 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && snapshot.includes('THREAD-FIXTURE')
           : snapshot.includes('"status":"empty"') && !snapshot.includes('PARENT-FIXTURE') && !snapshot.includes('THREAD-FIXTURE')
+    const historyOk = round <= 2 ? !/GROUP-HISTORY-FIXTURE|TOPIC-HISTORY-FIXTURE/.test(history)
+      : round === 4 ? history.includes('TOPIC-HISTORY-FIXTURE') && history.includes('TOPIC-QUOTE-FIXTURE') && !history.includes('GROUP-HISTORY-FIXTURE')
+        : history.includes('GROUP-HISTORY-FIXTURE') && !history.includes('TOPIC-HISTORY-FIXTURE')
     if (round && ((body.tools ?? []).length !== 0 && !(ownerSmoke && round <= 2)
-      || !rulesOk || JSON.stringify(body.system ?? '').includes('PARENT-FIXTURE')
+      || !rulesOk || !historyOk || /FUTURE-HISTORY-FIXTURE|WRONG-ROUTE-FIXTURE/.test(history)
+      || JSON.stringify(body.system ?? '').includes('PARENT-FIXTURE')
       || (round === 2 && !history.includes('fixture response 1'))
       || (round >= 3 && /fixture (prompt|response) [1-2]/.test(history))
       || (round === 4 && /fixture (prompt|response) 3/.test(history))

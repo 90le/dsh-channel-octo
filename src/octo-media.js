@@ -88,7 +88,7 @@ function mediaPath(path) {
 
 function relativeKey(value) {
   if (value.startsWith('//') || /[?#]/.test(value)) return
-  const path = value.startsWith('/') ? value : '/' + value
+  const path = (value.startsWith('/') ? value : '/' + value).replace(/^\/api(?=\/(?:v1\/)?file\/preview\/)/u, '')
   return objectKey(mediaPath(path) ?? path)
 }
 
@@ -335,13 +335,7 @@ function imageDimensions(bytes, mime) {
   return width > 0 && height > 0 ? { width, height } : {}
 }
 
-/** Upload caller-authorized bytes, then send to an already-authorized Octo route. */
-export async function uploadAttachment(config, route, file, signal) {
-  const ctx = context(config, signal)
-  const { channel_id, channel_type } = route ?? {}
-  if (channel_type === 1 ? !validUid(channel_id) : !ruleScope(channel_type, channel_id)) {
-    throw error('media_invalid_route')
-  }
+async function uploadMedia(ctx, file) {
   const { bytes } = file ?? {}
   const name = safeName(file?.name)
   const mime = mimeType(file?.mime)
@@ -381,13 +375,24 @@ export async function uploadAttachment(config, route, file, signal) {
     discard(response.body)
   })
 
+  // A standalone image may have unknown dimensions; an Octo RichText block may not.
+  const storedMime = mimeType(contentType)
+  const isImage = mime.startsWith('image/') && storedMime.startsWith('image/')
+  return { type: isImage ? 2 : 8, url: download.href, name, size,
+    ...(isImage && imageDimensions(bytes, storedMime)) }
+}
+
+export function prepareAttachment(config, file, signal) {
+  return uploadMedia(context(config, signal), file)
+}
+
+/** Upload caller-authorized bytes and send as a native image/file message. */
+export async function uploadAttachment(config, route, file, signal) {
+  const ctx = context(config, signal)
+  const { channel_id, channel_type } = route ?? {}
+  if (channel_type === 1 ? !validUid(channel_id) : !ruleScope(channel_type, channel_id)) throw error('media_invalid_route')
+  const payload = await uploadMedia(ctx, file)
   return atStage(ctx, 'send', async () => {
-    // Match OpenClaw: images are native, and audio/video use the general file
-    // payload rather than inventing a voice duration or video cover.
-    const storedMime = mimeType(contentType)
-    const isImage = mime.startsWith('image/') && storedMime.startsWith('image/')
-    const payload = { type: isImage ? 2 : 8, url: download.href, name, size,
-      ...(isImage && imageDimensions(bytes, storedMime)) }
     const response = await request(ctx, ctx.base + '/v1/bot/sendMessage', {
       method: 'POST', headers: { ...ctx.auth, 'Content-Type': 'application/json' },
       body: JSON.stringify({ channel_id, channel_type, payload }),

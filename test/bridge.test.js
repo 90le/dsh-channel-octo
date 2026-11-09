@@ -64,7 +64,7 @@ test('HTTP round trip persists before ACK, gates inputs, preserves IDs, and dedu
         }
         json({ status: 200 })
       } else if (req.url === '/api/v1/bot/sendMessage') {
-        assert.deepEqual(body, { channel_id: 'alice', channel_type: 1, payload: { type: 1, content: '你好，Alice' } })
+        assert.deepEqual(body, { channel_id: 'alice', channel_type: 1, payload: { type: 1, content: '你好，Alice', reply: { message_id: e.message.message_id } } })
         res.end('{"message_id":9223372036854775807,"message_seq":4}')
       } else throw new Error('unexpected route')
     } catch (error) {
