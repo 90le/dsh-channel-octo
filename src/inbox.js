@@ -59,7 +59,7 @@ export class InboxRecovery {
           for (const row of staged) {
             const message = JSON.parse(row.message)
             if (permitsRoute(config, message.sender, message.channelType, message.channelId)) {
-              if (this.accept(row.event_id, message, { historical: !row.live, delayed: true, questionKey: row.question_key }) === false) return
+              if (await this.accept(row.event_id, message, { historical: !row.live, delayed: true, questionKey: row.question_key }) === false) return
             }
             this.store.removeStagedInbox(row.message_id)
           }

@@ -1,10 +1,10 @@
 import { setTimeout as delay } from 'node:timers/promises'
-import { validUid } from './config.js'
+import { validUid, validBotIdentity } from './config.js'
 import { randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
 import { normalizeOctoContent } from './octo-content.js'
 import { parseSafeCommand } from './im-controls.js'
-import { ChannelApi } from './channel-api.js'
+import { ChannelApi, ChannelApiError } from './channel-api.js'
 import { OctoError, readApiError } from './api-errors.js'
 
 export { OctoError } from './api-errors.js'
@@ -56,6 +56,7 @@ async function boundedJson(response) {
 
 export class OctoClient {
   #token
+  #appRegistration
   constructor(config) {
     const { apiBase, token, waitSeconds, fetchImpl = fetch } = config
     this.base = apiBase
@@ -66,7 +67,7 @@ export class OctoClient {
   }
 
   configureChannel(config) {
-    const next = validUid(config.botUid) && validUid(config.spaceId)
+    const next = validBotIdentity(config)
       ? new ChannelApi({ config, request: (path, body, signal, options) => this.#request(path, body, signal, options) })
       : undefined
     this.channel?.revoke()
@@ -119,6 +120,16 @@ export class OctoClient {
   }
 
   async identify(signal) {
+    if (this.#token.startsWith('app_')) {
+      const data = await this.#registration(signal)
+      if (!validBotIdentity({ botUid: data.robot_id, botKind: 'app', spaceId: null })
+        || !validUid(data.owner_uid) || data.owner_uid === data.robot_id
+        || data.owner_uid.includes(this.#token)) throw new OctoError('invalid_bot_identity')
+      // App Bot registration is the official identity/WS bootstrap. It does not
+      // disclose its platform/Space scope. Never manufacture a verified Space.
+      this.#appRegistration = data
+      return { botUid: data.robot_id, botKind: 'app', spaceId: null, ownerUid: data.owner_uid }
+    }
     const result = await this.#request('/v1/auth/verify-bot', JSON.stringify({ bot_token: this.#token }), signal,
       { auth: false, timeout: 8000 })
     if (!validUid(result?.bot_uid) || !validUid(result?.space_id)
@@ -135,29 +146,58 @@ export class OctoClient {
     return result
   }
 
-  async register(botUid, signal) {
+  async #registration(signal) {
     const data = await this.#request('/v1/bot/register', '{}', signal)
-    if (data?.robot_id !== botUid || typeof data.im_token !== 'string' || !data.im_token
+    if (!validUid(data?.robot_id) || data.robot_id.includes(this.#token) || typeof data.im_token !== 'string' || !data.im_token
       || typeof data.ws_url !== 'string') throw new OctoError('invalid_bot_registration')
     const url = URL.parse(data.ws_url)
     const loopback = url && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
     if (!url || (url.protocol !== 'wss:' && !(url.protocol === 'ws:' && loopback))
       || url.username || url.password || url.hash) throw new OctoError('invalid_ws_url')
-    return { robot_id: botUid, im_token: data.im_token, ws_url: url.href }
+    return { robot_id: data.robot_id, im_token: data.im_token, ws_url: url.href, owner_uid: data.owner_uid }
+  }
+
+  async register(botUid, signal) {
+    signal?.throwIfAborted()
+    const data = this.#appRegistration ?? await this.#registration(signal)
+    this.#appRegistration = undefined
+    if (data.robot_id !== botUid) throw new OctoError('invalid_bot_registration')
+    return { robot_id: botUid, im_token: data.im_token, ws_url: data.ws_url }
   }
 
   async allowsMessage(config, job, signal) {
     const { sender, channel_type: type, ambient } = job
     const address = job.channel_id ?? sender
+    const app = this.#token.startsWith('app_')
+    if (app && (type !== 1 || address !== sender || !validUid(sender) || sender.includes('@') || sender === config.botUid)) return false
     if (type === 1) {
-      if (config.senderPolicy !== 'octo') return true
+      if (config.senderPolicy !== 'octo' && !app) return true
       if (sender.includes('@')) return false // Octo's internal DM channel separator
+      if (app) {
+        const people = await this.#request('/v1/bot/users/batch', JSON.stringify({ uids: [sender] }), signal, { timeout: 5000 })
+        if (!Array.isArray(people?.users) || people.users.length !== 1 || !Array.isArray(people.missing_uids)
+          || people.missing_uids.length || people.users[0]?.uid !== sender
+          || people.users[0].status !== 1 || people.users[0].robot !== 0) return false
+      }
       // Use the bot's ordinary history gate: it enforces friend/owner policy
       // without OBO. Request at most one record and never use its content.
       const result = await this.#request('/v1/bot/messages/sync', JSON.stringify({
         channel_id: sender, channel_type: 1, start_message_seq: 0, end_message_seq: 0, limit: 1, pull_mode: 0,
       }), signal, { timeout: 5000 })
       if (result?.messages !== null && !Array.isArray(result?.messages)) throw new OctoError('invalid_access_response')
+      if (app) {
+        let sourceId = decimalId(job.message_id)
+        if (!sourceId && job.metadata) {
+          try { sourceId = decimalId(JSON.parse(job.metadata).cardAction?.sourceMessageId) } catch {}
+        }
+        if (!sourceId || !this.channel) return false
+        try { await this.channel.appMessage({ channel_id: sender, channel_type: 1 }, sender, sourceId, signal) }
+        catch (error) {
+          if (error instanceof ChannelApiError && ['api_permission_denied', 'api_not_found', 'message_unavailable',
+            'message_outside_channel'].includes(error.code)) return false
+          throw error
+        }
+      }
       return true
     }
     const scope = ruleScope(type, address)
@@ -190,6 +230,7 @@ export class OctoClient {
       throw new OctoError('invalid_history_scope')
     }
     const end = channelSequence(before)
+    if (config.botKind === 'app' && type !== 1) throw new OctoError('invalid_history_scope')
     if (end === 1) return { rows: [], more: false }
     const data = await this.#request('/v1/bot/messages/sync', JSON.stringify({
       ...route, start_message_seq: end ? end - 1 : 0, end_message_seq: 0, pull_mode: 0, limit: 20,
@@ -204,6 +245,13 @@ export class OctoClient {
         || type !== 1 && item.channel_id != null && item.channel_id !== id
         || type === 1 && item.from_uid !== id && item.from_uid !== config.botUid
         || [item.revoke, item.revoked, item.is_deleted, item.extra?.revoke, item.message_extra?.revoke].some(flag)) continue
+      if (config.botKind === 'app') {
+        const verified = await this.channel.appMessage(route, id, messageId, signal)
+        if (verified.text.trim()) rows.push({ seq: verified.message_seq, messageId, sender: verified.from_uid,
+          text: Array.from(verified.text).slice(0, 280).join('') })
+        seenSeq.add(seq); seenId.add(messageId)
+        continue
+      }
       let payload = item.payload
       if (typeof payload === 'string') {
         if (payload.length > 120_000) continue
@@ -211,7 +259,7 @@ export class OctoClient {
           payload = readJson(payload.trimStart().startsWith('{') ? payload : Buffer.from(payload, 'base64').toString('utf8'))
         } catch { continue }
       }
-      if (!payload || payload.event != null || (payload.space_id != null && payload.space_id !== config.spaceId)) continue
+      if (!payload || payload.event != null || !matchesMessageSpace(config, payload)) continue
       const content = normalizeOctoContent(payload)
       if (!content?.text?.trim()) continue
       seenSeq.add(seq)
@@ -363,10 +411,19 @@ export function permitsRoute(config, sender, channelType, channelId) {
   if (typeof sender !== 'string' || !/^[A-Za-z0-9_.:@-]{1,128}$/.test(sender) || sender === config.botUid
     || (config.senderPolicy !== 'octo' && !config.allowed.has(sender))) return false
   if (channelType === 1) return channelId === sender
+  if (config.botKind === 'app') return false
   if (config.channelPolicy === 'joined') return !!ruleScope(channelType, channelId)
   if (channelType === 2) return config.groups?.has(channelId) === true
   if (channelType === 5) return config.threads?.has(channelId) === true
   return false
+}
+
+// App Bot scope is enforced by Octo; the register DTO does not attest a Space.
+// The existing User Bot binding remains pinned to its verified Space.
+function matchesMessageSpace(config, payload) {
+  return config.botKind === 'app'
+    ? payload.space_id == null || validUid(payload.space_id)
+    : payload.space_id == null || payload.space_id === config.spaceId
 }
 
 export function admit(event, config) {
@@ -378,7 +435,7 @@ export function admit(event, config) {
   const channelId = channelType === 1 ? sender : message?.channel_id
   if (!messageId || event.event_type || payload?.event != null
     || !permitsRoute(config, sender, channelType, channelId)
-    || !payload || (payload.space_id != null && payload.space_id !== config.spaceId)) return
+    || !payload || !matchesMessageSpace(config, payload)) return
   const content = normalizeOctoContent(payload, config)
   if (!content) return
   const { text, attachment, attachments, parts } = content

@@ -67,7 +67,7 @@ export function channelView(config) {
   if (!config) return null
   const { botUid, spaceId, apiBase, cwd, transport, senderPolicy, channelPolicy,
     mentionPolicy, threadRuleMode, progress, timeoutMs, allowed, groups, threads } = config
-  return { botUid, spaceId, apiBase, cwd, transport, senderPolicy, channelPolicy,
+  return { botUid, spaceId, ...(config.botKind === 'app' && { botKind: 'app' }), apiBase, cwd, transport, senderPolicy, channelPolicy,
     mentionPolicy, threadRuleMode, progress, timeoutMs,
     allowedUids: [...allowed], allowedGroupIds: [...groups], allowedThreadIds: [...threads] }
 }
@@ -92,6 +92,7 @@ const accountErrors = {
   permission_requires_allowlist: 400, settings_changed: 409, channel_not_configured: 409,
   transport_managed_by_host: 400, invalid_settings: 400, settings_not_saved: 500,
   invalid_bot_commands: 400, bot_commands_failed: 502,
+  app_bot_operation_unavailable: 400,
 }
 
 export function registerWeb(ctx, accounts) {

@@ -5,6 +5,9 @@ import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
 
+// AppBot is a separate fixture, not a relaxation of any USER-mode assertion.
+if (process.env.DSH_OCTO_FIXTURE_APP_BOT === '1') await appBotFixture()
+else {
 let received = 0
 let sent = 0
 const ownerSmoke = process.env.DSH_OCTO_FIXTURE_OWNER === '1'
@@ -888,4 +891,282 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return realFetch(input, init)
   return new Response(null, {status: 503})
+}
+}
+
+async function appBotFixture() {
+  const bot = 'app_fixture_bot', token = 'app_SECRETfixture', owner = 'fixture-owner', human = 'fixture-user'
+  const serverSpace = 'fixture-server-space'
+  const group = '00112233445566778899aabbccddeeff', topic = group + '____123456789012345678'
+  const fileName = 'appbot-tool-fixture.txt', fileText = 'written by native DSH for AppBot'
+  const ordinary = 'APPBOT-ORDINARY-REPLY'
+  const caption = 'APPBOT-FINAL\n\n文件：<appbot-tool-fixture.txt>\n\n**完整说明**\n\n'
+    + '- 原生 DSH 已接收卡片答案，并写入和展示文件。\n- 展示卡回执：730。\n\n'
+    + '保留段落、Markdown、中文和表情；文件与说明均在当前私聊交付。✅\n\nAPPBOT-CAPTION-END'
+  const display = { title: 'AppBot result', blocks: [{ type: 'text', text: 'Native file prepared.' }] }
+  const operations = [
+    ['ask_user_question', { questions: [{ id: 'appbot-choice', question: 'Prepare the fixture file?', options: [
+      { label: 'AppBot answer', description: 'Write and present the file' },
+      { label: 'Wrong callback answer', description: 'Must never be accepted' },
+    ] }] }],
+    ['write', { file_path: fileName, content: fileText }],
+    ['present', { files: [{ path: fileName }] }],
+    ['octo_display_card', display],
+  ]
+  const channelTools = ['inspect', 'messages.recent', 'messages.read', 'messages.user_info', 'messages.users_batch',
+    'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.edit_richtext', 'messages.edit_display_card',
+    'messages.clear_card_revisions'].map(name => 'octo_' + name.replaceAll('.', '_'))
+  const peer = await wirePeer({ bot, token: 'fixture-app-im-secret' })
+  const realFetch = globalThis.fetch
+  const checked = new Map(), synced = new Map(), events = new Map()
+  const messages = new Map()
+  let registrations = 0, sent = 0, received = 0, step = 0, uploaded = false, fileSent = false
+  let validEvent, validReleased = false, feedback = false, displaySent = false, finalReady = false, wireAcked = false
+  const fail = reason => {
+    console.error('FIXTURE_APP_FAIL=' + reason)
+    return new Response(null, { status: 400 })
+  }
+  const rememberMessage = (messageId, sender, channelId, payload) => {
+    const envelope = {
+      message_id: messageId, message_seq: Number(messageId), from_uid: sender,
+      channel_id: channelId, channel_type: 1,
+      payload: { ...structuredClone(payload), content: payload.content ?? payload.plain ?? '', space_id: serverSpace },
+    }
+    messages.set(messageId, envelope)
+    return envelope
+  }
+  const message = (messageId, sender, channelType, channelId, content) => {
+    const frame = {
+      messageId, sender, channelType, channelId, seq: Number(messageId),
+      payload: { type: 1, content, space_id: serverSpace,
+        ...(channelType !== 1 && { mention: { uids: [bot] } }) },
+    }
+    if (channelType === 1) rememberMessage(messageId, sender, channelId, frame.payload)
+    return frame
+  }
+  setInterval(() => {
+    if (!peer.send) return
+    if (!received) {
+      peer.send(message('9101', owner, 2, group, 'APPBOT-REJECT-GROUP'))
+      peer.send(message('9102', owner, 5, topic, 'APPBOT-REJECT-TOPIC'))
+      peer.send(message('1', human, 1, human, 'appbot fixture prompt 1'))
+      received = 1
+    } else if (received === 1 && sent === 1) {
+      peer.send(message('2', owner, 1, owner, 'appbot fixture prompt 2: ask, write, present, display and summarize'))
+      received = 2
+    }
+    if (!wireAcked && ['9101', '9102', '1', '2'].every(id => peer.acked.includes(id))) {
+      wireAcked = true
+      console.log('FIXTURE_APP_WIRE_ACK_OK')
+    }
+  }, 50).unref()
+
+  const stream = (body, content, tool) => {
+    const frames = [
+      { type: 'message_start', message: { id: 'appbot-fixture', model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: tool
+        ? { type: 'tool_use', id: 'toolu_appbot_' + (step - 1), name: tool, input: {} } : { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: tool
+        ? { type: 'input_json_delta', partial_json: JSON.stringify(content) } : { type: 'text_delta', text: content } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' },
+    ]
+    return new Response(frames.map(frame => 'event: ' + frame.type + '\ndata: ' + JSON.stringify(frame) + '\n\n').join(''),
+      { headers: { 'Content-Type': 'text/event-stream' } })
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    const json = value => Response.json(value)
+    const method = init?.method ?? 'GET'
+    if (url.hostname === 'octo-fixture.invalid') {
+      const path = url.pathname
+      if (path.endsWith('/verify-bot')) return fail('VERIFY_BOT_FORBIDDEN')
+      if (new Headers(init?.headers).get('authorization') !== 'Bearer ' + token) return fail('API_AUTH')
+      const body = init?.body ? JSON.parse(init.body) : undefined
+      if (path === '/api/v1/bot/register') {
+        if (method !== 'POST' || !isDeepStrictEqual(body, {}) || ++registrations !== 1) return fail('REGISTER_OR_CACHE')
+        console.log('FIXTURE_APP_REGISTER_OK')
+        return json({ robot_id: bot, owner_uid: owner, im_token: 'fixture-app-im-secret', ws_url: peer.wsUrl })
+      }
+      if (path === '/api/v1/bot/users/batch') {
+        const uid = body?.uids?.[0]
+        if (method !== 'POST' || ![human, owner].includes(uid) || !isDeepStrictEqual(body, { uids: [uid] })) return fail('HUMAN_SCOPE')
+        checked.set(uid, (checked.get(uid) ?? 0) + 1)
+        if (checked.get(uid) === 1) console.log('FIXTURE_APP_HUMAN_OK=' + uid)
+        return json({ users: [{ uid, name: uid, status: 1, robot: 0 }], missing_uids: [] })
+      }
+      if (path === '/api/v1/bot/messages/sync') {
+        const uid = body?.channel_id
+        if (method !== 'POST' || ![human, owner].includes(uid) || !(checked.get(uid) > (synced.get(uid) ?? 0))
+          || !isDeepStrictEqual(body, { channel_id: uid, channel_type: 1, start_message_seq: 0,
+            end_message_seq: 0, limit: 1, pull_mode: 0 })) return fail('FRIEND_SCOPE')
+        synced.set(uid, (synced.get(uid) ?? 0) + 1)
+        if (synced.get(uid) === 1) console.log('FIXTURE_APP_FRIEND_OK=' + uid)
+        return json({ messages: [] })
+      }
+      const messagePath = /^\/api\/v1\/bot\/messages\/person\/([^/]+)\/([^/]+)$/.exec(path)
+      if (messagePath) {
+        const [, uid, messageId] = messagePath
+        const envelope = messages.get(messageId)
+        if (method !== 'GET' || body !== undefined || url.search || ![human, owner].includes(uid)
+          || !synced.has(uid) || !envelope || envelope.channel_id !== uid) return fail('MESSAGE_GET_SCOPE')
+        console.log('FIXTURE_APP_MESSAGE_GET_OK=' + uid + ':' + messageId)
+        return json(envelope)
+      }
+      if (path === '/api/v1/bot/heartbeat' || path === '/api/v1/bot/readReceipt') return json({})
+      if (path === '/api/v1/bot/card/profile') return json({
+        enabled: true, card_version: '1.5', profiles: ['octo/v1', 'octo/v2'],
+        inputs: ['Input.Text', 'Input.ChoiceSet'], elements: ['TextBlock'],
+        config: { card_enabled: true, display_enabled: true, interaction_enabled: true, reasoning_enabled: false },
+      })
+      if (path === '/api/v1/bot/events') {
+        if (method !== 'POST') return fail('EVENT_METHOD')
+        await delay(80)
+        const cursor = BigInt(body.event_id)
+        if (validEvent && !validReleased && cursor >= 9204n) {
+          if (step !== 1 || feedback) return fail('INVALID_CALLBACK_ACCEPTED')
+          validReleased = true
+          events.set('9205', validEvent)
+          console.log('FIXTURE_APP_INVALID_CALLBACKS_IGNORED')
+        }
+        return json({ status: 1, results: [...events.values()].filter(event => BigInt(event.event_id) > cursor) })
+      }
+      if (/^\/api\/v1\/bot\/events\/\d+\/ack$/.test(path)) {
+        if (path !== '/api/v1/bot/events/9205/ack' || method !== 'POST' || !validReleased) return fail('CALLBACK_ACK')
+        console.log('FIXTURE_APP_CALLBACK_ACK_OK')
+        return json({ status: 200 })
+      }
+      if (path === '/api/v1/bot/message/edit') {
+        const frame = body?.content_edit && JSON.parse(body.content_edit)
+        if (!validReleased || body.message_id !== '720' || body.channel_id !== owner || body.channel_type !== 1
+          || !frame || frame.card.actions?.length || !frame.plain.includes('AppBot answer')) return fail('QUESTION_FEEDBACK')
+        feedback = true
+        console.log('FIXTURE_APP_QUESTION_FEEDBACK_OK')
+        return json({})
+      }
+      if (path === '/api/v1/bot/upload/presigned') {
+        if (method !== 'GET' || !finalReady || url.searchParams.get('filename') !== fileName
+          || url.searchParams.get('fileSize') !== String(Buffer.byteLength(fileText))) return fail('PRESIGN')
+        return json({ method: 'PUT', uploadUrl: 'https://storage-fixture.invalid/appbot.txt?signature=fixture',
+          downloadUrl: 'https://files-fixture.invalid/appbot.txt', contentType: 'text/plain' })
+      }
+      if (path === '/api/v1/bot/sendMessage') {
+        const uid = body?.channel_id, payload = body?.payload
+        if (method !== 'POST' || ![human, owner].includes(uid) || !synced.has(uid) || body.channel_type !== 1
+          || !isDeepStrictEqual(Object.keys(body).sort(), payload?.type === 17
+            ? ['channel_id', 'channel_type', 'client_msg_no', 'payload'] : ['channel_id', 'channel_type', 'payload'])
+          || payload?.type === 17 && !/^[a-f0-9]{32}$/.test(body.client_msg_no ?? '')
+          || !payload || payload.reply !== undefined || payload.mention !== undefined) return fail('SEND_SCOPE')
+        const sentMessage = messageId => {
+          // Only successful sends create readable records, with the exact returned ID and payload.
+          const envelope = rememberMessage(messageId, bot, uid, payload)
+          return json({ message_id: envelope.message_id })
+        }
+        if (uid === human && sent === 0 && isDeepStrictEqual(payload, { type: 1, content: ordinary })) {
+          sent = 1
+          console.log('FIXTURE_APP_ORDINARY_OK')
+          return sentMessage('710')
+        }
+        if (uid !== owner || sent !== 1) return fail('SEND_ORDER')
+        if (payload.profile === 'octo/v2') {
+          if (step !== 1 || validEvent || payload.type !== 17 || !payload.plain.includes('Prepare the fixture file?')
+            || payload.card.actions?.length !== 1 || !payload.card.actions[0].data) return fail('QUESTION_CARD')
+          validEvent = { event_id: '9205', event_type: 'card_action', event_data: {
+            message_id: '720', action_id: 'answer', space_id: serverSpace, operator_uid: owner,
+            channel_id: owner, channel_type: 1, data: payload.card.actions[0].data, inputs: { selection: 'q1' },
+          } }
+          setTimeout(() => {
+            for (const [id, patch] of [
+              ['9201', { operator_uid: human }], ['9202', { channel_id: group, channel_type: 2 }],
+              ['9203', { message_id: '9999' }],
+              ['9204', { data: Object.fromEntries(Object.keys(validEvent.event_data.data).map(key => [key, '0'.repeat(32)])) }],
+            ]) events.set(id, { ...validEvent, event_id: id, event_data: { ...validEvent.event_data, inputs: { selection: 'q2' }, ...patch } })
+          }, 300).unref()
+          console.log('FIXTURE_APP_QUESTION_CARD_OK')
+          return sentMessage('720')
+        }
+        if (payload.profile === 'octo/v1') {
+          if (step !== 4 || displaySent || !feedback || payload.type !== 17 || payload.card_version !== '1.5'
+            || payload.card?.type !== 'AdaptiveCard' || payload.card.version !== '1.5' || payload.card.actions?.length
+            || payload.plain !== 'AppBot result\nNative file prepared.'
+            || !isDeepStrictEqual(payload.card.body?.map(block => [block.type, block.text]),
+              [['TextBlock', 'AppBot result'], ['TextBlock', 'Native file prepared.']])) return fail('DISPLAY_CARD')
+          displaySent = true
+          console.log('FIXTURE_APP_DISPLAY_OK')
+          return sentMessage('730')
+        }
+        if (payload.type === 8) {
+          if (!finalReady || !uploaded || fileSent || !isDeepStrictEqual(payload, { type: 8, name: fileName,
+            url: 'https://files-fixture.invalid/appbot.txt', size: Buffer.byteLength(fileText) })) return fail('FILE_PAYLOAD')
+          fileSent = true
+          console.log('FIXTURE_APP_FILE_OK')
+          return sentMessage('740')
+        }
+        if (!finalReady || !fileSent || !displaySent || !feedback || !wireAcked
+          || !isDeepStrictEqual(payload, { type: 1, content: caption })) return fail('FINAL_OR_CAPTION')
+        sent = 2
+        console.log('FIXTURE_APP_FULL_CAPTION_OK')
+        console.log('FIXTURE_APP_FINAL_OK')
+        return sentMessage('741')
+      }
+      return fail('UNEXPECTED_API:' + method + ':' + path)
+    }
+    if (url.hostname === 'storage-fixture.invalid') {
+      if (method !== 'PUT' || !finalReady || uploaded || url.pathname !== '/appbot.txt'
+        || Buffer.from(init.body).toString() !== fileText) return fail('UPLOAD')
+      uploaded = true
+      console.log('FIXTURE_APP_UPLOAD_OK')
+      return new Response(null, { status: 200 })
+    }
+    if (url.hostname === 'model-fixture.invalid' && url.pathname.endsWith('/messages')) {
+      const body = JSON.parse(init.body), history = JSON.stringify(body.messages), tail = JSON.stringify(body.messages.at(-1))
+      if (tail.includes('Generate the session title from this JSON array of human messages:')) return stream(body, 'AppBot fixture title')
+      const round = Number([...history.matchAll(/appbot fixture prompt ([12])/g)].at(-1)?.[1])
+      if (!round || /APPBOT-REJECT-|fixture (?:prompt|response) [1-6]|NEVER_RETURN_WIRE_/u.test(history.replaceAll('appbot fixture prompt', 'appbot turn'))
+        || history.includes('Octo 当前会话规则快照')) return fail('MODEL_CONTEXT')
+      const names = (body.tools ?? []).map(tool => tool.name)
+      if (names.some(name => /^octo_(?:groups?|members|space_|targets_|rules_|threads?|webhooks?|voice)/.test(name)
+        || /^octo_messages_(?:search|resolve_|send_target)/.test(name))) return fail('UNAVAILABLE_TOOLS')
+      if (round === 1) {
+        if (names.length || sent !== 0) return fail('NONOWNER_PERMISSIONS')
+        console.log('FIXTURE_APP_NONOWNER_TEXT_ONLY_OK')
+        return stream(body, ordinary)
+      }
+      if (!isDeepStrictEqual(names.filter(name => name.startsWith('octo_')).sort(),
+        [...channelTools, 'octo_display_card', 'octo_form'].sort())) return fail('CHANNEL_TOOL_MENU')
+      if (step === 0) console.log('FIXTURE_APP_CHANNEL_TOOLS_OK=' + channelTools.length)
+      if (sent !== 1 || history.includes('appbot fixture prompt 1') || history.includes(ordinary)
+        || operations.some(([name]) => !names.includes(name))) return fail('OWNER_PERMISSIONS_OR_HISTORY')
+      console.log('FIXTURE_APP_TOOL_SCOPE_OK=' + step)
+      if (step) {
+        const parts = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+        const call = parts.find(part => part.type === 'tool_use' && part.id === 'toolu_appbot_' + (step - 1))
+        const result = parts.find(part => part.type === 'tool_result' && part.tool_use_id === call?.id)
+        if (call?.name !== operations[step - 1][0] || !isDeepStrictEqual(call.input, operations[step - 1][1])
+          || !result || result.is_error) return fail('HOST_TOOL_RESULT:' + step)
+        const text = typeof result.content === 'string' ? result.content
+          : (result.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
+        if (step === 1) {
+          let answer; try { answer = JSON.parse(text) } catch {}
+          if (!validReleased || !feedback || !isDeepStrictEqual(answer?.answers,
+            [{ id: 'appbot-choice', selected: ['AppBot answer'] }])) return fail('QUESTION_ANSWER')
+        }
+        if (step === 4) {
+          let receipt; try { receipt = JSON.parse(text) } catch {}
+          if (!displaySent || !isDeepStrictEqual(receipt, { messageId: '730', format: 'display_card',
+            fallbackBlocks: [], requiresFinalSummary: true })) return fail('DISPLAY_RECEIPT')
+        }
+        console.log('FIXTURE_APP_NATIVE_TOOL_OK=' + step)
+      }
+      if (step < operations.length) {
+        const [name, args] = operations[step++]
+        return stream(body, args, name)
+      }
+      finalReady = true
+      return stream(body, caption)
+    }
+    if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return realFetch(input, init)
+    return fail('EXTERNAL_REQUEST:' + url.hostname)
+  }
 }

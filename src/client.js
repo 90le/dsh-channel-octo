@@ -46,6 +46,7 @@ window.__ModuleLoader__.load({
       mention: ['群聊与子区触发', 'Group and topic trigger'], requireMention: ['必须 @ Bot', 'Require an @mention'],
       followMention: ['跟随 Octo 的免 @ 设置', 'Follow Octo’s mention setting'],
       requiresWebSocket: ['免 @ 需要 WebSocket 长连接。', 'Replies without mentions require WebSocket.'],
+      appScope: ['Octo 管理的私聊范围', 'Octo-managed DM scope'],
       threadRule: ['子区规则', 'Topic rules'], threadOnly: ['只用子区规则', 'Use only topic rules'],
       threadInherit: ['继承群规则，子区优先', 'Inherit group rules; topic rules take priority'],
       response: ['回复体验', 'Replies'], responseHint: ['设置用户看到的进度和最长等待时间。', 'Choose the progress users see and how long to wait.'],
@@ -386,6 +387,7 @@ window.__ModuleLoader__.load({
           ...Object.fromEntries(listKeys.map(key => [key, config[key].join('\n')])), timeout: config.timeoutMs / 1000 }
       }
       function Config({ config, revision, accountId, t }) {
+        const app = config.botKind === 'app'
         const [draft, setDraft] = useState(() => initialDraft(config))
         const [feedback, setFeedback] = useState(null)
         const [saving, setSaving] = useState(false)
@@ -412,8 +414,8 @@ window.__ModuleLoader__.load({
           e.preventDefault()
           setSaving(true); setFeedback(null); revisionEpoch++
           try {
-            const settings = Object.fromEntries(Object.keys(choices).map(k => [k, draft[k]]))
-            for (const key of listKeys) {
+            const settings = Object.fromEntries((app ? ['progress'] : Object.keys(choices)).map(k => [k, draft[k]]))
+            for (const key of app ? [] : listKeys) {
               const inactive = draft.channelPolicy === 'joined'
               settings[key] = inactive ? [] : [...new Set(draft[key].split('\n').map(x => x.trim()).filter(Boolean))]
             }
@@ -431,10 +433,11 @@ window.__ModuleLoader__.load({
         }
         const stale = dirty && base.current !== revision
         return h('form', { className: 'dsho-form', onSubmit: save, 'aria-label': t('rules') },
-          card('permission', 'permissionHint', select('channelPolicy'),
+          app && hint(t('appScope')),
+          !app && card('permission', 'permissionHint', select('channelPolicy'),
             draft.channelPolicy === 'allowlist' && multi('allowedGroupIds', 'groups'),
             draft.channelPolicy === 'allowlist' && multi('allowedThreadIds', 'threads', 'threadFormat')),
-          card('triggers', 'triggersHint', select('mentionPolicy', config.transport !== 'websocket' && 'requiresWebSocket'),
+          !app && card('triggers', 'triggersHint', select('mentionPolicy', config.transport !== 'websocket' && 'requiresWebSocket'),
             select('threadRuleMode')),
           card('response', 'responseHint', select('progress', draft.progress === 'auto' && 'cardHint'),
             field('timeout', 'timeout', h('input', { id: 'dsho-timeout', type: 'number', min: 1, max: 600, step: 0.001,

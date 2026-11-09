@@ -50,11 +50,11 @@ test('HTTP round trip persists before ACK, gates inputs, preserves IDs, and dedu
       const json = value => res.end(JSON.stringify(value))
       if (req.url === '/api/v1/auth/verify-bot') {
         assert.equal(req.headers.authorization, undefined)
-        assert.equal(body.bot_token, 'app_fixture')
+        assert.equal(body.bot_token, 'bf_fixture')
         json({ bot_uid: 'bot', space_id: 'space' })
         return
       }
-      assert.equal(req.headers.authorization, 'Bearer app_fixture')
+      assert.equal(req.headers.authorization, 'Bearer bf_fixture')
       if (req.url === '/api/v1/bot/events') {
         assert.deepEqual(body, { event_id: polls++ ? Number(e.event_id) : 0, limit: 20, wait: 15 })
         res.end(wire)
@@ -78,7 +78,7 @@ test('HTTP round trip persists before ACK, gates inputs, preserves IDs, and dedu
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections() }))
-  const api = new OctoClient({ apiBase: 'http://127.0.0.1:' + server.address().port + '/api', token: 'app_fixture', waitSeconds: 15 })
+  const api = new OctoClient({ apiBase: 'http://127.0.0.1:' + server.address().port + '/api', token: 'bf_fixture', waitSeconds: 15 })
   const host = { async run(session, text, created) {
     runs++
     assert.match(session.session_id, /^session-/)

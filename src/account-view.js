@@ -98,7 +98,7 @@ const caption = {
   account_changed: ['账号设置已在别处更新，请重新打开设置后再试。', 'The account changed elsewhere. Reopen its settings and try again.'],
   duplicate_bot: ['这个 Bot 已经添加，请编辑原账号。', 'This bot already has an account. Edit the existing account.'],
   invalid_bot_token: ['Bot 令牌无效或尚未配置。', 'The bot token is invalid or missing.'],
-  bot_identity_mismatch: ['新令牌不属于原来的 Bot 和空间。', 'The replacement token belongs to a different bot or space.'],
+  bot_identity_mismatch: ['新令牌的 Bot、类型或空间与原账号不一致。', 'The replacement token has a different bot, type or space.'],
   bot_verification_failed: ['Octo 未确认令牌，请检查令牌和服务地址。', 'Octo could not verify this token. Check the token and server.'],
   credential_provider_unavailable: ['DSH 凭据库暂不可用。', 'The DSH credential store is unavailable.'],
   permission_unavailable: ['该权限预设未在 Octo 的服务器配置中开放。', 'This permission preset is not enabled for Octo.'],
@@ -120,6 +120,7 @@ const caption = {
   menuUnavailable: ['账号配置不可用，无法修改菜单。', 'Account configuration is unavailable.'],
   bot_commands_failed: ['未收到 Octo 的成功确认，请检查菜单后再试。', 'Octo did not confirm success. Check the menu before retrying.'],
   invalid_bot_commands: ['菜单操作无效，请重新打开设置。', 'Invalid menu action. Reopen settings.'],
+  app_bot_operation_unavailable: ['App Bot 不支持此管理操作。', 'This management operation is unavailable for App Bots.'],
   account_not_found: ['账号已移除，请刷新。', 'This account was removed. Refresh the page.'],
   channel_not_configured: ['账号配置不可用，请先检查连接。', 'Check this account’s connection settings first.'],
 }
@@ -261,9 +262,9 @@ export function createAccountView(React, primitives, { request, status, label })
             { revision: revision.current })),
           onRemove: account && (() => { setConfirming(true); return false }),
         }),
-      account && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
+      account && account.botKind !== 'app' && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
         perform: action => perform('POST', endpoint(account.id) + '/commands', { action, revision: revision.current }) }),
-      account && h(WebhookView, { accountId: account.id, accountLabel: account.label, lang, busy, disabled: !data.canManage || !account.config,
+      account && account.botKind !== 'app' && h(WebhookView, { accountId: account.id, accountLabel: account.label, lang, busy, disabled: !data.canManage || !account.config,
         perform: async (input, signal) => {
           const result = await request(endpoint(account.id) + '/webhooks', {
             method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },

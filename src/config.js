@@ -4,6 +4,9 @@ import { statSync } from 'node:fs'
 import { ruleScope } from './rules.js'
 
 export const validUid = (s) => typeof s === 'string' && /^[A-Za-z0-9_.:@-]{1,128}$/.test(s)
+export const validBotIdentity = (config) => validUid(config?.botUid) && (config.botKind === 'app'
+  ? /^app_[A-Za-z0-9_-]+_bot$/.test(config.botUid) && config.spaceId === null
+  : (config.botKind === undefined || config.botKind === 'user') && validUid(config.spaceId))
 export const validToken = (s) => typeof s === 'string' && /^(app|bf)_[A-Za-z0-9_-]{1,512}$/.test(s)
 export const validToolScope = (scope) => ['private', 'owner', 'admitted'].includes(scope)
 
@@ -31,12 +34,15 @@ export function resolveConfig(config, env = process.env) {
   const apiBase = apiEndpoint(config.apiBase)
   const token = env.DSH_OCTO_BOT_TOKEN
   if (!validToken(token)) throw new Error('missing_bot_token')
+  const app = token.startsWith('app_')
+  if (config.botKind !== undefined && config.botKind !== (app ? 'app' : 'user')) throw new Error('bot_identity_mismatch')
+  const identity = { botUid: config.botUid, spaceId: config.spaceId, ...(app ? { botKind: 'app' } : {}) }
   const groups = scopeList(config.allowedGroupIds, 2)
   const threads = scopeList(config.allowedThreadIds, 5)
   const senderPolicy = config.senderPolicy ?? 'allowlist'
   const channelPolicy = config.channelPolicy ?? 'allowlist'
   const mentionPolicy = config.mentionPolicy ?? 'required'
-  const transport = config.transport ?? (mentionPolicy === 'octo' ? 'websocket' : 'events')
+  const transport = config.transport ?? (app || mentionPolicy === 'octo' ? 'websocket' : 'events')
   const toolScope = config.toolScope === undefined ? 'private' : config.toolScope
   if (!validToolScope(toolScope)) throw new Error('invalid_tool_scope')
   if (!['allowlist', 'octo'].includes(senderPolicy) || !['allowlist', 'joined'].includes(channelPolicy)
@@ -44,13 +50,14 @@ export function resolveConfig(config, env = process.env) {
     throw new Error('invalid_access_policy')
   }
   if (mentionPolicy === 'octo' && transport !== 'websocket') throw new Error('mention_free_requires_websocket')
+  if (app && transport !== 'websocket') throw new Error('app_bot_requires_websocket')
   if ((groups.size || threads.size || channelPolicy === 'joined' || mentionPolicy === 'octo') && !token.startsWith('bf_')) {
     throw new Error('group_and_thread_require_user_bot')
   }
   if (channelPolicy === 'joined' && (groups.size || threads.size)) throw new Error('ambiguous_channel_policy')
   const threadRuleMode = config.threadRuleMode ?? 'thread-only'
   if (!['thread-only', 'inherit-group'].includes(threadRuleMode)) throw new Error('invalid_thread_rule_mode')
-  if (!validUid(config.botUid) || !validUid(config.spaceId)) throw new Error('missing_bot_identity')
+  if (!validBotIdentity(identity)) throw new Error('missing_bot_identity')
   const allowedUids = config.allowedUids ?? []
   if (!Array.isArray(allowedUids) || allowedUids.length > 20
     || (senderPolicy === 'allowlist' ? !allowedUids.length : allowedUids.length > 0)
@@ -67,7 +74,7 @@ export function resolveConfig(config, env = process.env) {
     || !Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000) throw new Error('invalid_timeouts')
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
-    botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
+    ...identity, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
     senderPolicy, channelPolicy, mentionPolicy, transport, progress, toolScope,
     mediaDownloadOrigins: config.mediaDownloadOrigins, mediaUploadOrigins: config.mediaUploadOrigins,
     mediaMaxBytes: config.mediaMaxBytes, mediaTimeoutMs: config.mediaTimeoutMs,

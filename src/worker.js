@@ -19,7 +19,8 @@ import { InboxRecovery } from './inbox.js'
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
   : config.groupCommands === 'safe' && job.sender === config.ownerUid && !job.ambient)
-// Chat admission is separate from tools. Owner identity comes only from verify-bot.
+// Chat admission is separate from tools. Owner identity comes from the Bot's
+// official verified identity (User Bot verify-bot; App Bot registration).
 export function authorizedTools(config, job) {
   if (config.toolScope === 'admitted') return true // Caller must still pass channel admission.
   if (config.toolScope === 'owner') return !!config.ownerUid && job.sender === config.ownerUid
@@ -161,7 +162,7 @@ export class Worker {
     // Retain the configured admission model. For Octo-managed access, verify
     // the live friendship/membership again after preparation, not just intake.
     try {
-      if ((job.ambient || current.senderPolicy === 'octo' || job.channel_type !== 1 && current.channelPolicy === 'joined')
+      if ((current.botKind === 'app' || job.ambient || current.senderPolicy === 'octo' || job.channel_type !== 1 && current.channelPolicy === 'joined')
         && !await this.api.allowsMessage(current, job, signal)) throw new Error('delivery_access_changed')
     } catch (error) {
       if (error instanceof OctoError && ['api_authentication_failed', 'api_permission_denied', 'api_not_found', 'api_disabled']
@@ -179,9 +180,35 @@ export class Worker {
     return this.inFlight
   }
 
-  acceptInbound(eventId, message, { historical = false, delayed = false, questionKey } = {}) {
+  acceptInbound(eventId, message, { historical = false, delayed = false, questionKey, appVerified = false } = {}) {
+    if (this.config.botKind === 'app' && !appVerified) {
+      // Persist before the synchronous WS ACK. Serialize live authorization so
+      // a question answer or steering input cannot skip the server Space guard.
+      if (!channelSequence(message.messageSeq)) return this.store.add(eventId, message)
+      const capturedQuestion = questionKey ?? this.questions.match(message)?.key ?? null
+      this.store.stageInbox(eventId, message, !historical, capturedQuestion)
+      const config = this.config
+      const work = async () => {
+        try {
+          if (config !== this.config || this.stopIntake) return false
+          const allowed = await this.api.allowsMessage(config, { message_id: message.messageId,
+            sender: message.sender, channel_id: message.channelId, channel_type: message.channelType }, this.intakeSignal)
+          if (config !== this.config || this.stopIntake) return false
+          if (allowed) this.acceptInbound(eventId, message, { historical, delayed, questionKey: capturedQuestion, appVerified: true })
+          else this.store.rememberAnswer(eventId, message, null)
+          this.store.removeStagedInbox(message.messageId)
+          return true
+        } catch {
+          this.log('app_intake_access_unconfirmed')
+          this.store.blockInboxRoute({ channel_type: message.channelType, channel_id: message.channelId })
+          return false
+        }
+      }
+      this.appIntake = (this.appIntake ?? Promise.resolve()).then(work, work)
+      return this.appIntake
+    }
     const question = !historical && !message.attachment && !message.attachments?.length && !message.command && message.text.trim() && this.questions.match(message)
-    if (question && (!delayed || question.key === questionKey) && this.config.toolPermission !== 'text-only'
+    if (question && (!delayed && !appVerified || question.key === questionKey) && this.config.toolPermission !== 'text-only'
       && permitsRoute(this.config, message.sender, message.channelType, message.channelId)
       && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
       if (this.store.rememberAnswer(eventId, message, question.sessionId)) this.questions.text(question, message.text)
@@ -247,7 +274,16 @@ export class Worker {
         if (selection && permitsRoute(this.config, selection.operatorUid, selection.route.channel_type, selection.route.channel_id)) {
           const message = {
             messageId: 'card_action:' + id, sender: selection.operatorUid, channelId: selection.route.channel_id,
-            channelType: selection.route.channel_type, text: '', cardAction: { selection: selection.selection },
+            channelType: selection.route.channel_type, text: '', cardAction: { selection: selection.selection,
+              ...(this.config.botKind === 'app' && { sourceMessageId: action.messageId }) },
+          }
+          if (this.config.botKind === 'app' && !await this.api.allowsMessage(this.config, {
+            sender: selection.operatorUid, ...selection.route, message_id: action.messageId,
+          }, signal)) {
+            this.store.rememberAnswer(id, message, null)
+            await this.ackCardEvent(id, signal)
+            this.cursor = id
+            continue
           }
           if (binding.questionKey) {
             const pending = this.questions.match(message)
@@ -333,7 +369,7 @@ export class Worker {
       this.store.review(job.seq, 'route_not_allowed')
       return
     }
-    if (job.ambient || config.senderPolicy === 'octo' || (channelType !== 1 && config.channelPolicy === 'joined')) {
+    if (config.botKind === 'app' || job.ambient || config.senderPolicy === 'octo' || (channelType !== 1 && config.channelPolicy === 'joined')) {
       try {
         if (!await this.api.allowsMessage(config, job, signal)) {
           this.store.discard(job.seq, 'octo_access_denied')
@@ -414,7 +450,7 @@ export class Worker {
             this.channelContext(config, route, job, meta, signal),
           ])
           const { attachments, order } = material
-          const voice = config.allowFiles ? voiceTool(this.api, attachments) : undefined
+          const voice = config.allowFiles && config.botKind !== 'app' ? voiceTool(this.api, attachments) : undefined
           let session = this.store.session(conversation, config.idleMinutes)
           if (session.created && await host.exists?.(session.session_id, signal) === false) {
             this.store.forgetSession(session.session_id)
@@ -458,7 +494,8 @@ export class Worker {
             }, config.timeoutMs, toolsAllowed,
             { attachments, order: inputOrder, authorCard, channelContext, taskContext: true, onTrace: trace => progress.trace(trace),
               ...((channelType !== 1 || toolsAllowed) && config.toolPermission !== 'text-only' && this.api.channel && { channelTools: {
-                specs: [...operationSpecs.filter(spec => spec.available && (config.toolPermission !== 'read-only' || !spec.mutating)
+                specs: [...operationSpecs.filter(spec => spec.available && this.api.channel.supports?.(spec.name) !== false
+                  && (config.toolPermission !== 'read-only' || !spec.mutating)
                   && (!spec.requiresFiles || toolsAllowed && config.allowFiles)
                   && (!spec.privateOnly || channelType === 1)
                   && (channelType !== 1 ? !spec.name.startsWith('voice.context.')
@@ -472,8 +509,10 @@ export class Worker {
                 execute: (name, args, toolSignal) => {
                   if (name === formToolSpec.name) return (async () => {
                     const current = await this.liveToolAccess(job, toolSignal)
-                    return this.questions.form(args, { ...job, session_id: session.session_id }, current, toolSignal,
+                    const answer = await this.questions.form(args, { ...job, session_id: session.session_id }, current, toolSignal,
                       waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), () => this.liveToolAllowed(job, current))
+                    await this.liveToolAccess(job, toolSignal)
+                    return answer
                   })()
                   if (name === voice?.spec.name) return (async () => {
                     if (!this.config.allowFiles || this.config.toolPermission === 'text-only'
@@ -487,7 +526,8 @@ export class Worker {
                     return receipt
                   })()
                   const operation = operationSpecs.find(spec => 'octo_' + spec.name.replaceAll('.', '_') === name)
-                  if (!operation?.available || config.toolPermission === 'read-only' && operation.mutating
+                  if (!operation?.available || this.api.channel.supports?.(operation.name) === false
+                    || config.toolPermission === 'read-only' && operation.mutating
                     || operation.requiresFiles && (!toolsAllowed || !config.allowFiles)
                     || operation.privateOnly && channelType !== 1) throw new Error('octo_operation_unavailable')
                   return (async () => {
@@ -784,6 +824,7 @@ export class Worker {
   async runRealtime(lifetime) {
     const stop = new AbortController()
     const signal = AbortSignal.any([lifetime, stop.signal])
+    this.intakeSignal = signal
     const accept = m => {
       signal.throwIfAborted()
       const candidate = admit({ message: {
@@ -803,6 +844,7 @@ export class Worker {
     } finally {
       stop.abort()
       await Promise.allSettled([receiving, draining, cardEvents, recovery])
+      await this.appIntake
     }
   }
 }

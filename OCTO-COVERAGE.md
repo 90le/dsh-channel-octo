@@ -1,6 +1,6 @@
 # Octo IM 能力核对与完整交付方案
 
-核对日期：2026-11-10，目标版本 0.16.0。逐项覆盖 Octo Bot API 的私聊、群聊、话题、消息、媒体、交互和群管理；不把“有接口”称为“已全支持”。通话、文档评论、Loop 后台任务和用户代发是不同权限面。服务端有接口、机器人有权限、客户端能渲染、插件实际跑通是四种不同证据。
+核对日期：2026-11-10，目标版本 0.17.0。逐项覆盖 Octo Bot API 的私聊、群聊、话题、消息、媒体、交互和群管理；不把“有接口”称为“已全支持”。通话、文档评论、Loop 后台任务和用户代发是不同权限面。服务端有接口、机器人有权限、客户端能渲染、插件实际跑通是四种不同证据。
 
 ## 0.15 交付时设置生效
 
@@ -12,7 +12,13 @@
 
 0.16 已接入 User Bot 向明确指定的第三方私聊发送文字、文件/图片及展示卡。名称查询限定固定 Space，分页候选分别验证精确人类身份；查询不授予发送权。发起人遵循现有账号 DSH 工具范围，发送前重查原会话、当前人类/Bot/目标身份。参数在等待前复制，不接受代发字段或原始卡片；私聊不附群提及及空引用。实际发送接口检查好友关系；文件上传完成不等于对方收到，说明发送不明也不重发文件。`messages/sync` 会读取消息，因此不用于第三方目标的发送预检。[发送检查](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/send.go#L160)、[同步接口](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/sync.go#L70)。
 
-App Bot 的注册和私聊发送有官方支持，但当前插件使用的身份验证端点仅查询 User Bot，精确空间成员端点也明确拒绝 App Bot。注册成功不足以证明空间及当前人类身份，事件端点可调用也不足以证明普通私聊会进入事件队列；因此通用 App Bot 绑定仍未实现，不以已有令牌格式校验冒充兼容。[注册实现](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/register.go#L435)、[身份验证](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/user/api.go#L5150)、[精确空间成员](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/space_principal.go#L29)。以上为固定提交源码核对，未执行正式私聊投递或 App Bot 注册。
+0.17 实现独立 App Bot 私聊模式。使用官方注册验证已发布应用的 Bot 与所有者，绑定 API + Bot + 空 Space；注册响应不提供应用 scope/space，不能虚构固定空间。普通消息用 WebSocket，交互卡回调用事件队列及持久 ACK。账号面板区分两种身份，保留 DSH 权限与工具范围。[注册实现](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/register.go#L435)。
+
+App 每次准入先核对活跃人类及好友，再读取触发消息的官方单条私聊接口；该路由执行应用空间约束，sync 好友检查本身不足以证明空间准入。提问文字答案和插话先持久化、后授权，卡片回调绑定原 Bot/对端/操作者/消息/nonce；发布和工具操作再次检查。当前私聊查询也重新读取消息，不能仅信 sync 的记录。[空间检查](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/authtree_guard.go#L64)、[单条消息](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/message/api_message_get.go#L197)。
+
+App 可用 11 项：inspect、messages.recent/read/user_info/users_batch/notify/mark_read/edit/edit_richtext/edit_display_card/clear_card_revisions；另有展示卡、表单、原生问答、文件和进度。修订清理仍要求已验证所有者明确确认。拒绝群/子区、空间成员搜索、跨会话发送、授权搜索及语音接口；不调用只支持 User Bot 的成员身份端点。原生命令菜单接口只更新 robot 表，App 可能得到未实际保存的成功响应，因此界面隐藏且后端明确拒绝；本地斜杠命令不受影响。[菜单存储](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/db.go#L209)。
+
+以上为固定提交源码及合成回归验证，尚未用正式 App Bot 凭据注册或发送真实消息。正式客户端显示、当前部署的空间撤权行为须独立验收。
 
 ## 能力矩阵
 
@@ -28,9 +34,9 @@ App Bot 的注册和私聊发送有官方支持，但当前插件使用的身份
 | 交互卡 | octo/v2 的提交产生 `card_action` 事件；能力受 Bot 策略和部署限制。 | 支持受限选择及工具范围内的 Agent 提问；逐题回执、完整答案进入 DSH，卡片不可用时可回复序号或文字。回调绑定原频道、原提问用户和一次性标识；旧卡不触发新任务。 |
 | 长轮询与长连接 | 事件 API 支持长轮询和 ACK；悟空 IM WebSocket 使用注册、加密握手、PING/PONG、接收确认。官方渠道把 WS 消息接收与 REST 回复分开。 | 支持 HTTP 事件或 WebSocket；免 @ 使用 WebSocket，仍以 REST 回发。0.10.0 从实际接收起点持久登记频道，重连/定时按序补读历史；临时消息先持久化再确认。真实加密线协议测试验证缺口先于新消息处理、去重。恢复边界见下文。 |
 
-## 0.16.0 频道工具对照
+## 0.17.0 频道工具对照
 
-实现位于 `src/channel-api.js`，共 52 个可用操作，另有 `octo_display_card` 展示工具、本轮语音附件的 `octo_voice_transcribe` 和等待填写的 `octo_form`。模型参数不能改变 Bot、Space 或当前会话；授权检索和指定目标发送有独立的目标授权，不接受模型指定授权身份。下表“实现”指源码、模拟接口及参数/权限测试；不表示已对正式群执行管理操作。
+实现位于 `src/channel-api.js`，User Bot 共 52 个可用操作，App Bot 为上述 11 项当前私聊操作，另有 `octo_display_card` 展示工具、本轮语音附件的 `octo_voice_transcribe` 和等待填写的 `octo_form`。模型参数不能改变 Bot、Space 或当前会话；授权检索和指定目标发送有独立的目标授权，不接受模型指定授权身份。下表“实现”指源码、模拟接口及参数/权限测试；不表示已对正式群执行管理操作。
 
 | 官方能力 | 插件操作及范围 | 验证/限制 |
 | --- | --- | --- |
@@ -54,9 +60,9 @@ App Bot 的注册和私聊发送有官方支持，但当前插件使用的身份
 | Agent 问答卡 | 原生 `ask_user_question` + 逐题回执 | DSH 工具范围内支持私聊/群聊/子区；答案回到原生等待，不生成另一条无关联任务。不是宿主权限审批的替代。 |
 | DSH 工具权限审批 | 独立的原生 `approval/request` 桥接 | 从本次原生工具事件取得参数，绑定真实 callId/回合；支持单次批准/拒绝，等待不消耗执行时限。信息不完整、脱敏、权限撤回或混入 Web 回合均不批准。不是安装插件等其他审批的通用接管。 |
 | 六类输入与多选 | `octo_form`；原生提问的文字/多选卡 | 文字、数字、日期、时间、开关、选择；8 字段/6 按钮，回到原回合并暂停执行计时。能力不足时提示文字填写；不确认未知投递。暂不支持回合结束后长期异步表单。 |
-| Bot 原生命令菜单 | 账号设置的发布/清空菜单 | 固定五个已有命令；明确整体替换，不自动改写已有菜单。经模拟接口及 UI 回调验证，未替换正式 Bot 菜单。 |
+| Bot 原生命令菜单 | User Bot 账号设置的发布/清空菜单；App 明确不支持 | 固定五个已有命令；明确整体替换，不自动改写已有菜单。经模拟接口及 UI 回调验证，未替换正式 Bot 菜单。 |
 | 尚无已核验 Bot 端点 | 子区改名、消息表情反应/置顶/删除 | 不挂载可执行工具，不假装调用成功；待官方端点/权限契约成立后接入。 |
-| 尚未达到官方全部形态 | 通用 App Bot、长期异步表单、尚未登记频道的离线发现 | 明确待办，不算已支持；已实现投递工具不能代替这些形态，交互等待仍属于原生回合。 |
+| 尚未达到官方全部形态 | 长期异步表单、尚未登记频道的离线发现 | 明确待办，不算已支持；已实现投递工具不能代替这些形态，交互等待仍属于原生回合。 |
 | Webhook 修改/删除/测试工具 | 当前群或精确子区的 PUT/DELETE、POST `/{id}/test` | 请求者必须是实时群主/管理员，Bot 必须是创建者或群管理员。可调整名称、启停、广播许可及定向名单；测试须明确请求，会真实发送固定文字和配置的定向提及，不是健康探测。没有自动重试。 |
 | Webhook 管理界面 | 同一 Bot 管理路径的创建、`regenerate`、修改、删除、投递诊断、测试 | 登录的 DSH 管理员以 Bot 身份操作；空间、频道和服务端权限实时核验，操作前核对配置版本。一次性密钥及适配器 URL/示例仅返回当前管理请求，界面默认遮盖并按账号/频道切换清除，不进入模型工具或持久账号数据。 |
 | 卡片修订清理 | POST `/v1/bot/message/card/revisions/clear` | 仅验证的 Bot 所有者明确请求，可清理本 Bot 当前会话的普通展示卡历史；群内还要求群管理权限。再次读取原始/有效卡片和权限，排除所有待交互及受管理卡片。只验证清理数量，保留当前卡片与审计墓碑；不自动重试。 |

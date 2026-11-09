@@ -20,18 +20,23 @@ const npm = process.env.npm_execpath
 const wire = process.argv[3] !== 'events'
 const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
+const appBotSmoke = process.env.DSH_OCTO_SMOKE_APP_BOT === '1'
 const ownerSmoke = process.env.DSH_OCTO_SMOKE_OWNER === '1'
 const groupToolsSmoke = process.env.DSH_OCTO_SMOKE_GROUP_TOOLS === '1'
 const delegatedSmoke = process.env.DSH_OCTO_SMOKE_DELEGATED_SEARCH === '1'
 if (delegatedSmoke && !ownerSmoke) throw new Error('Delegated search smoke requires owner fixture mode')
 if (groupToolsSmoke && !ownerSmoke) throw new Error('Group tools smoke requires owner mode')
 const deleteSmoke = process.env.DSH_OCTO_SMOKE_DELETE === '1'
-const includeImConnect = !ownerSmoke && process.env.DSH_OCTO_SMOKE_CORE_ONLY !== '1'
+const includeImConnect = !appBotSmoke && !ownerSmoke && process.env.DSH_OCTO_SMOKE_CORE_ONLY !== '1'
+if (appBotSmoke && (ownerSmoke || groupToolsSmoke || delegatedSmoke || deleteSmoke || !wire || browserModule)) {
+  throw new Error('AppBot smoke requires its own headless WebSocket scenario; do not combine USER fixture modes')
+}
 if (deleteSmoke && (ownerSmoke || browserModule)) throw new Error('Deletion smoke uses an isolated headless profile')
 if (ownerSmoke && (!wire || browserModule)) throw new Error('Owner tool smoke uses headless WebSocket')
 const screenshots = process.env.DSH_OCTO_SMOKE_SCREENSHOTS
 const codexUi = process.env.DSH_OCTO_SMOKE_CODEX_UI
 const automation = process.env.DSH_OCTO_SMOKE_AUTOMATION
+if (appBotSmoke && (codexUi || automation)) throw new Error('AppBot smoke uses only the isolated Octo plugin')
 if (codexUi && !/^\d+\.\d+\.\d+$/.test(codexUi)) throw new Error('Set an exact Codex UI version')
 if (automation && !/^\d+\.\d+\.\d+$/.test(automation)) throw new Error('Set an exact automation version')
 if (browserModule && (!browserExecutable || !wire)) throw new Error('Browser smoke needs WebSocket and an executable path')
@@ -41,8 +46,9 @@ const observer = join(home, 'fixture-observer.mjs')
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|TEMP|TMP|TMPDIR|USERPROFILE|APPDATA|LOCALAPPDATA|HOME|LANG|npm_config_cache)$/i.test(key)))
 Object.assign(env, {
-  DSH_HOME: home, DSH_OCTO_BOT_TOKEN: 'bf_fixture', DEEPSEEK_API_KEY: 'sk-fixture-for-local-smoke',
+  DSH_HOME: home, DSH_OCTO_BOT_TOKEN: appBotSmoke ? 'app_SECRETfixture' : 'bf_fixture', DEEPSEEK_API_KEY: 'sk-fixture-for-local-smoke',
   DSH_TELEMETRY_DISABLED: '1',
+  DSH_OCTO_FIXTURE_APP_BOT: appBotSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_OWNER: ownerSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_GROUP_TOOLS: groupToolsSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_DELEGATED_SEARCH: delegatedSmoke ? '1' : '0',
@@ -64,6 +70,65 @@ function sentCount() {
     return db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE state='sent'").get().n
   } catch { return 0 }
   finally { db?.close() }
+}
+async function assertAppBotSmoke(child, output, deadline) {
+  const markers = ['REGISTER_OK', 'WIRE_ACK_OK', 'HUMAN_OK=fixture-user', 'HUMAN_OK=fixture-owner',
+    'FRIEND_OK=fixture-user', 'FRIEND_OK=fixture-owner', 'NONOWNER_TEXT_ONLY_OK', 'ORDINARY_OK',
+    'MESSAGE_GET_OK=fixture-user:1', 'MESSAGE_GET_OK=fixture-owner:2', 'MESSAGE_GET_OK=fixture-owner:720',
+    'CHANNEL_TOOLS_OK=11',
+    'QUESTION_CARD_OK', 'INVALID_CALLBACKS_IGNORED', 'CALLBACK_ACK_OK', 'QUESTION_FEEDBACK_OK',
+    'UPLOAD_OK', 'FILE_OK', 'FULL_CAPTION_OK', 'DISPLAY_OK', 'FINAL_OK',
+    ...[0, 1, 2, 3, 4].map(step => 'TOOL_SCOPE_OK=' + step),
+    ...[1, 2, 3, 4].map(step => 'NATIVE_TOOL_OK=' + step)].map(marker => 'FIXTURE_APP_' + marker)
+  const complete = () => sentCount() === 2 && markers.every(marker => output().includes(marker))
+  while (Date.now() < deadline && child.exitCode === null && !complete() && !output().includes('FIXTURE_APP_FAIL=')) await delay(100)
+  if (!complete() || output().includes('FIXTURE_APP_FAIL=')) {
+    let jobs = []
+    try {
+      const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
+      try { jobs = db.prepare('SELECT message_id,state,issue FROM jobs ORDER BY seq').all() } finally { db.close() }
+    } catch {}
+    throw new Error('AppBot native fixture failed; missing: ' + markers.filter(marker => !output().includes(marker)).join(', ')
+      + '; jobs: ' + JSON.stringify(jobs) + '\n' + output().replace(/https?:\/\/\S+/g, '[url]'))
+  }
+  if ((output().match(/FIXTURE_APP_REGISTER_OK/g) ?? []).length !== 1
+    || readFileSync(join(home, 'appbot-tool-fixture.txt'), 'utf8') !== 'written by native DSH for AppBot') {
+    throw new Error('AppBot registration cache or native workspace write was not confirmed')
+  }
+  const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
+  try {
+    const jobs = db.prepare('SELECT message_id,sender,channel_type,channel_id,session_id,state,result_id,input FROM jobs ORDER BY seq').all()
+    const ordinary = jobs.find(job => job.message_id === '1'), owner = jobs.find(job => job.message_id === '2')
+    const answer = jobs.find(job => job.message_id === 'card_action:9205')
+    if (jobs.length !== 3 || !ordinary?.session_id || !owner?.session_id || ordinary.session_id === owner.session_id
+      || ordinary.state !== 'sent' || ordinary.result_id !== '710' || ordinary.sender !== 'fixture-user'
+      || owner.state !== 'sent' || owner.result_id !== '741' || owner.sender !== 'fixture-owner'
+      || jobs.some(job => job.channel_type !== 1 || job.channel_id !== job.sender)
+      || answer?.session_id !== owner.session_id || answer.state !== 'ignored' || answer.input !== '' || answer.sender !== owner.sender) {
+      throw new Error('AppBot DM isolation, group/topic rejection or native callback session binding failed')
+    }
+    const card = db.prepare("SELECT claimed,binding FROM card_bindings WHERE message_id='720'").get()
+    const binding = card && JSON.parse(card.binding)
+    if (card?.claimed !== 1 || binding?.questionFeedback !== 1 || binding?.spaceId !== null
+      || binding.account !== JSON.stringify(['https://octo-fixture.invalid/api', null, 'app_fixture_bot'])
+      || binding.messageId !== '720' || binding.operatorUid !== 'fixture-owner'
+      || binding.route.channel_type !== 1 || binding.route.channel_id !== 'fixture-owner') {
+      throw new Error('AppBot callback did not retain its account, null Space, operator, DM and exact card binding')
+    }
+  } finally { db.close() }
+  const stored = readFileSync(join(state, 'accounts.json'), 'utf8')
+  const account = JSON.parse(stored).accounts.find(row => row.id === 'legacy')
+  if (account?.botKind !== 'app' || account.botUid !== 'app_fixture_bot' || account.spaceId !== null
+    || account.transport !== 'websocket' || account.senderPolicy !== 'octo' || account.permission !== 'workspace-write'
+    || stored.includes('app_SECRETfixture') || Object.hasOwn(account, 'ownerUid')) {
+    throw new Error('AppBot account identity, server-managed admission or credential isolation changed')
+  }
+  console.log('PASS: native AppBot register identity and cached encrypted WebSocket; no verify-bot or invented Space.')
+  console.log('PASS: active-human batch lookup and friendship sync; ordinary DM text-only, registered owner native workspace tools; isolated DM sessions.')
+  console.log('PASS: official person-message GET verified both DM triggers and the stored question card against their exact peers and IDs.')
+  console.log('PASS: owner menu contains exactly 11 App DM channel operations plus display-card and form tools.')
+  console.log('PASS: native question-card callback with server Space, wrong operator/route/message/nonce rejection, write/present, file plus full Markdown caption, display receipt and final.')
+  console.log('PASS: group/topic inputs rejected; unavailable group/search/proactive/voice tools absent; fake local APIs only.')
 }
 let child, browser
 try {
@@ -142,19 +207,30 @@ export function apply(ctx) {
       }],
     }), { mode: 0o600 })
   }
+  if (appBotSmoke) {
+    mkdirSync(state, { mode: 0o700 })
+    writeFileSync(join(state, 'accounts.json'), JSON.stringify({
+      version: 1, endpoint: 'https://octo-fixture.invalid/api', accounts: [{
+        id: 'legacy', botUid: 'app_fixture_bot', botKind: 'app', spaceId: null, cwd: home,
+        label: 'Fixture AppBot', enabled: true, permission: 'workspace-write', agentPreset: 'standard',
+        senderPolicy: 'octo', transport: 'websocket', allowFiles: true, sendMode: 'steer', toolScope: 'private',
+      }],
+    }), { mode: 0o600 })
+  }
   writeFileSync(join(home, 'profiles', 'web', 'cordis.patch.yml'), [
     '- insert:', '  - id: octo-fixture-observer', '    name: ' + q(pathToFileURL(observer).href),
     '- id: dsh-channel-octo', '  config:', '    enabled: true',
-    '    apiBase: https://octo-fixture.invalid/api', '    botUid: fixture-bot',
-    '    spaceId: fixture-space',
-    ...(wire
+    '    apiBase: https://octo-fixture.invalid/api',
+    ...(appBotSmoke ? ['    botUid: app_fixture_bot', '    botKind: app', '    spaceId: null']
+      : ['    botUid: fixture-bot', '    spaceId: fixture-space']),
+    ...(appBotSmoke ? ['    senderPolicy: octo', '    transport: websocket', '    progress: off'] : wire
       ? ['    senderPolicy: octo', '    channelPolicy: joined', '    mentionPolicy: octo']
       : ['    allowedUids: [fixture-user]',
         '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
         '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]']),
     '    threadRuleMode: inherit-group', '    allowFiles: true',
     '    hostPermissions: [read-only, workspace-write, danger-full-access, auto]',
-    ...(ownerSmoke ? ['    mediaDownloadOrigins: ["https://files-fixture.invalid"]',
+    ...(ownerSmoke || appBotSmoke ? ['    mediaDownloadOrigins: ["https://files-fixture.invalid"]',
       '    mediaUploadOrigins: ["https://storage-fixture.invalid"]'] : []),
     '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 22000',
     '- id: llm-deepseek', '  config:', '    baseURL: https://model-fixture.invalid',
@@ -431,6 +507,8 @@ export function apply(ctx) {
       console.log('PASS: protected Webhook native settings UI ' + JSON.stringify(await runWebhookUiSmoke(page)))
     }
   }
+  if (appBotSmoke) await assertAppBotSmoke(child, () => output, deadline)
+  else {
   // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
   const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
   const expectedReceipts = ownerSmoke || deleteSmoke ? 6 : 5
@@ -558,6 +636,7 @@ export function apply(ctx) {
   console.log('PASS: DSH Web' + (includeImConnect ? ' + IM Connect' : '') + '; '
     + (wire ? 'Octo friends/members with @ and no-@ over WebSocket' : 'explicit @ over HTTP events')
     + '; channel rules and isolated histories.')
+  }
 } finally {
   await browser?.close()
   if (child && child.exitCode === null && child.signalCode === null) {

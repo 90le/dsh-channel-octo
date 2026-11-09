@@ -1,4 +1,4 @@
-import { validUid } from './config.js'
+import { validUid, validBotIdentity } from './config.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
 import { apiErrorCode, officialApiErrorCode } from './api-errors.js'
@@ -217,6 +217,12 @@ export const CHANNEL_API_OPERATIONS = freeze([
     schema({ message_id: messageID }, ['message_id']), true, 'unsupported_bot_endpoint')),
 ])
 const specs = new Map(CHANNEL_API_OPERATIONS.map(value => [value.name, value]))
+// App Bots have a distinct DM-only API surface. Do not expose User Bot group,
+// directory, delegated search or voice operations and let the model discover
+// their incompatibility by issuing failing mutations.
+const appOperations = new Set(['inspect', 'messages.recent', 'messages.read', 'messages.user_info', 'messages.users_batch',
+  'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.edit_richtext', 'messages.edit_display_card',
+  'messages.clear_card_revisions'])
 const errorHints = Object.freeze({
   account_configuration_changed: '账号配置已变更，此次旧配置下的操作已停止。请基于当前配置重新确认；已经发出的写请求不会自动重试。',
   private_operation_required: '请在你与 Bot 的私聊中明确选择目标频道；共享群聊不会开放跨频道发送。',
@@ -458,13 +464,13 @@ export class ChannelApi {
   #searchContinuations = new Map()
   #revoked = false
   constructor({ request, config }) {
-    if (typeof request !== 'function' || !validUid(config?.botUid) || !validUid(config?.spaceId)) fail('invalid_channel_api_config')
+    if (typeof request !== 'function' || !validBotIdentity(config)) fail('invalid_channel_api_config')
     this.#request = request
     // The host fills ownerUid from verified identity after constructing its
     // client. Read that trusted field at call time; never accept it in args.
     this.#ownerUid = () => config.ownerUid
     this.#config = {
-      botUid: config.botUid, spaceId: config.spaceId,
+      botUid: config.botUid, spaceId: config.spaceId, botKind: config.botKind,
       senderPolicy: config.senderPolicy ?? 'octo', channelPolicy: config.channelPolicy ?? 'joined',
       allowed: new Set(config.allowed ?? []), groups: new Set(config.groups ?? []), threads: new Set(config.threads ?? []),
     }
@@ -473,6 +479,17 @@ export class ChannelApi {
   }
 
   revoke() { this.#revoked = true; this.#searchContinuations.clear() }
+
+  supports(operation) {
+    return specs.get(operation)?.available === true && (this.#config.botKind !== 'app' || appOperations.has(operation))
+  }
+
+  // Unlike sync, this official route applies the App's server-managed Space
+  // guard as well as ordinary DM visibility. Never cache this authorization.
+  async appMessage(route, sender, messageId, signal) {
+    if (this.#config.botKind !== 'app' || route.channel_type !== 1 || route.channel_id !== sender) fail('invalid_route')
+    return this.#readMessage(this.#scope(route), sender, messageId, signal)
+  }
 
   async #call(path, body, signal, method = body === undefined ? 'GET' : 'POST', retainSendReceipt = false) {
     if (this.#revoked) fail('account_configuration_changed')
@@ -509,6 +526,7 @@ export class ChannelApi {
     if (channel_type === 1 && validUid(channel_id) && !channel_id.includes('@') && channel_id !== this.#config.botUid) {
       return { route: fixed }
     }
+    if (this.#config.botKind === 'app') fail('api_unsupported')
     const scope = ruleScope(channel_type, channel_id)
     if (!scope) fail('invalid_route')
     if (this.#config.channelPolicy === 'allowlist'
@@ -562,6 +580,12 @@ export class ChannelApi {
       || this.#config.senderPolicy === 'allowlist' && !this.#config.allowed.has(sender)) fail('requester_not_allowed')
     if (!scope.group) {
       if (scope.route.channel_id !== sender) fail('requester_not_allowed')
+      if (this.#config.botKind === 'app') {
+        const users = await this.#call('/v1/bot/users/batch', { uids: [sender] }, signal)
+        if (!Array.isArray(users?.users) || users.users.length !== 1 || !Array.isArray(users.missing_uids)
+          || users.missing_uids.length || users.users[0]?.uid !== sender
+          || users.users[0].status !== 1 || users.users[0].robot !== 0) fail('requester_not_allowed')
+      }
       // Also used before DM mutations: ordinary sync checks owner/friend access.
       const data = await this.#call('/v1/bot/messages/sync', { ...scope.route, start_message_seq: 0, end_message_seq: 0, limit: 1, pull_mode: 0 }, signal)
       // Official sync can serialize an empty Go slice as null. Missing/other
@@ -569,6 +593,11 @@ export class ChannelApi {
       if (!object(data) || strictRead && (!Object.hasOwn(data, 'messages')
         || data.messages !== null && !Array.isArray(data.messages))) fail('invalid_api_response')
       list(data.messages, 1)
+      if (this.#config.botKind === 'app') {
+        const anchor = id(data.messages?.[0]?.message_id)
+        if (!anchor) fail('message_unavailable')
+        await this.#readMessage(scope, sender, anchor, signal)
+      }
       return {}
     }
     const rows = await this.#membership(scope, signal)
@@ -787,7 +816,9 @@ export class ChannelApi {
       try { payload = JSON.parse(payload.trimStart().startsWith('{') ? payload : Buffer.from(payload, 'base64').toString('utf8')) }
       catch { fail('invalid_message_response') }
     }
-    if (!object(payload) || payload.event != null || payload.space_id != null && payload.space_id !== this.#config.spaceId) fail('message_unavailable')
+    const matchesSpace = value => value.space_id == null || (this.#config.botKind === 'app'
+      ? validUid(value.space_id) : value.space_id === this.#config.spaceId)
+    if (!object(payload) || payload.event != null || !matchesSpace(payload)) fail('message_unavailable')
     if (payload.visibles != null && (!Array.isArray(payload.visibles)
       || payload.visibles.length > 0 && !payload.visibles.includes(sender))) fail('message_unavailable')
     const checkEditSource = value => {
@@ -821,7 +852,7 @@ export class ChannelApi {
       if (!object(payload) || payload.visibles != null || payload.event != null) fail('invalid_message_response')
     }
     if (editType) {
-      if (payload.space_id != null && payload.space_id !== this.#config.spaceId) fail('message_unavailable')
+      if (!matchesSpace(payload)) fail('message_unavailable')
       checkEditSource(payload)
     }
     const normalized = normalizeOctoContent(payload, { allowFiles: details })
@@ -1162,6 +1193,7 @@ export class ChannelApi {
     if (this.#revoked) fail('account_configuration_changed')
     const definition = specs.get(operation)
     if (!definition) fail('unknown_operation')
+    if (this.#config.botKind === 'app' && !this.supports(operation)) fail('api_unsupported')
     const structuredEdit = structuredEdits.has(operation)
     const identityRead = identityReads.has(operation)
     const scopedRead = identityRead || webhookReads.has(operation)
@@ -1423,7 +1455,9 @@ export class ChannelApi {
       const rows = list(raw.messages, size), messages = [], seen = new Set()
       for (const row of rows) {
         try {
-          const message = this.#message(row, scope, sender)
+          const message = this.#config.botKind === 'app'
+            ? await this.#readMessage(scope, sender, id(row?.message_id), signal)
+            : this.#message(row, scope, sender)
           if ((!args.before_seq || message.message_seq < args.before_seq) && !seen.has(message.message_id)) {
             seen.add(message.message_id); messages.push(message)
           }

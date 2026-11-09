@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, isAbsolute, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { apiEndpoint, privateStateDir, validToken, validToolScope, validUid } from './config.js'
+import { apiEndpoint, privateStateDir, validBotIdentity, validToken, validToolScope, validUid } from './config.js'
 import { DshHost } from './dsh.js'
 import { OctoClient, OctoError } from './octo.js'
 import { Store } from './store.js'
@@ -23,6 +23,7 @@ const idleOptions = [0, 15, 30, 60, 120]
 const fail = code => { throw new Error(code) }
 const str = (v, max = 200) => typeof v === 'string' && v.length <= max && !/[\x00-\x1f\x7f]/.test(v)
 const sameBot = (a, b) => a?.botUid === b?.botUid && a?.spaceId === b?.spaceId
+  && (a?.botKind ?? 'user') === (b?.botKind ?? 'user')
 const id = () => randomUUID()
 
 function privateDir(dir) {
@@ -46,11 +47,12 @@ function savedRecords(path, endpoint) {
     const ids = new Set(), bots = new Set()
     for (const item of saved.accounts) {
       const bot = item?.botUid
-      if ((!idPattern.test(item?.id ?? '') && item?.id !== legacy) || !validUid(item.botUid) || !validUid(item.spaceId)
+      if ((!idPattern.test(item?.id ?? '') && item?.id !== legacy) || !validBotIdentity(item)
         || ids.has(item.id) || bots.has(bot) || (item.secretRef != null && !refPattern.test(item.secretRef))
         || (item.id !== legacy && !item.secretRef && !item.removed)
         || !str(item.label, 80) || !str(item.cwd, 1024) || !isAbsolute(item.cwd)
-        || !['events', 'websocket'].includes(item.transport) || typeof item.enabled !== 'boolean'
+        || !['events', 'websocket'].includes(item.transport) || (item.botKind === 'app' && item.transport !== 'websocket')
+        || typeof item.enabled !== 'boolean'
         || (item.toolScope !== undefined && !validToolScope(item.toolScope))) fail('accounts_unavailable')
       item.toolScope ??= 'private'
       ids.add(item.id); bots.add(bot)
@@ -93,12 +95,16 @@ export class Accounts {
       this.file = join(this.root, 'accounts.json')
       for (const record of savedRecords(this.file, this.endpoint)) this.records.set(record.id, record)
       const { botUid, spaceId, cwd, mentionPolicy } = this.deployment
-      if (this.deployment.enabled === true && validUid(botUid) && validUid(spaceId) && isAbsolute(cwd ?? '')) {
+      const botKind = this.deployment.botKind === undefined && this.env.DSH_OCTO_BOT_TOKEN?.startsWith('app_')
+        ? 'app' : this.deployment.botKind
+      const identity = { botUid, spaceId, botKind }
+      if (this.deployment.enabled === true && validBotIdentity(identity) && isAbsolute(cwd ?? '')) {
         const existing = this.records.get(legacy)
-        if (existing && !sameBot(existing, { botUid, spaceId })) fail('bot_identity_mismatch')
+        if (existing && !sameBot(existing, identity)) fail('bot_identity_mismatch')
         if (!existing) this.records.set(legacy, {
           id: legacy, botUid, spaceId, cwd, label: 'Octo Bot', enabled: true, permission: textOnly, toolScope: 'private',
-          transport: this.deployment.transport ?? (mentionPolicy === 'octo' ? 'websocket' : 'events'),
+          ...(identity.botKind === 'app' && { botKind: 'app' }),
+          transport: this.deployment.transport ?? (identity.botKind === 'app' || mentionPolicy === 'octo' ? 'websocket' : 'events'),
         })
       }
       this.status = this.records.size ? 'connecting' : 'disabled'
@@ -161,6 +167,7 @@ export class Accounts {
         mediaMaxBytes: this.deployment.mediaMaxBytes, mediaTimeoutMs: this.deployment.mediaTimeoutMs,
       }),
       apiBase: this.endpoint, stateDir, cwd: record.cwd, botUid: record.botUid, spaceId: record.spaceId, transport: record.transport,
+      ...(record.botKind === 'app' && { botKind: 'app' }),
       toolScope: record.toolScope ?? 'private',
     }
     const admission = record.senderPolicy ? { senderPolicy: record.senderPolicy, allowedUids: record.allowedUids ?? [] } : {}
@@ -299,6 +306,7 @@ export class Accounts {
     return {
       id: record.id, legacy: record.id === legacy, label: record.label, enabled: record.enabled,
       botUid: record.botUid, spaceId: record.spaceId, cwd: record.cwd, transport: record.transport,
+      ...(record.botKind === 'app' && { botKind: 'app' }),
       provider: record.provider ?? '', model: record.model ?? '', reasoningEffort: record.reasoningEffort ?? '',
       permission: record.permission ?? textOnly, agentPreset: record.agentPreset ?? 'octo-text', idleMinutes: record.idleMinutes ?? 0,
       toolScope: record.toolScope ?? 'private',
@@ -399,7 +407,14 @@ export class Accounts {
   async identify(token) {
     try {
       const api = new OctoClient({ apiBase: this.endpoint, token, fetchImpl: this.fetchImpl })
-      return await api.identify(this.lifetime.signal)
+      const identity = await api.identify(this.lifetime.signal)
+      if (!validBotIdentity(identity) || (identity.botKind === 'app') !== token.startsWith('app_')
+        || [identity.botUid, identity.spaceId, identity.ownerUid].some(value => typeof value === 'string' && value.includes(token))) {
+        fail('bot_verification_failed')
+      }
+      return { botUid: identity.botUid, spaceId: identity.spaceId,
+        ...(identity.botKind === 'app' && { botKind: 'app' }),
+        ...(validUid(identity.ownerUid) && identity.ownerUid !== identity.botUid && { ownerUid: identity.ownerUid }) }
     } catch { fail('bot_verification_failed') }
   }
 
@@ -490,7 +505,8 @@ export class Accounts {
       const newRef = changedToken ? 'DSH_OCTO_ACCOUNT_' + id().replaceAll('-', '').toUpperCase() : old?.secretRef
       const record = {
         ...fields, id: old?.id ?? existing?.id ?? id(), botUid: identity.botUid, spaceId: identity.spaceId, secretRef: newRef,
-        transport: old?.transport ?? (token.startsWith('bf_') ? 'websocket' : 'events'),
+        ...(identity.botKind === 'app' && { botKind: 'app' }),
+        transport: old?.transport ?? 'websocket',
       }
       const active = this.runtimes.get(record.id)
       if (active?.changing) fail('account_transition')
@@ -559,6 +575,7 @@ export class Accounts {
         || Object.keys(input).some(key => !['revision', 'action'].includes(key))) fail('invalid_bot_commands')
       botCommandMenu(input.action)
       const record = this.record(accountId)
+      if (record.botKind === 'app') fail('app_bot_operation_unavailable')
       const runtime = this.runtimes.get(accountId)
       if (!runtime?.settings?.config) fail('channel_not_configured')
       if (runtime.changing) fail('account_transition')
@@ -590,6 +607,7 @@ export class Accounts {
       this.checkRevision(input)
       validateWebhookInput(input)
       const record = this.record(accountId)
+      if (record.botKind === 'app') fail('app_bot_operation_unavailable')
       const runtime = this.runtimes.get(accountId)
       if (!runtime?.settings?.config) fail('channel_not_configured')
       if (runtime.changing) fail('account_transition')

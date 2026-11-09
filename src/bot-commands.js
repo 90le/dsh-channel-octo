@@ -20,6 +20,9 @@ export function botCommandMenu(action) {
 export async function setBotCommands({ apiBase, token, fetchImpl = fetch }, action, signal) {
   const commands = botCommandMenu(action)
   if (!validToken(token)) throw new Error('invalid_bot_token')
+  // The official handler only updates robot.bot_commands; App tokens can get
+  // HTTP 200 without updating any App Bot. Do not report a phantom menu save.
+  if (token.startsWith('app_')) throw new Error('app_bot_operation_unavailable')
   let reader
   try {
     const endpoint = apiEndpoint(apiBase)

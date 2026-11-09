@@ -39,7 +39,7 @@ test('menu is a fixed copy of supported command metadata; only explicit clear yi
 })
 
 test('official wire contract uses POST setCommands, bearer auth, command names without slashes and explicit empty array', async () => {
-  for (const credential of [token, 'app_synthetic_menu_fixture']) {
+  for (const credential of [token, 'bf_synthetic_menu_fixture_other']) {
     for (const action of ['publish', 'clear']) {
       const calls = []
       const result = await setBotCommands({ apiBase: 'https://octo.invalid/api/', token: credential,
@@ -67,6 +67,8 @@ test('invalid actions, tokens and destinations fail before transport; errors rev
   for (const value of [undefined, '', 'uk_fixture', 'bf_unsafe\nvalue']) {
     await assert.rejects(setBotCommands({ ...config, token: value }, 'publish', signal()), /^Error: invalid_bot_token$/)
   }
+  await assert.rejects(setBotCommands({ ...config, token: 'app_synthetic_menu_fixture' }, 'publish', signal()),
+    /^Error: app_bot_operation_unavailable$/)
   for (const apiBase of ['http://octo.invalid', 'https://name:secret@octo.invalid', 'https://octo.invalid?secret=x', 'bad-secret-url']) {
     await assert.rejects(setBotCommands({ ...config, apiBase }, 'publish', signal()), /^Error: bot_commands_failed$/)
   }
@@ -136,7 +138,7 @@ async function fixture(t) {
     calls.push({ url, init })
     if (url === deployment.apiBase + '/v1/auth/verify-bot') {
       const credential = JSON.parse(init.body).bot_token
-      return Response.json({ bot_uid: state.botUid ?? (credential === 'app_second_fixture' ? 'bot-second' : 'bot-fixture'),
+      return Response.json({ bot_uid: state.botUid ?? (credential === 'bf_second_fixture' ? 'bot-second' : 'bot-fixture'),
         space_id: 'space-fixture', owner_uid: 'owner-fixture' })
     }
     assert.equal(url, deployment.apiBase + '/v1/bot/setCommands', 'all HTTP is intercepted; no live requests')
@@ -255,11 +257,11 @@ test('startup, saves, pause, reconnect and removal never replace or clear the me
   await accounts.reconnect(id, { revision: accounts.revision })
   await accounts.setEnabled(id, { revision: accounts.revision, enabled: false })
   const other = await accounts.save(null, { revision: accounts.revision,
-    account: { token: 'app_second_fixture', label: 'Other', cwd: root, enabled: false } })
+    account: { token: 'bf_second_fixture', label: 'Other', cwd: root, enabled: false } })
   assert.ok(calls.every(c => c.url.endsWith('/verify-bot')))
   calls.length = 0
   await accounts.updateBotCommands(other.accountId, { revision: accounts.revision, action: 'publish' })
-  assert.equal(calls[1].init.headers.Authorization, 'Bearer app_second_fixture')
+  assert.equal(calls[1].init.headers.Authorization, 'Bearer bf_second_fixture')
   calls.length = 0
   await accounts.remove(id, { revision: accounts.revision })
   await accounts.remove(other.accountId, { revision: accounts.revision })

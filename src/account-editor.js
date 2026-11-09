@@ -38,6 +38,12 @@ const copy = {
   saveToken: ['保存新令牌', 'Save new token'],
   botUid: ['Bot ID', 'Bot ID'],
   spaceId: ['空间 ID', 'Space ID'],
+  botKind: ['Bot 类型', 'Bot type'],
+  appBot: ['应用 Bot', 'App Bot'],
+  userBot: ['用户 Bot', 'User Bot'],
+  scope: ['聊天范围', 'Chat scope'],
+  appScope: ['Octo 管理的私聊范围', 'Octo-managed DM scope'],
+  appRegistration: ['验证 App Bot 令牌时，也会向 Octo 注册该 Bot 的连接。', 'Verifying an App Bot token also registers its connection with Octo.'],
   workspace: ['工作区', 'Workspace'],
   currentWorkspace: ['当前工作区', 'Current workspace'],
   agentPreset: ['Agent 预设', 'Agent preset'],
@@ -59,12 +65,17 @@ const copy = {
   toolOwner: ['Bot 所有者的全部会话', 'All bot owner conversations'],
   toolAdmitted: ['所有已准入用户', 'All admitted users'],
   toolScopeHint: ['控制谁能使用所选 Agent 预设中可用的全部 DSH 工具、插件和技能（Skills），实际操作仍受账号权限策略约束；“仅文字”不开放工具。所有用户和私聊、群聊、子区（话题）仍须通过现有聊天准入规则。', 'Controls who can use all DSH tools, plugins and skills available in the selected Agent preset, subject to this account’s permission policy. Text-only permission grants no tools. Every user and DM, group or topic must still pass existing chat admission rules.'],
+  appToolScopeHint: ['控制谁能在获准的私聊中使用所选 Agent 预设的 DSH 工具、插件和技能，实际操作仍受账号权限策略约束；“仅文字”不开放工具。', 'Controls who can use the selected Agent preset’s DSH tools, plugins and skills in admitted DMs, subject to this account’s permission policy. Text-only permission grants no tools.'],
+  appToolPrivateHint: ['工具对名单内的私聊用户开放；跟随 Octo 准入时为已验证的 Bot 所有者。', 'Tools are available to allowlisted DM users or, with Octo admission, the verified bot owner.'],
+  appToolOwnerHint: ['工具仅对已验证的 Bot 所有者的获准私聊开放。', 'Tools are available to the verified bot owner in admitted DMs.'],
+  appToolAdmittedHint: ['工具对所有已通过聊天准入的私聊用户开放。', 'Tools are available to all admitted DM users.'],
   toolPrivateHint: ['DSH 工具仅对获准的私聊用户开放：名单准入时为名单内用户，跟随 Octo 准入时为 Bot 所有者。群聊和子区仍可使用已开放的 Octo 频道工具，不能访问工作区。', 'DSH tools are limited to allowlisted DM users or the verified bot owner in DMs. Groups and topics can still use enabled Octo channel tools, without workspace access.'],
   toolOwnerHint: ['仅已验证的 Bot 所有者可用，适用于其已准入的私聊、群聊和子区（话题）。', 'Only the verified bot owner can use tools, in admitted DMs, groups and topics.'],
   toolAdmittedHint: ['所有已通过聊天准入的用户均可用，包括私聊、群聊和子区（话题）。', 'All users who passed chat admission can use tools, including in DMs, groups and topics.'],
   senderPolicy: ['私聊准入', 'Private chat access'],
   senderAllowlist: ['仅允许名单中的用户', 'Allowlisted users only'],
   senderOcto: ['跟随 Octo 好友和群成员权限', 'Follow Octo friend and group access'],
+  appSenderOcto: ['跟随 Octo 私聊权限', 'Follow Octo DM access'],
   allowedUids: ['允许的用户 ID', 'Allowed user IDs'],
   allowedUidsHint: ['每行填写一个用户 ID。', 'Enter one user ID per line.'],
   allowedUidsRequired: ['请至少填写一个允许的用户 ID。', 'Enter at least one allowed user ID.'],
@@ -85,6 +96,7 @@ const copy = {
   commandsHint: ['仅控制 /help、/status、/new、/card、/choose 等频道快捷命令，仍遵循原有命令授权规则；不控制 DSH 工具、插件或技能访问，也不转发其他插件命令。工具访问请设置“工具使用范围”和“权限策略”。', 'Only controls channel shortcuts such as /help, /status, /new, /card and /choose, under existing command authorization rules. It does not control DSH tools, plugins or skills, or forward other plugin commands. Configure tool scope and permission for tool access.'],
   allowFiles: ['允许处理文件附件', 'Allow file attachments'],
   filesNote: ['允许处理符合聊天准入规则的附件。工作区文件交付还须符合“工具使用范围”和账号权限策略；选择包含群聊、子区的工具范围时，可在相应已准入会话交付文件。', 'Process attachments from admitted chats. Workspace file delivery also requires tool access under the selected scope and account permission. Scopes that include groups and topics allow delivery in those admitted conversations.'],
+  appFilesNote: ['允许处理获准私聊中的附件。工作区文件交付仍须符合“工具使用范围”和账号权限策略。', 'Process attachments from admitted DMs. Workspace file delivery still requires tool access under the selected scope and account permission.'],
   current: ['当前设置', 'Current setting'],
   enabled: ['启用此账号', 'Enable this account'],
   save: ['保存账号', 'Save account'],
@@ -198,14 +210,20 @@ export function createAccountEditor(React, { Button, Input }) {
       clearToken()
       const request = start('verify')
       try {
-        const { botUid, spaceId } = await onVerify({ token })
+        const { botUid, spaceId, botKind } = await onVerify({ token })
         if (pending.current !== request) return
-        if ([botUid, spaceId].some(value => typeof value !== 'string' || !value.trim() || value.includes(token))) {
+        const validId = value => typeof value === 'string' && /^[A-Za-z0-9_.:@-]{1,128}$/.test(value) && !value.includes(token)
+        const verifiedApp = botKind === 'app' && token.startsWith('app_') && validId(botUid)
+          && /^app_[A-Za-z0-9_-]+_bot$/.test(botUid) && spaceId === null
+        const verifiedUser = (botKind === undefined || botKind === 'user') && token.startsWith('bf_')
+          && validId(botUid) && validId(spaceId)
+        if ((!verifiedApp && !verifiedUser) || editing && (botUid !== account.botUid || spaceId !== account.spaceId
+          || (botKind ?? 'user') !== (account.botKind ?? 'user'))) {
           failure(null, 'verifyFailed')
           return
         }
         verifiedToken.current = token
-        setIdentity({ botUid, spaceId })
+        setIdentity({ botUid, spaceId, ...(verifiedApp && { botKind: 'app' }) })
       } catch (error) {
         if (pending.current === request) failure(error, 'verifyFailed')
       } finally {
@@ -340,9 +358,11 @@ export function createAccountEditor(React, { Button, Input }) {
       placeholder && h('option', { value: '', disabled: !emptyAllowed }, tr(placeholder)),
       ...items.map(item => h('option', { key: item.value, value: item.value, disabled: item.disabled }, item.label))))
     const enums = values => values.map(([value, label]) => ({ value, label: tr(label) }))
-    const senderItems = enums([['allowlist', 'senderAllowlist'], ['octo', 'senderOcto']])
+    const app = (editing ? account : identity)?.botKind === 'app'
+    const senderItems = enums([['allowlist', 'senderAllowlist'], ['octo', app ? 'appSenderOcto' : 'senderOcto']])
     const toolItems = enums([['private', 'toolPrivate'], ['owner', 'toolOwner'], ['admitted', 'toolAdmitted']])
-    const toolHint = draft.toolScope === 'owner' ? 'toolOwnerHint' : draft.toolScope === 'admitted' ? 'toolAdmittedHint' : 'toolPrivateHint'
+    const toolHint = draft.toolScope === 'owner' ? (app ? 'appToolOwnerHint' : 'toolOwnerHint')
+      : draft.toolScope === 'admitted' ? (app ? 'appToolAdmittedHint' : 'toolAdmittedHint') : (app ? 'appToolPrivateHint' : 'toolPrivateHint')
     const idleItems = choices(idleChoices.map(minutes => ({
       value: String(minutes), label: tr(minutes === 0 ? 'idleOff' : 'idle' + minutes),
     })), String(initial.idleMinutes))
@@ -351,8 +371,10 @@ export function createAccountEditor(React, { Button, Input }) {
       h('input', { type: 'checkbox', checked: draft[key], disabled: locked, 'aria-describedby': description,
         onChange: event => update({ [key]: event.target.checked }) }), tr(title))
     const identityDetails = value => (value?.botUid || value?.spaceId) && h('div', { className: 'dsho-account-ids' },
-      ...['botUid', 'spaceId'].filter(key => value[key]).map(key =>
-        h('span', { key }, tr(key) + ': ', value[key])))
+      h('span', null, tr('botKind') + ': ', tr(value.botKind === 'app' ? 'appBot' : 'userBot')),
+      h('span', null, tr('botUid') + ': ', value.botUid),
+      value.botKind === 'app' ? h('span', null, tr('scope') + ': ', tr('appScope'))
+        : h('span', null, tr('spaceId') + ': ', value.spaceId))
 
     const labelField = field('label', 'label', h(React.Fragment, null, h(Input, {
       id: id + '-label', value: draft.label, maxLength: 80, disabled: locked,
@@ -383,7 +405,7 @@ export function createAccountEditor(React, { Button, Input }) {
         policyItems.length ? 'pickPolicy' : 'noPolicies'),
       select('tool-scope', 'toolScope', toolItems, draft.toolScope, toolScope => update({ toolScope })),
       policies.some(item => item.disabled) && hint('policyDisabled', { className: 'dsho-account-note dsho-account-wide' }),
-      hint('toolScopeHint', { className: 'dsho-account-note dsho-account-wide' }),
+      hint(app ? 'appToolScopeHint' : 'toolScopeHint', { className: 'dsho-account-note dsho-account-wide' }),
       hint(toolHint, { className: 'dsho-account-note dsho-account-wide' }),
       select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),
       draft.senderPolicy === 'allowlist' && field('uids', 'allowedUids', h(React.Fragment, null,
@@ -397,10 +419,10 @@ export function createAccountEditor(React, { Button, Input }) {
         idleMinutes => update({ idleMinutes: Number(idleMinutes) })),
       draft.sendMode === 'steer' && hint('sendSteerNote', { className: 'dsho-account-note dsho-account-wide' }),
       select('dm-commands', 'dmCommands', commandItems, draft.dmCommands, dmCommands => update({ dmCommands })),
-      select('group-commands', 'groupCommands', commandItems, draft.groupCommands, groupCommands => update({ groupCommands })),
+      !app && select('group-commands', 'groupCommands', commandItems, draft.groupCommands, groupCommands => update({ groupCommands })),
       hint('commandsHint', { className: 'dsho-account-note dsho-account-wide' }),
       checkbox('allowFiles', 'allowFiles', draft.allowFiles ? id + '-files-note' : undefined),
-      draft.allowFiles && hint('filesNote', { id: id + '-files-note', className: 'dsho-account-note dsho-account-wide' }),
+      draft.allowFiles && hint(app ? 'appFilesNote' : 'filesNote', { id: id + '-files-note', className: 'dsho-account-note dsho-account-wide' }),
       !editing && checkbox('enabled', 'enabled'))
 
     const cancelReplacement = () => { clearToken(); setReplacing(false); setFeedback(null) }
@@ -414,10 +436,11 @@ export function createAccountEditor(React, { Button, Input }) {
             hint('verified', { role: 'status' }), identityDetails(identity))
             : field('token', editing ? 'replacement' : 'token', h(React.Fragment, null,
               h('input', { id: id + '-token', ref: tokenField, type: 'password', autoComplete: 'off', disabled: !!busy,
-                'aria-describedby': editing ? id + '-keep' : undefined,
+                'aria-describedby': id + '-registration' + (editing ? ' ' + id + '-keep' : ''),
                 onChange: event => { setHasInput(Boolean(event.target.value.trim())); setFeedback(null) },
                 onKeyDown: event => { if (event.key === 'Enter') { event.preventDefault(); void verify() } } }),
-              editing && hint('keepToken', { id: id + '-keep' }))),
+              editing && hint('keepToken', { id: id + '-keep' }),
+              hint('appRegistration', { id: id + '-registration' }))),
           h('div', { className: 'dsho-account-buttons' },
             !identity && h(Button, { type: 'button', variant: 'outline', disabled: !!busy || !hasInput, onClick: verify }, tr('verify')),
             editing && identity && h(Button, { type: 'button', variant: 'primary', disabled: !!busy,

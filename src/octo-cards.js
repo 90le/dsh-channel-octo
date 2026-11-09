@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { apiEndpoint, validToken, validUid } from './config.js'
+import { apiEndpoint, validToken, validUid, validBotIdentity } from './config.js'
 import { decimalId, OctoClient, OctoError, readJson } from './octo.js'
 import { ruleScope } from './rules.js'
 import { cardInputs, cardInputValues } from './card-inputs.js'
@@ -129,7 +129,7 @@ export function parseCardAction(rawEvent) {
 
 // Same identity boundary as the channel store. Tokens are never part of a receipt.
 function accountScope(config) {
-  if (!validUid(config?.botUid) || !validUid(config?.spaceId) || typeof config?.apiBase !== 'string') return
+  if (!validBotIdentity(config) || typeof config?.apiBase !== 'string') return
   try { return JSON.stringify([apiEndpoint(config.apiBase), config.spaceId, config.botUid]) } catch {}
 }
 
@@ -228,11 +228,16 @@ export async function sendCard(config, route, form, signal = new AbortController
 export function resolveCardAction(rawEvent, binding, verifiedAccount, now = Date.now(), { reportInvalidInputs = false } = {}) {
   const action = parseCardAction(rawEvent)
   const account = accountScope(verifiedAccount)
+  // App registration supplies no authoritative Space. The server-authenticated
+  // queue, exact account/DM/operator/message and per-card nonce bind the answer.
+  // User Bots continue to require the independently verified Space as before.
+  const matchingSpace = verifiedAccount?.botKind === 'app'
+    ? verifiedAccount.spaceId === null && binding?.spaceId === null && binding?.route?.channel_type === 1
+    : action?.spaceId === verifiedAccount?.spaceId && action?.spaceId === binding?.spaceId
   if (!action || !account || !binding || account !== binding.account
     || !Number.isSafeInteger(now) || !Number.isSafeInteger(binding.expiresAt) || now >= binding.expiresAt
     || !action.cardNonce || action.cardNonce !== binding.cardNonce
-    || action.messageId !== binding.messageId || action.spaceId !== verifiedAccount.spaceId
-    || action.spaceId !== binding.spaceId
+    || action.messageId !== binding.messageId || !matchingSpace
     || action.channelId !== binding.route?.channel_id || action.channelType !== binding.route?.channel_type
     || action.operatorUid !== binding.operatorUid || !Array.isArray(binding.actionIds)) return null
   const actionId = binding.actionIds.find(value => value === action.actionId)
