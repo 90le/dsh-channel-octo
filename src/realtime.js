@@ -7,22 +7,26 @@ const codeOf = (error) => {
   return /^IM_[A-Z0-9_]+$/.test(error?.message ?? '') ? error.message : 'connection_failed'
 }
 
-export async function receiveRealtime({ api, botUid, accept, signal, log, makeConnection, pause = delay }) {
+export async function receiveRealtime({ api, botUid, accept, signal, log, makeConnection, pause = delay, connection = () => {} }) {
   let failures = 0
   while (!signal.aborted) {
     let ended
     const disconnected = new Promise(resolve => { ended = resolve })
-    const conn = makeConnection?.(accept, ended) ?? new WukongConnection(accept, ended)
+    connection(false) // Hold known routes before registration or CONNACK/RECV.
+    const end = error => { connection(false); ended(error) }
+    const conn = makeConnection?.(accept, end) ?? new WukongConnection(accept, end)
     const heartbeatStop = new AbortController()
     const heartbeatSignal = AbortSignal.any([signal, heartbeatStop.signal])
     let heartbeat
-    const stop = () => { heartbeatStop.abort(); ended(); void conn.close() }
+    const stop = () => { heartbeatStop.abort(); end(); void conn.close() }
     signal.addEventListener('abort', stop, { once: true })
     let backoff = 0
     try {
       const registration = await api.register(botUid, signal)
       signal.throwIfAborted()
       await conn.connect(registration)
+      signal.throwIfAborted()
+      connection(true)
       const connectedAt = Date.now()
       log('octo_ws_connected')
       // REST presence is separate from socket PING/PONG. A failed beat must not
@@ -48,6 +52,7 @@ export async function receiveRealtime({ api, botUid, accept, signal, log, makeCo
       backoff = Math.max(error?.retryAfterMs ?? 0, Math.min(30_000, 1000 * 2 ** Math.min(failures - 1, 5)))
       log('octo_ws_retry_' + codeOf(error))
     } finally {
+      connection(false)
       heartbeatStop.abort()
       await heartbeat
       signal.removeEventListener('abort', stop)

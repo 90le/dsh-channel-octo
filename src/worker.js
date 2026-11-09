@@ -12,6 +12,7 @@ import { CHANNEL_API_OPERATIONS as operationSpecs } from './channel-api.js'
 import { spec as displayCardSpec, sendDisplayCard } from './display-card.js'
 import { voiceTool } from './voice-tool.js'
 import { formToolSpec } from './form-tool.js'
+import { InboxRecovery } from './inbox.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
@@ -84,9 +85,13 @@ export class Worker {
     this.questions = new QuestionBridge({ api, store, log })
     this.cursor = '0'
     this.steering = new Set()
+    this.inbox = new InboxRecovery({ api, store, log, config: () => this.config,
+      questionKey: message => this.questions.match(message)?.key,
+      accept: (id, message, options) => this.acceptInbound(id, message, options) })
   }
 
   reconfigure(config, host) {
+    this.revokeApproval?.()
     config.ownerUid = this.config.ownerUid
     this.api.configureChannel?.(config)
     this.config = config
@@ -111,18 +116,18 @@ export class Worker {
     return this.inFlight
   }
 
-  acceptInbound(eventId, message) {
-    const question = !message.attachment && !message.attachments?.length && !message.command && message.text.trim() && this.questions.match(message)
-    if (question && this.config.toolPermission !== 'text-only'
+  acceptInbound(eventId, message, { historical = false, delayed = false, questionKey } = {}) {
+    const question = !historical && !message.attachment && !message.attachments?.length && !message.command && message.text.trim() && this.questions.match(message)
+    if (question && (!delayed || question.key === questionKey) && this.config.toolPermission !== 'text-only'
       && permitsRoute(this.config, message.sender, message.channelType, message.channelId)
       && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
       if (this.store.rememberAnswer(eventId, message, question.sessionId)) this.questions.text(question, message.text)
-      return
+      return true
     }
-    if (this.stopIntake) return
+    if (this.stopIntake) return false
     const inserted = this.store.add(eventId, message)
     const active = this.steerActive?.job ?? this.currentJob
-    if (inserted.changes && !this.paused && active && this.config.sendMode === 'steer'
+    if (inserted.changes && !historical && !delayed && !this.paused && active && this.config.sendMode === 'steer'
       && message.channelType === active.channel_type && message.sender === active.sender
       && message.channelId === (active.channel_id ?? active.sender)
       && !message.command && !message.parts && !message.attachment && !message.attachments?.length
@@ -130,6 +135,7 @@ export class Worker {
       this.steering.add(message.messageId)
       this.attemptSteering()
     }
+    return true
   }
 
   async drain(signal) {
@@ -197,7 +203,7 @@ export class Worker {
         } else if (this.store.hasEvent(id)) await this.ackCardEvent(id, signal)
       } else if (!cardsOnly) {
         const message = admit(event, this.config)
-        if (message) this.acceptInbound(id, message)
+        if (message && !this.stopIntake) this.inbox.receive(id, message)
         await this.api.ack(id, signal)
       }
       // In WebSocket mode this poll consumes only this plugin's own card actions.
@@ -254,7 +260,8 @@ export class Worker {
   }
 
   async process(job, signal) {
-    const config = { ...this.config }
+    const sourceConfig = this.config
+    const config = { ...sourceConfig }
     const host = this.host
     const channelType = job.channel_type
     const recipient = job.channel_id ?? job.sender
@@ -408,10 +415,15 @@ export class Worker {
                   return this.api.channel.dispatch(route, job.sender, operation.name, args, toolSignal)
                 }, guidance: mentionGuidance,
               } }),
-              ...(toolsAllowed && { onQuestion: async (questions, askSignal) => {
+              ...(toolsAllowed && { approval: { runId: String(job.seq), requester: job.sender },
+                authorizeTools: () => this.liveToolAllowed(job, sourceConfig),
+                onApprovalControl: revoke => { this.revokeApproval = revoke },
+                onQuestion: async (questions, askSignal) => {
                 const current = await this.liveToolAccess(job, askSignal)
-                return this.questions.ask(questions, { ...job, session_id: session.session_id }, current, askSignal,
+                const answer = await this.questions.ask(questions, { ...job, session_id: session.session_id }, current, askSignal,
                   waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), () => this.liveToolAllowed(job, current))
+                await this.liveToolAccess(job, askSignal)
+                return answer
               } }),
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
               ...(toolsAllowed && config.transport === 'websocket'
@@ -563,10 +575,13 @@ export class Worker {
     if (this.config.transport === 'websocket') return this.runRealtime(signal)
     const stop = new AbortController()
     const lifetime = AbortSignal.any([signal, stop.signal])
+    this.inbox.connection(false)
+    this.inbox.connection(true)
     const draining = this.drain(lifetime)
     const receiving = this.poll(lifetime)
-    try { await Promise.all([receiving, draining]) }
-    finally { stop.abort(); await Promise.allSettled([receiving, draining]) }
+    const recovery = this.inbox.run(lifetime)
+    try { await Promise.all([receiving, draining, recovery]) }
+    finally { stop.abort(); await Promise.allSettled([receiving, draining, recovery]) }
   }
 
   async poll(signal) {
@@ -616,17 +631,19 @@ export class Worker {
         message_id: m.messageId, message_seq: m.messageSeq, from_uid: m.fromUid, channel_type: m.channelType,
         channel_id: m.channelId, payload: m.payload,
       } }, this.config)
-      if (candidate) this.acceptInbound('ws:' + candidate.messageId, candidate)
+      if (candidate && !this.stopIntake) this.inbox.receive('ws:' + candidate.messageId, candidate)
       // WukongConnection sends RECVACK only after this function returns.
     }
-    const receiving = receiveRealtime({ api: this.api, botUid: this.config.botUid, accept, signal, log: this.log })
+    const receiving = receiveRealtime({ api: this.api, botUid: this.config.botUid, accept, signal, log: this.log,
+      connection: online => this.inbox.connection(online) })
     const draining = this.drain(signal)
     const cardEvents = this.pollCardEvents(signal)
+    const recovery = this.inbox.run(signal)
     try {
-      await Promise.all([receiving, draining, cardEvents])
+      await Promise.all([receiving, draining, cardEvents, recovery])
     } finally {
       stop.abort()
-      await Promise.allSettled([receiving, draining, cardEvents])
+      await Promise.allSettled([receiving, draining, cardEvents, recovery])
     }
   }
 }

@@ -44,6 +44,23 @@ function fixture({ profile = () => template, create = () => '456', edit = () => 
   return { calls, logs, progress: new Progress(api, log => logs.push(log)) }
 }
 
+test('native approval has a distinct waiting label and cannot hide the final state', async t => {
+  const tick = clock(t), f = fixture()
+  const handle = f.progress.start(job, 'auto', new AbortController().signal)
+  handle.stage('running')
+  handle.trace({ kind: 'tool-start', id: 'write', name: 'write' })
+  handle.stage('approval')
+  handle.trace({ kind: 'question-open' })
+  await tick(450)
+  assert.equal(f.calls.find(c => c.type === 'create').frame.data.statusLabel, '等待你批准这次操作')
+  handle.trace({ kind: 'question-closed' })
+  handle.stage('running')
+  await tick(800)
+  assert.equal(f.calls.filter(c => c.type === 'edit').at(-1).frame.data.statusLabel, '正在执行工具')
+  await handle.finish('completed')
+  assert.equal(f.calls.filter(c => c.type === 'edit').at(-1).frame.data.statusLabel, '回复已发送')
+})
+
 test('type-17 template shows queued, running, responding and confirmed completion', async t => {
   const tick = clock(t)
   const requests = []

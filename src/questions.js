@@ -26,7 +26,7 @@ function answer(question, input) {
 function presentation(question, index, total) {
   const options = question.options ?? []
   const prefix = total > 1 ? '（' + (index + 1) + '/' + total + '）' : ''
-  const title = 'DSH 等待你的回答' + prefix
+  const title = (question.intent === 'approval' ? 'DSH 等待你的批准' : 'DSH 等待你的回答') + prefix
   const prompt = [cut(question.header, 45), cut(question.question, 240), cut(question.detail, 900)].filter(Boolean)
   const labels = options.map((option, i) => (i + 1) + '. ' + cut(option.label, 75)
     + (option.description ? ' — ' + cut(option.description, 90) : ''))

@@ -4,6 +4,7 @@ import { prepareInput } from './dsh-media.js'
 import { sessionExists } from './session-state.js'
 import { RunClock } from './run-clock.js'
 import { mountChannelTools } from './channel-tools.js'
+import { mountApprovalAdapter } from './approval.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
@@ -45,7 +46,7 @@ export class DshHost {
       if (!service?.set || !agent?.session) throw new Error('missing_host_permission')
       service.set(agent.session, permission)
     }
-    const controls = (scoped, cleanup) => {
+    const controls = (scoped, cleanup, agent) => {
       let channelNames = new Set()
       if (extras.channelTools?.specs?.length) {
         const mounted = mountChannelTools(scoped, { ...extras.channelTools, signal,
@@ -77,7 +78,23 @@ export class DshHost {
       if (permission) {
         const tools = scoped.get('tools')
         if (!tools?.guard) throw new Error('missing_scoped_tool_controls')
-        cleanup.push(tools.guard(() => !authority.active || authority.mixed || signal.aborted ? denial : undefined))
+        cleanup.push(tools.guard(() => !authority.active || authority.mixed || signal.aborted
+          || extras.authorizeTools && extras.authorizeTools() !== true ? denial : undefined))
+      }
+      if (permission && extras.approval && extras.onQuestion && typeof scoped.on === 'function') {
+        const binding = mountApprovalAdapter(scoped, {
+          agent, runId: extras.approval.runId, requester: extras.approval.requester, signal,
+          getTurn: () => authority.active && !authority.mixed ? authority.turn : undefined,
+          authorize: () => extras.authorizeTools?.() === true,
+          onQuestion: extras.onQuestion,
+          onWaiting: waiting => {
+            if (waiting) { deadline.pause(); onStage('approval') }
+            else { deadline.resume(); onStage('running') }
+          },
+        })
+        authority.approval = binding.adapter
+        extras.onApprovalControl?.(() => binding.adapter.revoke())
+        cleanup.push(binding.dispose)
       }
       if (permission && extras.onQuestion && typeof scoped.on === 'function') {
         cleanup.push(scoped.on('user-questions/request', async (request, next) => {
@@ -131,7 +148,7 @@ export class DshHost {
     const setup = async (scoped, agent) => {
       await ctx.agentPresets.mount(scoped, preset)
       applyPermission(agent)
-      controls(scoped, []) // Automatically released with the owned agent scope.
+      controls(scoped, [], agent) // Automatically released with the owned agent scope.
     }
     const find = () => ctx.agents.get?.(session.session_id)
     let agent = session.created ? find() : undefined
@@ -168,7 +185,7 @@ export class DshHost {
         if (permission && ctx.get?.('permissionPresets')?.current?.(agent.session) !== permission) {
           throw new Error('session_requires_owned_writer')
         }
-        controls(agent.ctx, cleanup)
+        controls(agent.ctx, cleanup, agent)
         onStage('reused')
       }
       if (!session.created) {
@@ -193,6 +210,8 @@ export class DshHost {
       if (classified.has(error?.message) || error?.name === 'SessionAlreadyOwnedError') throw error
       throw new Error(failure, { cause: error })
     } finally {
+      authority.approval?.dispose()
+      extras.onApprovalControl?.(undefined)
       deadline.close()
       if (handle) await handle.dispose()
       else if (borrowed && cleanup.length) {
@@ -223,8 +242,10 @@ export class DshHost {
           if (payload?.agent?.id !== agent.id || !Number.isSafeInteger(payload.turn)) return
           if (matches(payload)) {
             claimedTurn = payload.turn
+            authority.turn = claimedTurn
             authority.active = true
             authority.mixed = otherTurns.has(claimedTurn)
+            if (authority.mixed) authority.approval?.revoke()
             onStage('running')
           }
           else if (payload.turn === claimedTurn && steering.has(payload?.message?.id)) {
@@ -232,7 +253,7 @@ export class DshHost {
             steering.get(payload.message.id).claimed = true
           } else if (payload?.message?.source?.kind !== 'runtime-context') {
             otherTurns.add(payload.turn)
-            if (payload.turn === claimedTurn) authority.mixed = true
+            if (payload.turn === claimedTurn) { authority.mixed = true; authority.approval?.revoke() }
           }
         }, { global: true }))
         dispose.push(this.ctx.on('agent/inbox/discarded', (payload) => {
@@ -271,6 +292,7 @@ export class DshHost {
           } else if (event.type === 'turn/end') {
             open = false
             authority.active = false
+            authority.turn = undefined
             if ([...steering.values()].some(item => !item.claimed)) reject(new Error('prompt_discarded'))
             else if (otherTurns.has(claimedTurn)) reject(new Error('shared_turn_not_forwarded'))
             else if (event.data.reason?.kind === 'completed' && pendingCalls.size === 0 && (finalText.trim() || deliverables.size)) {
@@ -305,6 +327,8 @@ export class DshHost {
     } finally {
       open = false
       authority.active = false
+      authority.turn = undefined
+      authority.approval?.dispose()
       onSteer?.(undefined)
       for (const cleanup of dispose.reverse()) cleanup()
     }

@@ -8,6 +8,7 @@ const labels = {
   delivering: '正在发送回复与交付文件',
   tool: '正在执行工具',
   question: '等待你的回答',
+  approval: '等待你批准这次操作',
   completed: '回复已发送',
   stopped: '回复发送待确认',
   error: '本次回复未完成，请稍后重发',
@@ -15,7 +16,7 @@ const labels = {
 
 const stages = ['queued', 'running', 'responding', 'delivering']
 const outcomes = ['completed', 'stopped', 'error']
-const wireStates = { queued: 'reasoning', running: 'reasoning', responding: 'answering', delivering: 'answering', tool: 'reasoning', question: 'reasoning' }
+const wireStates = { queued: 'reasoning', running: 'reasoning', responding: 'answering', delivering: 'answering', tool: 'reasoning', question: 'reasoning', approval: 'reasoning' }
 const templateStates = ['reasoning', 'answering', ...outcomes]
 const initialDelay = 450
 const editInterval = 800
@@ -72,7 +73,8 @@ const action = (tool, detail, status = 'active') => ({
 
 function frame(mode, reasoningId, phase, seconds, stats, detail) {
   const terminal = outcomes.includes(phase)
-  const actual = !terminal && stats.waiting ? 'question' : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
+  const actual = !terminal && stats.approval ? 'approval' : !terminal && stats.waiting ? 'question'
+    : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
   const label = labels[actual]
   const state = wireStates[actual] ?? actual
   const elapsed = '已用时 ' + seconds + ' 秒'
@@ -245,6 +247,9 @@ export class Progress {
     }
     return {
       stage(next) {
+        if (!active()) return
+        if (next === 'approval') { stats.approval = true; changed(); return }
+        if (next === 'running' && stats.approval) { stats.approval = false; changed() }
         if (next === 'answering') next = 'responding'
         if (!active() || stages.indexOf(next) <= stages.indexOf(phase)) return
         phase = next

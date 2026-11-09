@@ -221,6 +221,44 @@ export class OctoClient {
     return { rows: rows.sort((a, b) => a.seq - b.seq).slice(-20), more: flag(data.more) || (data.messages?.length ?? 0) >= 20 }
   }
 
+  async inboxPage(config, route, start, through, signal) {
+    const { channel_type: type, channel_id: id } = route
+    if (![1, 2, 5].includes(type) || (type === 1 ? !validUid(id) || id.includes('@') : !ruleScope(type, id))
+      || !Number.isInteger(start) || start < 0 || start > 0xffffffff
+      || through != null && (!channelSequence(through) || start > through)) throw new OctoError('invalid_inbox_scope')
+    const latest = through == null
+    const data = await this.#request('/v1/bot/messages/sync', JSON.stringify({
+      channel_type: type, channel_id: id, start_message_seq: latest ? 0 : start,
+      end_message_seq: latest || through === 0xffffffff ? 0 : through + 1,
+      pull_mode: latest ? 0 : 1, limit: latest ? 1 : 100,
+    }), signal, { timeout: 8000 })
+    if (!data || data.messages !== null && !Array.isArray(data.messages)
+      || data.messages?.length > (latest ? 1 : 100)) throw new OctoError('invalid_inbox_response')
+    const seen = new Set(), ids = new Set(), messages = [], suppressed = []
+    let last = 0
+    for (const row of data.messages ?? []) {
+      const seq = channelSequence(row?.message_seq), messageId = decimalId(row?.message_id)
+      if (!seq || !messageId || seen.has(seq) || ids.has(messageId) || !latest && (seq < start || seq > through)
+        || row.channel_type != null && row.channel_type !== type
+        || type !== 1 && row.channel_id != null && row.channel_id !== id
+        || type === 1 && row.from_uid !== id && row.from_uid !== config.botUid) throw new OctoError('invalid_inbox_response')
+      seen.add(seq); ids.add(messageId); last = Math.max(last, seq)
+      if (latest) continue
+      if ([row.revoke, row.revoked, row.is_deleted, row.extra?.revoke, row.message_extra?.revoke].some(flag)) { suppressed.push(messageId); continue }
+      let payload = row.message_extra?.content_edit ?? row.extra?.content_edit ?? row.payload
+      if (typeof payload === 'string') {
+        if (payload.length > 120_000) { suppressed.push(messageId); continue }
+        try { payload = readJson(payload.trimStart().startsWith('{') ? payload : Buffer.from(payload, 'base64').toString('utf8')) }
+        catch { suppressed.push(messageId); continue }
+      }
+      const m = admit({ message: { message_id: messageId, message_seq: seq, from_uid: row.from_uid,
+        channel_type: type, channel_id: id, payload } }, config)
+      if (m) messages.push(m)
+      else suppressed.push(messageId)
+    }
+    return { last, messages: messages.sort((a, b) => a.messageSeq - b.messageSeq), count: seen.size, observed: [...ids], suppressed }
+  }
+
   async events(signal, cursor = '0') {
     const started = Date.now()
     if (cursor !== '0' && !decimalId(cursor)) throw new OctoError('invalid_event_id')

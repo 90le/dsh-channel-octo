@@ -75,6 +75,17 @@ const richtextBlocks = { type: 'array', minItems: 1, maxItems: 20, items: { oneO
   ['type', 'url', 'width', 'height']),
 ] } }
 const structuredEdits = new Set(['messages.edit_richtext', 'messages.edit_display_card'])
+// octo-server f984d405: bot_api/{commands.go:56-94,batch_users.go:74-159,
+// incoming_webhook.go:25-39}; incomingwebhook/{api.go:287-299,861-882,
+// 1123-1170,model.go:180-228}. Bot-token reads only, never user-session routes.
+const identityReads = new Set(['messages.user_info', 'messages.users_batch'])
+const webhookReads = new Set(['webhooks.list', 'webhooks.deliveries'])
+const identityUID = { type: 'string', pattern: '^[A-Za-z0-9_.:@-]{1,64}$' }
+const webhookID = { type: 'string', pattern: '^iwh_[a-f0-9]{32}$' }
+const bareUID = value => value.replace(/^s\d+_(.+)$/, '$1')
+const deliveryReasons = new Set(['', 'token', 'body', 'too_large', 'json', 'no_event',
+  'content', 'blocks', 'card', 'msg_type', 'delivery_failed', 'ping', 'event'])
+const deliveryAdapters = new Set(['native', 'test', 'github', 'wecom', 'multica', 'octo', 'gitlab', 'feishu'])
 // Only helpers with static error codes run here; no upstream error text is exposed.
 const displayWork = fn => {
   try { return fn() } catch (error) {
@@ -89,6 +100,9 @@ export const CHANNEL_API_OPERATIONS = freeze([
   spec('inspect', 'Inspect the current channel and its parent group permissions.'),
   spec('groups.list', 'Return only the current parent group, never other groups.'),
   spec('members', 'List current parent-group members with authoritative numeric roles.', schema({ limit })),
+  spec('webhooks.list', 'List incoming webhook metadata only in this group or current topic. Requires live requester group owner/admin and bot membership. No tokens, URLs or examples.', schema({ limit })),
+  spec('webhooks.deliveries', 'Read recent delivery diagnostics for a listed webhook in this group or current topic. Requester must be live group owner/admin; bot must own the webhook or be group owner/admin. No test push or secrets.',
+    schema({ webhook_id: webhookID, limit }, ['webhook_id'])),
   spec('members.add', 'Add explicitly requested human UIDs from the configured Space to the current parent group; requester must be group owner/admin.',
     schema({ uids: memberTargets }, ['uids']), true),
   spec('members.remove', 'Remove explicitly requested current members with role 0 from the current parent group. Requester must be group owner/admin; server requires bot_admin. Octo may also remove their bots and thread memberships.',
@@ -129,6 +143,11 @@ export const CHANNEL_API_OPERATIONS = freeze([
   spec('messages.recent', 'Read one bounded page of current-channel history; before_seq is exclusive.',
     schema({ limit, before_seq: { type: 'integer', minimum: 1, maximum: 0xffffffff } })),
   spec('messages.read', 'Read one message from the current channel.', schema({ message_id: messageID }, ['message_id'])),
+  // Keep conversation identity tools in messages.* for the host's native DM filter.
+  spec('messages.user_info', 'Read a visible participant name by exact UID in this conversation. DM: current actor or this bot only; group: live members; topic: live participants plus current actor/this bot. No global directory or avatar URL.',
+    schema({ uid: identityUID }, ['uid'])),
+  spec('messages.users_batch', 'Look up 1-20 exact visible participant UIDs in this conversation, returning names/status/robot flags and missing UIDs. Same visibility rules as user_info; Space aliases do not grant access. Missing is not proof of nonmembership.',
+    schema({ uids: { type: 'array', items: identityUID, minItems: 1, maxItems: 20, uniqueItems: true } }, ['uids'])),
   spec('messages.search', 'Search current-channel messages as a User Bot with server search enabled. Supply a keyword or sender/time filter. One page, at most 10 verified hits; no global or OBO search.',
     schema({ keyword: searchKeyword, ...searchPage })),
   spec('messages.search_files', 'Search/list files in the current channel as a User Bot with server search enabled. Keyword optional; one page of at most 10 verified messages and attachment metadata, without downloads or indexed snippets.',
@@ -170,6 +189,9 @@ const errorHints = Object.freeze({
   api_server_error: 'Octo reported a server failure. Check the resource state before retrying a mutation.',
   api_request_failed: 'The request failed. Check connectivity/API support and inspect the resource before retrying a mutation.',
   requester_admin_required: 'The requesting member must be this group owner or administrator; bot ownership grants no extra authority.',
+  identity_outside_channel: 'Use an exact UID currently visible in this conversation; directory aliases and bot ownership grant no extra visibility.',
+  webhook_outside_channel: 'Select a webhook listed in this exact group or topic.',
+  webhook_bot_permission_required: 'The bot must own this webhook or currently be a group owner/administrator.',
   separate_owner_context_required: 'This operation is outside the admitted current-parent scope. It needs a separate owner context with explicit Space and requester visibility checks.',
   owner_dm_required: 'Personal voice context is available only in a verified bot-owner DM; group administrator status is not owner authority.',
   owner_identity_required: 'The host must first verify the bot owner identity before using this owner-only operation.',
@@ -288,6 +310,73 @@ function validate(value, def) {
   }
 }
 
+// Snapshot new read inputs without invoking accessors, iterators or toJSON.
+// Flat objects and UID arrays only; schema limits are enforced before walking.
+function readArguments(value, def) {
+  if (def.type === 'object' || def.type === 'array') {
+    const array = def.type === 'array'
+    if (array ? !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > def.maxItems
+      : !object(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail('invalid_arguments')
+    const copy = array ? [] : {}
+    const keys = Reflect.ownKeys(value)
+    if (array && keys.length !== value.length + 1) fail('invalid_arguments')
+    for (const key of keys) {
+      if (array && key === 'length') continue
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (typeof key !== 'string' || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable
+        || (array ? !/^(0|[1-9]\d*)$/.test(key) || Number(key) >= value.length : !Object.hasOwn(def.properties, key))) fail('invalid_arguments')
+      copy[key] = readArguments(descriptor.value, array ? def.items : def.properties[key])
+    }
+    validate(copy, def)
+    return copy
+  }
+  validate(value, def)
+  return value
+}
+
+function responseRows(raw, key, max, code) {
+  if (!object(raw) || !Array.isArray(raw[key]) || raw[key].length > max) fail(code)
+  return raw[key]
+}
+const nonnegative = value => Number.isSafeInteger(value) && value >= 0
+function identityName(value) {
+  if (typeof value !== 'string' || value.length > 1000) fail('invalid_identity_response')
+  return boundedText(value, 100)
+}
+
+function webhookRows(raw, scope) {
+  const seen = new Set()
+  return responseRows(raw, 'list', MAX_MEMBERS, 'invalid_webhook_response').map(row => {
+    if (!object(row) || typeof row.webhook_id !== 'string' || !/^iwh_[a-f0-9]{32}$/.test(row.webhook_id)
+      || seen.has(row.webhook_id) || row.group_no !== scope.group
+      || (scope.thread ? row.thread_short_id !== scope.thread : row.thread_short_id !== undefined && row.thread_short_id !== '')
+      || !validUid(row.creator_uid) || typeof row.name !== 'string' || row.name.length > 1000
+      || ![0, 1].includes(row.status) || ![0, 1].includes(row.allow_mention_all) || ![0, 1].includes(row.allow_mention_bots)
+      || ![row.last_used_at, row.call_count, row.created_at].every(nonnegative)) fail('invalid_webhook_response')
+    seen.add(row.webhook_id)
+    // Never spread upstream DTOs (including create DTOs carrying one-time secrets).
+    return { webhook_id: row.webhook_id, group_no: scope.group, ...(scope.thread && { thread_short_id: scope.thread }),
+      name: boundedText(row.name, 100), creator_uid: row.creator_uid, status: row.status,
+      allow_mention_all: row.allow_mention_all, allow_mention_bots: row.allow_mention_bots,
+      last_used_at: row.last_used_at, call_count: row.call_count, created_at: row.created_at }
+  })
+}
+
+function deliveryRows(raw, size) {
+  return responseRows(raw, 'list', size, 'invalid_delivery_response').map(row => {
+    const messageID = row?.message_id === 0 || row?.message_id === '0' ? '0' : id(row?.message_id)
+    if (!object(row) || !messageID || ![1, 2, 3].includes(row.status)
+      // sql/20260606000001_incomingwebhook_audit_outcome.sql:14: legacy
+      // successful rows use 0 = unknown HTTP status, deliberately not 200.
+      || !Number.isInteger(row.http_status) || row.http_status !== 0 && (row.http_status < 100 || row.http_status > 599)
+      || typeof row.reason !== 'string' || typeof row.adapter !== 'string'
+      || !nonnegative(row.byte_size) || !nonnegative(row.created_at)) fail('invalid_delivery_response')
+    return { status: row.status, reason: deliveryReasons.has(row.reason) ? row.reason : 'unknown',
+      adapter: deliveryAdapters.has(row.adapter) ? row.adapter : 'unknown', http_status: row.http_status,
+      byte_size: row.byte_size, message_id: messageID, created_at: row.created_at }
+  })
+}
+
 function memberRows(raw) {
   const seen = new Set()
   return list(raw, MAX_MEMBERS).flatMap(row => {
@@ -396,14 +485,17 @@ export class ChannelApi {
     return { threads: list(raw.list, size).map(row => this.#thread(row, scope)), total: raw.count, more: page * size < raw.count }
   }
 
-  async #access(scope, sender, mutating, signal) {
+  async #access(scope, sender, mutating, signal, strictRead = false) {
     if (!validUid(sender) || sender === this.#config.botUid
       || this.#config.senderPolicy === 'allowlist' && !this.#config.allowed.has(sender)) fail('requester_not_allowed')
     if (!scope.group) {
       if (scope.route.channel_id !== sender) fail('requester_not_allowed')
       // Also used before DM mutations: ordinary sync checks owner/friend access.
       const data = await this.#call('/v1/bot/messages/sync', { ...scope.route, start_message_seq: 0, end_message_seq: 0, limit: 1, pull_mode: 0 }, signal)
-      if (!object(data)) fail('invalid_api_response')
+      // Official sync can serialize an empty Go slice as null. Missing/other
+      // shapes are not a successful access probe for the scoped identity reads.
+      if (!object(data) || strictRead && (!Object.hasOwn(data, 'messages')
+        || data.messages !== null && !Array.isArray(data.messages))) fail('invalid_api_response')
       list(data.messages, 1)
       return {}
     }
@@ -432,6 +524,102 @@ export class ChannelApi {
       || raw.channel_type !== 5 || !validUid(raw.creator_uid) || ![1, 2].includes(raw.status)) fail('invalid_thread_response')
     return { group_no: scope.group, short_id: raw.short_id, channel_id: raw.channel_id, channel_type: 5,
       name: boundedText(raw.name, 100), creator_uid: raw.creator_uid, status: raw.status }
+  }
+
+  async #currentReadScope(scope, access, signal) {
+    if (scope.group && access.group.status !== 1) fail('group_not_active')
+    if (scope.thread) {
+      const thread = this.#threadPath(scope, {})
+      this.#thread(await this.#call(thread.path, undefined, signal), scope, thread.selected)
+      return thread.path
+    }
+    return scope.root
+  }
+
+  async #visibleIdentities(scope, sender, access, signal) {
+    const path = await this.#currentReadScope(scope, access, signal)
+    if (!scope.group) return new Set([sender, this.#config.botUid])
+    const visible = new Set(access.rows.map(row => row.uid))
+    if (!scope.thread) return visible
+    // A topic does not grant the parent's whole roster. Parent membership is
+    // still necessary; topic subscriptions alone cannot resurrect removed users.
+    const raw = await this.#call(path + '/members', undefined, signal)
+    if (!Array.isArray(raw) || raw.length > MAX_MEMBERS) fail('invalid_thread_response')
+    const participants = new Set([sender, this.#config.botUid]), seen = new Set()
+    for (const row of raw) {
+      if (!object(row) || !validUid(row.uid) || ![0, 1].includes(row.role) || seen.has(row.uid)) fail('invalid_thread_response')
+      seen.add(row.uid)
+      if (row.is_deleted !== undefined && ![0, false].includes(row.is_deleted)
+        || row.status !== undefined && row.status !== 1) continue
+      if (visible.has(row.uid)) participants.add(row.uid)
+    }
+    return participants
+  }
+
+  async #identities(scope, sender, operation, args, access, signal) {
+    const targets = operation === 'messages.user_info' ? [args.uid] : args.uids
+    // Check literal current-route UIDs BEFORE normalizing the server's aliases.
+    const check = async current => {
+      const visible = await this.#visibleIdentities(scope, sender, current, signal)
+      if (targets.some(target => !visible.has(target))) fail('identity_outside_channel')
+    }
+    await check(access)
+    let result
+    if (operation === 'messages.user_info') {
+      const raw = await this.#call('/v1/bot/user/info?' + new URLSearchParams({ uid: args.uid }), undefined, signal)
+      if (!object(raw) || raw.uid !== bareUID(args.uid)) fail('invalid_identity_response')
+      // Keep the admitted caller key, not an alias that could imply new access.
+      result = { uid: args.uid, name: identityName(raw.name) }
+    } else {
+      const raw = await this.#call('/v1/bot/users/batch', { uids: targets }, signal)
+      const seen = new Set()
+      const accept = target => {
+        if (!targets.includes(target) || seen.has(target)) fail('invalid_identity_response')
+        seen.add(target)
+      }
+      const users = responseRows(raw, 'users', targets.length, 'invalid_identity_response').map(row => {
+        if (!object(row) || row.status !== 1 || ![0, 1].includes(row.robot)) fail('invalid_identity_response')
+        accept(row.uid)
+        return { uid: row.uid, name: identityName(row.name), status: 1, robot: row.robot }
+      })
+      const missing = responseRows(raw, 'missing_uids', targets.length, 'invalid_identity_response')
+      missing.forEach(accept)
+      if (seen.size !== targets.length) fail('invalid_identity_response')
+      result = { users: targets.flatMap(target => users.filter(row => row.uid === target)),
+        missing_uids: targets.filter(target => missing.includes(target)) }
+    }
+    // No identity cache or authorization carried into the next conversation.
+    await check(await this.#access(scope, sender, false, signal, true))
+    return result
+  }
+
+  async #webhooks(scope, sender, operation, args, access, signal) {
+    const gate = async current => {
+      if (!admin(current.actor)) fail('requester_admin_required')
+      return (await this.#currentReadScope(scope, current, signal)) + '/incoming-webhooks'
+    }
+    const path = await gate(access)
+    const rows = webhookRows(await this.#call(path, undefined, signal), scope)
+    const size = args.limit ?? 20
+    const selected = operation === 'webhooks.deliveries' ? rows.find(row => row.webhook_id === args.webhook_id) : undefined
+    const botCanRead = current => {
+      if (!selected) fail('webhook_outside_channel')
+      if (selected.creator_uid !== this.#config.botUid && !admin(current.bot)) fail('webhook_bot_permission_required')
+    }
+    let result
+    if (operation === 'webhooks.deliveries') {
+      botCanRead(access)
+      // Listing is a separate request; recheck roles before fetching diagnostics.
+      const current = await this.#access(scope, sender, false, signal, true)
+      await gate(current)
+      botCanRead(current)
+      const raw = await this.#call(path + '/' + args.webhook_id + '/deliveries?' + new URLSearchParams({ limit: size }), undefined, signal)
+      result = { webhook_id: args.webhook_id, deliveries: deliveryRows(raw, size) }
+    } else result = { webhooks: rows.slice(0, size), total: rows.length, truncated: rows.length > size }
+    const current = await this.#access(scope, sender, false, signal, true)
+    await gate(current)
+    if (selected) botCanRead(current)
+    return result
   }
 
   async #rules(path, signal) {
@@ -602,6 +790,14 @@ export class ChannelApi {
     const definition = specs.get(operation)
     if (!definition) fail('unknown_operation')
     const structuredEdit = structuredEdits.has(operation)
+    const identityRead = identityReads.has(operation)
+    const scopedRead = identityRead || webhookReads.has(operation)
+    if (scopedRead) args = readArguments(args, definition.parameters)
+    if (identityRead) {
+      const targets = operation === 'messages.user_info' ? [args.uid] : args.uids
+      if (targets.some(target => ['.', '..'].includes(bareUID(target)))
+        || new Set(targets.map(target => bareUID(target).toLowerCase())).size !== targets.length) fail('invalid_arguments')
+    }
     let prepared
     if (structuredEdit) {
       // The recursive display DSL and richtext union use their bounded runtime
@@ -631,11 +827,14 @@ export class ChannelApi {
     const voice = operation.startsWith('voice.context.')
     if (voice) this.#requireOwnerDM(scope, sender)
     if (operation === 'groups.create') this.#requireOwner(sender)
-    if (!scope.group && !voice && !search && !structuredEdit && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
+    if (!scope.group && !voice && !search && !structuredEdit && !identityRead && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
       'messages.mark_read', 'space.members.search', 'groups.create'].includes(operation)) fail('group_required')
     const thread = operation.startsWith('thread.') ? this.#threadPath(scope, args) : undefined
-    const access = await this.#access(scope, sender, definition.mutating, signal)
+    const access = await this.#access(scope, sender, definition.mutating, signal, scopedRead)
     const requireAdmin = () => { if (scope.group && !admin(access.actor)) fail('requester_admin_required') }
+
+    if (identityRead) return this.#identities(scope, sender, operation, args, access, signal)
+    if (webhookReads.has(operation)) return this.#webhooks(scope, sender, operation, args, access, signal)
 
     if (operation === 'inspect') return { ...scope.route, ...(access.group && { group: access.group }),
       requester_group_admin: admin(access.actor), bot_group_admin: admin(access.bot),

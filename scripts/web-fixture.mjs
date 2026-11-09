@@ -16,6 +16,7 @@ let groupStep = 0
 let groupQuestion
 let groupDisplaySent = false, groupDisplayReceipt = false
 let groupFormAnswered = false, groupFormFeedback = false
+let approvalSent = false, approvalFeedback = false
 const typedForm = { title: 'Fixture typed form', inputs: [
   { id: 'note', kind: 'text', label: '说明', required: true },
   { id: 'amount', kind: 'number', label: '数量', required: true },
@@ -111,6 +112,7 @@ globalThis.fetch = async (input, init) => {
     if (url.pathname.endsWith('/v1/bot/readReceipt')) return json({})
     if (url.pathname.endsWith('/messages/sync')) {
       const request = JSON.parse(init.body)
+      if (request.limit === 1 && request.pull_mode === 0 && routes.some(([type,id]) => type === request.channel_type && id === request.channel_id)) return json({ messages: [] })
       if (request.channel_type === 1 && request.channel_id === 'fixture-user' && request.limit === 1) return json({ messages: [] })
       const [type, id] = routes[received - 1] ?? []
       if (type < 2 || request.channel_id !== id || request.channel_type !== type
@@ -179,6 +181,14 @@ globalThis.fetch = async (input, init) => {
     })
     if (url.pathname.endsWith('/message/edit')) {
       const body = JSON.parse(init.body)
+      if (groupToolsSmoke && body.message_id === '506' && body.content_edit) {
+        const frame = JSON.parse(body.content_edit)
+        if (!approvalSent || body.channel_id !== group || body.channel_type !== 2 || frame.card.actions?.length
+          || !frame.plain.includes('仅批准这一次')) return new Response(null, { status: 400 })
+        approvalFeedback = true
+        console.log('FIXTURE_APPROVAL_FEEDBACK')
+        return json({})
+      }
       if (groupToolsSmoke && body.message_id === '505' && body.content_edit) {
         const frame = JSON.parse(body.content_edit)
         if (body.channel_id !== group || body.channel_type !== 2 || frame.card.actions?.length || !frame.plain.includes('表单答案已交给 DSH')) return new Response(null, { status: 400 })
@@ -231,10 +241,21 @@ globalThis.fetch = async (input, init) => {
         const inGroup = groupToolsSmoke && received === 3
         if (body.channel_id !== (inGroup ? group : 'fixture-user') || body.channel_type !== (inGroup ? 2 : 1)
           || !body.payload.card.actions?.[0]?.data) return new Response(null, { status: 400 })
+        if (inGroup && body.payload.plain?.startsWith('DSH 等待你的批准\n')) {
+          if (approvalSent || groupStep !== 3 || !JSON.stringify(body.payload).includes('group-tool-fixture.txt')
+            || !JSON.stringify(body.payload).includes('仅批准这一次')) return new Response(null, { status: 400 })
+          approvalSent = true
+          setTimeout(() => questionEvents.set('907', { event_id: '907', event_type: 'card_action', event_data: {
+            message_id: '506', action_id: 'answer', space_id: 'fixture-space', operator_uid: 'fixture-user',
+            channel_id: group, channel_type: 2, data: body.payload.card.actions[0].data, inputs: { selection: 'q1' },
+          } }), 300).unref()
+          console.log('FIXTURE_APPROVAL_CARD')
+          return json({ message_id: 506 })
+        }
         const index = ++questionIndex, id = 500 + index, eventId = String(900 + index)
         if (inGroup && body.payload.plain === typedForm.title) {
           if (index !== 5 || groupStep !== 5 || body.payload.card.body.filter(n => n.type.startsWith('Input.')).length !== 6) return new Response(null, { status: 400 })
-          setTimeout(() => questionEvents.set('907', { event_id: '907', event_type: 'card_action', event_data: {
+          setTimeout(() => questionEvents.set('908', { event_id: '908', event_type: 'card_action', event_data: {
             message_id: '505', action_id: 'submit', space_id: 'fixture-space', operator_uid: 'fixture-user',
             channel_id: group, channel_type: 2, data: body.payload.card.actions[0].data,
             inputs: { note: 'typed answer', amount: '2.5', date: '2028-02-29', time: '12:30', flag: 'true', pick: 'a,b' },
@@ -391,7 +412,7 @@ globalThis.fetch = async (input, init) => {
       if (groupToolsSmoke && groupStep >= 3) {
         const result = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
           .find(part => part.type === 'tool_result' && part.tool_use_id === 'toolu_fixture_group_write')
-        if (!result || result.is_error) return new Response(null, { status: 400 })
+        if (!result || result.is_error || !approvalSent || !approvalFeedback) return new Response(null, { status: 400 })
         if (!groupQuestion.writeCompleted) console.log('FIXTURE_GROUP_WRITE_OK')
         groupQuestion.writeCompleted = true
       }

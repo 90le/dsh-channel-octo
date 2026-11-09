@@ -304,7 +304,7 @@ export class Accounts {
       senderPolicy: config?.senderPolicy ?? record.senderPolicy ?? 'octo', allowedUids: config?.allowedUids ?? record.allowedUids ?? [],
       status: runtime?.status ?? (record.enabled ? 'invalid_configuration' : 'disabled'),
       ...normalizeImControls({ ...this.deployment, ...record }),
-      config, revision: runtime?.settings.revision(), counts: overview?.counts ?? [],
+      config, revision: runtime?.settings.revision(), counts: overview?.counts ?? [], inbox: overview?.inbox,
       conversations: (overview?.conversations ?? []).map(row => ({ ...row, accountId: record.id, accountLabel: record.label })),
     }
   }

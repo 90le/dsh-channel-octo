@@ -90,6 +90,8 @@ const caption = {
   noVault: ['DSH 凭据库暂不可用，不能添加账号或更换令牌。', 'The DSH credential store is unavailable.'],
   cancel: ['取消', 'Cancel'], close: ['关闭', 'Close'], unnamed: ['Octo 账号', 'Octo account'],
   processing: ['处理中…', 'Processing…'],
+  inboxRecovering: ['正在补收断线期间的消息，按原频道顺序处理。', 'Recovering offline messages in channel order.'],
+  inboxUnavailable: ['部分频道的消息恢复暂不可用，正在重试。该频道的新消息已暂存。', 'Recovery is unavailable for some channels. Retrying; new messages there are stored.'],
   failure: ['操作未完成，请稍后重试。', 'Could not complete the request. Try again.'],
   account_transition: ['账号正在切换连接，请稍后再试。', 'The account is changing its connection. Try again shortly.'],
   account_changed: ['账号设置已在别处更新，请重新打开设置后再试。', 'The account changed elsewhere. Reopen its settings and try again.'],
@@ -354,6 +356,8 @@ export function createAccountView(React, primitives, { request, status, label })
             onClick: () => { if (!writing.current) { choose(account.id); setModal({ id: account.id }) } },
             'aria-label': tr('edit') + ' · ' + (account.label || tr('unnamed')) }, tr('edit'))))),
       notice && h('p', { className: 'dsho-alert dsho-account-list-note', role: 'alert' }, notice),
+      open && current?.inbox?.recoveringRoutes > 0 && h('p', { className: 'dsho-account-list-note', role: 'status' },
+        tr(current.inbox.failedRoutes ? 'inboxUnavailable' : 'inboxRecovering')),
       open && current?.counts?.length > 0 && h('div', { className: 'dsho-counts' }, ...current.counts.map(row =>
         h('span', { key: row.state }, (label(row.state, lang) || label('review', lang)) + ' ' + row.total))),
       modal && (!modal.id || selected) && h(Modal, { key: modal.id ?? 'new', account: selected, data, lang, tr, publish, refresh,
