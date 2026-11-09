@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { ruleScope } from './rules.js'
 
 const maxBody = 1024 * 1024
 
@@ -53,11 +54,11 @@ export class OctoClient {
     this.fetch = fetchImpl
   }
 
-  async #post(path, body, signal, { timeout = 15_000, auth = true } = {}) {
+  async #request(path, body, signal, { timeout = 15_000, auth = true } = {}) {
     try {
       const response = await this.fetch(this.base + path, {
-        method: 'POST', redirect: 'manual',
-        headers: { 'Content-Type': 'application/json', ...(auth && { Authorization: 'Bearer ' + this.#token }) },
+        method: body === undefined ? 'GET' : 'POST', redirect: 'manual',
+        headers: { ...(body !== undefined && { 'Content-Type': 'application/json' }), ...(auth && { Authorization: 'Bearer ' + this.#token }) },
         body, signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
       })
       if (!response.ok) {
@@ -76,13 +77,13 @@ export class OctoClient {
   }
 
   async verify(botUid, spaceId, signal) {
-    const result = await this.#post('/v1/auth/verify-bot', JSON.stringify({ bot_token: this.#token }), signal, { auth: false })
+    const result = await this.#request('/v1/auth/verify-bot', JSON.stringify({ bot_token: this.#token }), signal, { auth: false })
     if (result?.bot_uid !== botUid || result?.space_id !== spaceId) throw new OctoError('bot_identity_mismatch')
   }
 
   async events(signal) {
     const started = Date.now()
-    const result = await this.#post('/v1/bot/events', JSON.stringify({ event_id: 0, limit: 20, wait: this.wait }), signal, {
+    const result = await this.#request('/v1/bot/events', JSON.stringify({ event_id: 0, limit: 20, wait: this.wait }), signal, {
       timeout: (this.wait + 10) * 1000,
     })
     if (result?.status !== 1 || (result.results !== null && !Array.isArray(result.results))) {
@@ -95,18 +96,37 @@ export class OctoClient {
 
   async ack(id, signal) {
     if (!decimalId(id)) throw new OctoError('invalid_event_id')
-    const result = await this.#post('/v1/bot/events/' + id + '/ack', '{}', signal)
+    const result = await this.#request('/v1/bot/events/' + id + '/ack', '{}', signal)
     if (result?.status !== 200) throw new OctoError('invalid_ack_response')
   }
 
   async send(recipient, text, signal, channelType = 1) {
     if (![1, 2, 5].includes(channelType)) throw new OctoError('invalid_channel_type')
-    const result = await this.#post('/v1/bot/sendMessage', JSON.stringify({
+    const result = await this.#request('/v1/bot/sendMessage', JSON.stringify({
       channel_id: recipient, channel_type: channelType, payload: { type: 1, content: text },
     }), signal)
     const id = decimalId(result?.message_id)
     if (!id) throw new OctoError('send_result_unconfirmed')
     return id
+  }
+
+  async rules(type, address, threadRuleMode, signal) {
+    const scope = ruleScope(type, address)
+    if (!scope) throw new OctoError('invalid_rule_scope')
+    const root = '/v1/bot/groups/' + encodeURIComponent(scope.group)
+    const read = async (kind, path) => {
+      const doc = await this.#request(path, undefined, signal, { timeout: 8000 })
+      if (typeof doc?.content !== 'string' || !Number.isSafeInteger(doc.version) || doc.version < 0
+        || Buffer.byteLength(doc.content, 'utf8') > 10_240) throw new OctoError('invalid_rule_document')
+      const markdown = doc.content.trim() ? doc.content : ''
+      return { kind, version: doc.version, status: markdown ? 'present' : 'empty', markdown }
+    }
+    if (!scope.thread) return [await read('group', root + '/md')]
+    // Verify the topic endpoint first; a failure must not fall back to parent rules.
+    const thread = await read('thread', root + '/threads/' + scope.thread + '/md')
+    return threadRuleMode === 'inherit-group'
+      ? [await read('group', root + '/md'), thread]
+      : [thread]
   }
 }
 

@@ -51,7 +51,7 @@ test('DSH scopes tools and only forwards the result of the claimed turn', async 
   assert.equal(await host.run(session, 'hello', () => calls.push('session stored'), signal), 'final answer')
   assert.deepEqual(calls, [
     ['create', agentId], ['mount', 'octo-text'], ['restrict', { allow: [] }],
-    ['guard', 'Octo direct messages cannot execute tools'], 'flush', 'session stored',
+    ['guard', 'Octo IM sessions cannot execute tools'], 'flush', 'session stored',
     ['prompt', 'hello'], 'flush', 'dispose',
   ])
   assert.equal(events.eventNames().length, 0)

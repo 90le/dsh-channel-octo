@@ -1,8 +1,10 @@
 let received = 0
 let sent = 0
+const group = '00112233445566778899aabbccddeeff'
+const thread = '123456789012345678'
 const routes = [
   [1, 'fixture-user'], [1, 'fixture-user'],
-  [2, 'fixture-group'], [5, 'fixture-group____topic'],
+  [2, group], [5, group + '____' + thread], [2, group],
 ]
 const realFetch = globalThis.fetch
 globalThis.fetch = async (input, init) => {
@@ -10,6 +12,14 @@ globalThis.fetch = async (input, init) => {
   const json = value => Response.json(value)
   if (url.hostname === 'octo-fixture.invalid') {
     if (url.pathname.endsWith('/verify-bot')) return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space' })
+    if (init.method === 'GET' && url.pathname.endsWith('/groups/' + group + '/md')) {
+      return received === 5
+        ? json({ content: '', version: 2 })
+        : json({ content: 'PARENT-FIXTURE {{leave_literal}}', version: 1 })
+    }
+    if (init.method === 'GET' && url.pathname.endsWith('/groups/' + group + '/threads/' + thread + '/md')) {
+      return json({ content: 'THREAD-FIXTURE', version: 8 })
+    }
     if (url.pathname.endsWith('/ack')) return json({ status: 200 })
     if (url.pathname.endsWith('/sendMessage')) {
       const body = JSON.parse(init.body)
@@ -38,12 +48,22 @@ globalThis.fetch = async (input, init) => {
     const body = JSON.parse(init.body)
     const history = JSON.stringify(body.messages)
     const tail = JSON.stringify(body.messages.at(-1))
-    const round = Number(tail.match(/fixture prompt ([1-4])/)?.[1] ?? 0)
+    const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
+    const round = titleRequest ? 0 : Number(Array.from(tail.matchAll(/fixture prompt ([1-5])/g)).at(-1)?.[1] ?? 0)
+    const snapshot = body.messages.filter(m => m.role === 'user').flatMap(m =>
+      typeof m.content === 'string' ? [m.content] : m.content.map(c => c.text ?? ''),
+    ).filter(text => text.includes('Octo 当前会话规则快照')).at(-1) ?? ''
+    const rulesOk = round <= 2 ? !snapshot
+      : round === 3 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && !snapshot.includes('THREAD-FIXTURE')
+        : round === 4 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && snapshot.includes('THREAD-FIXTURE')
+          : snapshot.includes('"status":"empty"') && !snapshot.includes('PARENT-FIXTURE') && !snapshot.includes('THREAD-FIXTURE')
     if (round && ((body.tools ?? []).length !== 0
+      || !rulesOk || JSON.stringify(body.system ?? '').includes('PARENT-FIXTURE')
       || (round === 2 && !history.includes('fixture response 1'))
       || (round >= 3 && /fixture (prompt|response) [1-2]/.test(history))
-      || (round === 4 && /fixture (prompt|response) 3/.test(history)))) {
-      console.error('FIXTURE_MODEL_CONTEXT_OR_TOOLS_WRONG round=' + round + ' tools=' + (body.tools ?? []).length + ' prior=' + history.includes('fixture response 1'))
+      || (round === 4 && /fixture (prompt|response) 3/.test(history))
+      || (round === 5 && (!history.includes('fixture response 3') || /fixture (prompt|response) 4/.test(history))))) {
+      console.error('FIXTURE_MODEL_CONTEXT_OR_TOOLS_WRONG round=' + round + ' rules=' + rulesOk + ' tools=' + (body.tools ?? []).length)
       return new Response(null, { status: 400 })
     }
     const frames = [

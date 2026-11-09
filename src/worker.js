@@ -27,13 +27,27 @@ export class Worker {
       return
     }
     if (job.state === 'queued') {
-      // Preserve the existing DM mapping on upgrade. Use a disjoint namespace
-      // for the entire group/topic so two participants share the intended history.
-      const conversation = channelType === 1 ? job.sender : JSON.stringify([channelType, recipient])
+      let rules
+      if (channelType !== 1) {
+        try {
+          rules = await this.api.rules(channelType, recipient, this.config.threadRuleMode, signal)
+        } catch (error) {
+          if (signal.aborted) return // still queued; a clean restart can fetch rules
+          const code = error instanceof OctoError ? error.code : 'internal_error'
+          this.store.review(job.seq, 'rules_' + code)
+          this.log('rules_' + code)
+          return
+        }
+      }
+      signal.throwIfAborted()
+      // Keep the old mappings in thread-only mode. An inherited thread may
+      // retain parent rules in its history, so keep it in a separate session.
+      const inheritance = channelType === 5 && this.config.threadRuleMode === 'inherit-group' ? ['inherit-group'] : []
+      const conversation = channelType === 1 ? job.sender : JSON.stringify([channelType, recipient, ...inheritance])
       const session = this.store.session(conversation)
       this.store.running(job.seq)
       try {
-        const reply = await this.host.run(session, job.input, () => this.store.sessionCreated(conversation), signal)
+        const reply = await this.host.run(session, job.input, () => this.store.sessionCreated(conversation), signal, rules)
         const bounded = Array.from(reply.trim()).slice(0, 1800).join('')
         if (!bounded) throw new Error('empty_reply')
         this.store.ready(job.seq, bounded)

@@ -16,7 +16,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.2.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.3.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -31,13 +31,16 @@ dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.2.0.tgz
     allowedUids: [TEST_USER_UID]
     allowedGroupIds: []
     allowedThreadIds: []
+    threadRuleMode: thread-only
     cwd: /absolute/test-workspace
     stateDir: /absolute/private-octo-state
     waitSeconds: 15
     timeoutMs: 120000
 ```
 
-群聊与话题只接受 User Bot（bf_），两个白名单分别配置。话题填完整通道 ID，例如 `GROUP_ID____SHORT_ID`；群 ID 不会自动放行旗下话题。两个场景都只响应白名单用户明确 @ Bot 的普通文本。升级前停止消费者并备份状态目录；旧私聊会话和排队记录兼容保留。
+群聊与子区只接受 User Bot（`bf_`），两个白名单分别配置。子区填完整通道 ID：32 位十六进制父群 ID、四个下划线、15–20 位数字短 ID；群 ID 不会自动放行旗下子区。两个场景都只响应白名单用户明确 @ Bot 的普通文本。升级前停止消费者并备份状态目录；私聊、群聊和默认子区模式沿用旧会话。
+
+主区每轮读群规则。默认子区仅加载本区规则；设置 `threadRuleMode: inherit-group` 后，该插件允许的子区先读本区规则，再读父群规则，有冲突时以子区为准。父群继承会使用独立的子区会话，切回默认模式不会携带继承模式的历史。详见[群规则边界](OCTO-COVERAGE.md#群主区与子区规则)。
 
 需要为测试 profile 设置可用的 DSH 模型。使用独立 Bot，不与其他连接程序同时消费其事件；启用后会确认该 Bot 收到的事件，超出当前支持范围的事件不进入模型。暂停时将 `enabled` 改回 `false` 并按环境流程重载 Web；本地状态和会话保留。
 
@@ -45,7 +48,9 @@ dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.2.0.tgz
 
 ## 当前状态
 
-0.2.0 为开发候选，支持私聊、群聊和话题文本路由。7 项自动测试覆盖收发、准入、去重、恢复及旧数据库迁移。隔离 DSH Web 0.2.1-rc.5 与 IM Connect 1.0.30 使用模拟 Octo 和模型跑通两轮私聊、一轮群聊和一轮话题；验证私聊续接及三种会话互不串线。正式环境已另行验证 Bot 鉴权、HTTP 长轮询和悟空 WebSocket 握手；这些探测未部署本插件。实际 Octo 插件收发、附件和卡片闭环、其他已绑定 IM 渠道收发与 Debian 部署仍待验收。
+0.3.0 为开发候选，支持私聊、群聊、子区文本路由，以及每轮读取当前群规则和子区规则。正式环境曾另行验证 Bot 鉴权、HTTP 长轮询和悟空 WebSocket 握手；这些探测未部署本插件。实际 Octo 插件收发和规则验收、附件与卡片闭环、其他已绑定 IM 渠道收发与 Debian 部署仍待验证。
+
+11 项自动测试通过。隔离 DSH Web 与 IM Connect 共同加载后，用模拟 Octo 和模型验证了主区规则、子区继承、清空后的新快照、私聊续接及会话隔离。
 
 复跑宿主检查（需安装指定版本的 DSH CLI；脚本使用临时 DSH home 和测试凭据）：
 

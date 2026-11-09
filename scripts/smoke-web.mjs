@@ -49,7 +49,9 @@ try {
     '- id: dsh-channel-octo', '  config:', '    enabled: true',
     '    apiBase: https://octo-fixture.invalid/api', '    botUid: fixture-bot',
     '    spaceId: fixture-space', '    allowedUids: [fixture-user]',
-    '    allowedGroupIds: [fixture-group]', '    allowedThreadIds: [fixture-group____topic]',
+    '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
+    '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]',
+    '    threadRuleMode: inherit-group',
     '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 8000',
     '- id: llm-deepseek', '  config:', '    baseURL: https://model-fixture.invalid',
   ].join('\n') + '\n')
@@ -59,14 +61,14 @@ try {
   ], { ...common, stdio: ['ignore', 'pipe', 'pipe'] })
   let output = ''
   for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-12_000) })
-  const deadline = Date.now() + 20_000
-  while (Date.now() < deadline && child.exitCode === null && sentCount() !== 4) await delay(200)
-  if (sentCount() !== 4) {
-    throw new Error('expected four delivered replies; fixture diagnostics: ' + output.replace(/https?:\/\/\S+/g, '[url]'))
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline && child.exitCode === null && sentCount() !== 5) await delay(200)
+  if (sentCount() !== 5) {
+    throw new Error('expected five delivered replies; fixture diagnostics: ' + output.replace(/https?:\/\/\S+/g, '[url]'))
   }
   const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')
   if (!imLog.includes('API 已注册') || !imLog.includes('attachMappedSessions')) throw new Error('IM Connect did not initialize')
-  console.log('PASS: DSH 0.2.1-rc.5 + IM Connect 1.0.30; DM continuity, group/topic isolation, no model tools.')
+  console.log('PASS: DSH Web + IM Connect; scoped group/topic rules, cleared latest snapshot, isolated history, no model tools.')
 } finally {
   if (child && child.exitCode === null && child.signalCode === null) {
     const exited = new Promise(resolve => child.once('exit', resolve))

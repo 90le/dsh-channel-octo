@@ -1,7 +1,7 @@
 {
   "name": "dsh-channel-octo",
-  "version": "0.2.0",
-  "description": "Octo direct messages as a native DeepSeek Harness Web channel",
+  "version": "0.3.0",
+  "description": "Octo IM as a native DeepSeek Harness Web channel",
   "private": true,
   "license": "UNLICENSED",
   "type": "module",

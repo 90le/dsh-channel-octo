@@ -164,6 +164,7 @@ test('only directed, opted-in User Bot group and topic text reaches its original
   const sends = [], sessions = []
   const api = {
     async events() { return source }, async ack() {},
+    async rules() { return [] },
     async send(address, _text, _signal, type) { sends.push([type, address]); return String(sends.length) },
   }
   const host = { async run(session, _text, created) { sessions.push(session.session_id); created(); return 'answer' } }

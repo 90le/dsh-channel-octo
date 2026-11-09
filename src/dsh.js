@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto'
+import { ruleContext } from './rules.js'
 
 const preset = 'octo-text'
-const denial = 'Octo direct messages cannot execute tools'
+const denial = 'Octo IM sessions cannot execute tools'
 
 export class DshHost {
   constructor(ctx, cwd, timeoutMs) {
     Object.assign(this, { ctx, cwd, timeoutMs })
   }
 
-  async run(session, text, onCreated, lifetime) {
+  async run(session, text, onCreated, lifetime, rules) {
     const signal = AbortSignal.any([lifetime, AbortSignal.timeout(this.timeoutMs)])
     signal.throwIfAborted()
     const ctx = this.ctx
@@ -21,6 +22,15 @@ export class DshHost {
       if (!tools?.restrict || !tools?.guard) throw new Error('missing_scoped_tool_controls')
       tools.restrict({ allow: [] })
       tools.guard(() => denial)
+      if (rules) {
+        const prompt = scoped.get('systemPrompt')
+        if (typeof prompt?.context !== 'function') throw new Error('missing_scoped_rule_context')
+        // DSH projects runtime facts into a user-role snapshot, not the system role.
+        prompt.context({
+          name: 'dsh-channel-octo.channel-rules',
+          order: 50, required: true, interpolate: false, text: ruleContext(rules),
+        })
+      }
     }
     const handle = session.created
       ? await ctx.agents.resume({ resumeSessionId: session.session_id, setup, agentOptions, signal })

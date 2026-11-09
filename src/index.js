@@ -5,7 +5,7 @@ import { Store } from './store.js'
 import { Worker } from './worker.js'
 
 export const name = 'dsh-channel-octo'
-export const inject = ['agents', 'agentDefaultModel', 'agentPresets', 'sessions', 'tools']
+export const inject = ['agents', 'agentDefaultModel', 'agentPresets', 'sessions', 'tools', 'systemPrompt']
 
 export function apply(ctx, settings = {}) {
   if (settings.enabled !== true) return

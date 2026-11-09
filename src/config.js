@@ -1,16 +1,15 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { statSync } from 'node:fs'
+import { ruleScope } from './rules.js'
 
 const validUid = (s) => typeof s === 'string' && /^[A-Za-z0-9_.:@-]{1,128}$/.test(s)
 
-function scopeList(value, isThread) {
+function scopeList(value, type) {
   if (value === undefined) return new Set()
-  if (!Array.isArray(value) || value.length > 50 || value.some(id => {
-    if (!validUid(id)) return true
-    const parts = id.split('____')
-    return isThread ? parts.length !== 2 || parts.some(part => !part) : parts.length !== 1
-  })) throw new Error('invalid_channel_allowlist')
+  if (!Array.isArray(value) || value.length > 50 || value.some(id => !ruleScope(type, id))) {
+    throw new Error('invalid_channel_allowlist')
+  }
   return new Set(value)
 }
 
@@ -22,9 +21,11 @@ export function resolveConfig(config, env = process.env) {
   const apiBase = url.href.replace(/\/+$/, '')
   const token = env.DSH_OCTO_BOT_TOKEN
   if (!/^(app|bf)_[A-Za-z0-9_-]+$/.test(token ?? '')) throw new Error('missing_bot_token')
-  const groups = scopeList(config.allowedGroupIds, false)
-  const threads = scopeList(config.allowedThreadIds, true)
+  const groups = scopeList(config.allowedGroupIds, 2)
+  const threads = scopeList(config.allowedThreadIds, 5)
   if ((groups.size || threads.size) && !token.startsWith('bf_')) throw new Error('group_and_thread_require_user_bot')
+  const threadRuleMode = config.threadRuleMode ?? 'thread-only'
+  if (!['thread-only', 'inherit-group'].includes(threadRuleMode)) throw new Error('invalid_thread_rule_mode')
   if (!validUid(config.botUid) || !validUid(config.spaceId)) throw new Error('missing_bot_identity')
   if (!Array.isArray(config.allowedUids) || !config.allowedUids.length || config.allowedUids.length > 20
     || config.allowedUids.some(uid => !validUid(uid) || uid === config.botUid)) throw new Error('invalid_user_allowlist')
@@ -38,6 +39,6 @@ export function resolveConfig(config, env = process.env) {
     || !Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000) throw new Error('invalid_timeouts')
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
-    botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(config.allowedUids), groups, threads,
+    botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(config.allowedUids), groups, threads, threadRuleMode,
   }
 }
