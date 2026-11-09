@@ -49,11 +49,13 @@ export function resolveConfig(config, env = process.env) {
   }
   const waitSeconds = config.waitSeconds ?? 15
   const timeoutMs = config.timeoutMs ?? 120_000
+  const progress = config.progress ?? 'auto'
+  if (!['auto', 'typing', 'off'].includes(progress)) throw new Error('invalid_progress_mode')
   if (!Number.isInteger(waitSeconds) || waitSeconds < 5 || waitSeconds > 30
     || !Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000) throw new Error('invalid_timeouts')
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
     botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
-    senderPolicy, channelPolicy, mentionPolicy, transport,
+    senderPolicy, channelPolicy, mentionPolicy, transport, progress,
   }
 }

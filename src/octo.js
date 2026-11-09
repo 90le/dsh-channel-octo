@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
 
 const maxBody = 1024 * 1024
@@ -163,6 +164,32 @@ export class OctoClient {
     const id = decimalId(result?.message_id)
     if (!id) throw new OctoError('send_result_unconfirmed')
     return id
+  }
+
+  async cardProfile(signal) {
+    return this.#request('/v1/bot/card/profile', undefined, signal, { timeout: 2000 })
+  }
+
+  async typing(route, signal) {
+    await this.#request('/v1/bot/typing', JSON.stringify(route), signal, { timeout: 2000 })
+  }
+
+  async progressCard(route, frame, signal) {
+    const result = await this.#request('/v1/bot/sendMessage', JSON.stringify({
+      ...route, client_msg_no: randomUUID().replaceAll('-', ''), payload: { type: 17, ...frame },
+    }), signal, { timeout: 2500 })
+    const id = decimalId(result?.message_id)
+    if (!id) throw new OctoError('card_send_unconfirmed')
+    return id
+  }
+
+  async editProgress(route, id, frame, seq, transient, signal) {
+    const update = { card_seq: seq, ...(transient ? { transient: true } : {}) }
+    await this.#request('/v1/bot/message/edit', JSON.stringify({
+      ...route, message_id: id, ...(frame.template_ref
+        ? { ...frame, ...update }
+        : { content_edit: JSON.stringify({ type: 17, ...frame, ...update }) }),
+    }), signal, { timeout: 2500 })
   }
 
   async rules(type, address, threadRuleMode, signal) {

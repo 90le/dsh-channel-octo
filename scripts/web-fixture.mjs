@@ -1,7 +1,11 @@
 import { wirePeer } from './wukong-fixture.mjs'
+import { existsSync } from 'node:fs'
+import { setTimeout as delay } from 'node:timers/promises'
 
 let received = 0
 let sent = 0
+let openedCard = false
+const browserReady = process.env.DSH_OCTO_BROWSER_READY
 const group = '00112233445566778899aabbccddeeff'
 const thread = '123456789012345678'
 const routes = [
@@ -21,7 +25,8 @@ function nextMessage() {
   }
 }
 if (peer) setInterval(() => {
-  if (peer.send && received < routes.length && received === sent) peer.send(nextMessage())
+  if (peer.send && received < routes.length && received === sent
+    && (!browserReady || received !== 1 || existsSync(browserReady + '.owned'))) peer.send(nextMessage())
 }, 50).unref()
 const realFetch = globalThis.fetch
 globalThis.fetch = async (input, init) => {
@@ -56,8 +61,36 @@ globalThis.fetch = async (input, init) => {
       return json({ content: 'THREAD-FIXTURE', version: 8 })
     }
     if (url.pathname.endsWith('/ack')) return json({ status: 200 })
+    if (url.pathname.endsWith('/card/profile')) return json({
+      enabled: true, config: { card_enabled: true, reasoning_enabled: true,
+        reasoning_template_ref: { id: 'ai.reasoning-process', version: '0.4.1' } },
+      templating: { supported: true, templates: [{ id: 'ai.reasoning-process', version: '0.4.1',
+        views: [{ states: ['reasoning', 'answering', 'completed', 'stopped', 'error'] }] }] },
+    })
+    if (url.pathname.endsWith('/message/edit')) {
+      const body = JSON.parse(init.body)
+      if (body.message_id !== '200' || body.channel_type !== 1 || body.channel_id !== 'fixture-user'
+        || body.template_ref?.id !== 'ai.reasoning-process' || body.data.state !== body.state
+        || body.state === 'answering' && body.transient !== true
+        || body.state === 'completed' && body.transient === true) {
+        console.error('FIXTURE_CARD_EDIT_MISMATCH')
+        return new Response(null, { status: 400 })
+      }
+      console.log('FIXTURE_CARD=' + body.state + ':' + body.card_seq)
+      return json({})
+    }
     if (url.pathname.endsWith('/sendMessage')) {
       const body = JSON.parse(init.body)
+      if (body.payload.type === 17) {
+        if (openedCard || received !== 1 || body.channel_type !== 1 || body.channel_id !== 'fixture-user'
+          || body.payload.template_ref?.id !== 'ai.reasoning-process' || body.payload.data.state !== body.payload.state) {
+          console.error('FIXTURE_CARD_OPEN_MISMATCH')
+          return new Response(null, { status: 400 })
+        }
+        openedCard = true
+        console.log('FIXTURE_CARD_OPEN')
+        return json({ message_id: 200 })
+      }
       const [type, address] = routes[sent] ?? []
       if (body.channel_id !== address || body.channel_type !== type || body.payload.content !== 'fixture response ' + (sent + 1)) {
         console.error('FIXTURE_REPLY_MISMATCH')
@@ -109,6 +142,7 @@ globalThis.fetch = async (input, init) => {
       {type:'message_delta',delta:{stop_reason:'end_turn'},usage:{output_tokens:5}},
       {type:'message_stop'},
     ]
+    if (round === 1) await delay(6400)
     return new Response(frames.map(f => 'event: ' + f.type + '\ndata: ' + JSON.stringify(f) + '\n\n').join(''), {
       headers: {'Content-Type':'text/event-stream'},
     })

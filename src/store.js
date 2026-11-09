@@ -40,6 +40,7 @@ export class Store {
       this.db.exec(`
         CREATE INDEX IF NOT EXISTS jobs_by_route
           ON jobs(channel_type, COALESCE(channel_id, sender), seq) WHERE state IN ('queued','ready','running','sending');
+        CREATE INDEX IF NOT EXISTS jobs_route_history ON jobs(channel_type, COALESCE(channel_id, sender), seq);
         COMMIT;
       `)
       this.db.exec("UPDATE jobs SET state='review', issue='interrupted_' || state WHERE state IN ('running','sending')")
@@ -76,6 +77,25 @@ export class Store {
   }
 
   sessionCreated(sender) { this.db.prepare('UPDATE conversations SET created=1 WHERE sender=?').run(sender) }
+  overview() {
+    const conversations = this.db.prepare(`
+      WITH routes AS (
+        SELECT session_id,
+          CASE WHEN substr(sender, 1, 1)='[' THEN json_extract(sender, '$[0]') ELSE 1 END AS type,
+          CASE WHEN substr(sender, 1, 1)='[' THEN json_extract(sender, '$[1]') ELSE sender END AS address,
+          CASE WHEN substr(sender, 1, 1)='[' THEN json_extract(sender, '$[2]') END AS scope
+        FROM conversations WHERE created=1 ORDER BY rowid DESC LIMIT 250
+      )
+      SELECT r.session_id AS id, r.type, r.address, r.scope, j.state, j.issue
+      FROM routes r LEFT JOIN jobs j ON j.seq=(
+        SELECT seq FROM jobs WHERE channel_type=r.type AND COALESCE(channel_id, sender)=r.address
+          AND state <> 'ignored' ORDER BY seq DESC LIMIT 1
+      )
+      ORDER BY j.seq DESC
+    `).all()
+    const counts = this.db.prepare('SELECT state, count(*) AS total FROM jobs GROUP BY state').all()
+    return { conversations, counts }
+  }
   running(seq) { this.db.prepare("UPDATE jobs SET state='running' WHERE seq=?").run(seq) }
   ready(seq, reply) { this.db.prepare("UPDATE jobs SET state='ready', reply=? WHERE seq=?").run(reply, seq) }
   sending(seq) { this.db.prepare("UPDATE jobs SET state='sending', attempts=attempts+1 WHERE seq=?").run(seq) }

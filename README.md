@@ -1,6 +1,6 @@
 # DSH Channel Octo
 
-在 DeepSeek Harness Web 中并列加载的 Octo IM 插件。使用宿主模型和原生会话，支持私聊、群聊和子区纯文本。可选本地白名单或 Octo 好友与成员准入。见[基础方案](PLAN.md)与[完整能力及验收计划](OCTO-COVERAGE.md)。
+在 DeepSeek Harness Web 中并列加载的 Octo IM 插件。使用宿主模型和原生会话，支持私聊、群聊和子区纯文本，以及回复进度卡。可选本地白名单或 Octo 好友与成员准入。见[基础方案](PLAN.md)与[完整能力及验收计划](OCTO-COVERAGE.md)。
 
 ## 本地检查
 
@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.4.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.5.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -63,13 +63,20 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 
 ## 当前状态
 
-0.4.0 为开发候选，增加 Octo 好友与成员准入、群和子区按 Octo 开关免 @、悟空 IM WebSocket 接收。正式环境曾另行验证 Bot 鉴权、HTTP 长轮询和悟空 WebSocket 握手；这些探测未部署本插件。实际 Octo 插件收发和规则验收、附件与卡片闭环、其他已绑定 IM 渠道收发与 Debian 部署仍待验证。
+0.5.0 复用已经在 DSH Web 打开的 Octo 会话，继续限制宿主工具，等待已有工作结束后再提交 Octo 消息。终态与该消息对应的回合绑定；同回合混入其他输入时停止转发。没有确认回复的旧任务仍留在待检查列表。
 
-16 项自动测试覆盖权限校验、断线重连、收件确认和重复消息去重。隔离 DSH Web 与 IM Connect 共同加载，用模拟 Octo 和模型检查规则与会话隔离；WebSocket 和 HTTP 两种接收模式均通过。
+- **设置 → Octo 渠道**：查看连接与任务状态，编辑准入方式、名单、@ 触发、子区规则、进度方式和超时。保存后，新消息使用新设置。Bot 连接、凭据、目录和传输方式由部署控制。
+- **侧栏 → Octo 频道**：私聊、群聊和子区在建立原生 DSH 会话后自动归档；点开可查看原生会话。若现有插件提供扩展页签，还会出现独立的 Octo 页签。
+- **进度**：长回复优先使用 Octo 推理过程模板，或使用展示卡；卡片不可用时回退到“正在输入”。卡片只显示 DSH 的工作阶段和耗时。进度失败不阻止正文；明确失败有提示，旧任务不会自动重放。
+
+文件、媒体、任意内容卡和卡片按钮回调未接入。具体接口与验证边界见[能力矩阵](OCTO-COVERAGE.md)。
+
+自动测试覆盖权限校验、断线重连、收件确认和重复消息去重。隔离 DSH Web 与 IM Connect 共同加载，用模拟 Octo 和模型检查规则、会话隔离和进度卡更新。可另传 Playwright 模块与 Chromium 路径，验证浏览器设置页。
 
 复跑宿主检查（需安装指定版本的 DSH CLI；脚本使用临时 DSH home 和测试凭据）：
 
 ```sh
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js events
+npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket /absolute/path/to/playwright-core/index.mjs /absolute/path/to/chrome
 ```

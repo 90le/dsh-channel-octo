@@ -73,3 +73,35 @@ test('DSH fails closed when the tool guard is missing or the turn fails', async 
     if (options.toolGuard === false) assert.equal(calls.some(call => call[0] === 'prompt'), false)
   }
 })
+
+test('reuses a Web-owned Octo session with scoped safety and suppresses mixed-turn answers', async () => {
+  const { ctx, calls, events, agentId } = fakeHost()
+  const agent = {
+    id: agentId, session: { id: agentId, header: { cwd: '/fixture' } }, status: 'idle',
+    ctx: { get: () => ({
+      restrict() { calls.push('restrict'); return () => calls.push('release restriction') },
+      guard() { calls.push('guard'); return () => calls.push('release guard') },
+    }) },
+    async whenIdle() {},
+    followup(message) {
+      events.emit('agent/inbox/claimed', { agent: this, message, turn: 1 })
+      if (message.content[0].text === 'mixed') {
+        events.emit('agent/inbox/claimed', { agent: this, message: { id: 'web-prompt' }, turn: 1 })
+      }
+      events.emit('session/event', this.session, { type: 'assistant/message',
+        data: { turn: 1, message: { content: [{ type: 'text', text: 'reply' }] } } })
+      events.emit('session/event', this.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    },
+  }
+  ctx.agents.get = () => agent
+  ctx.agentPresets.composedPreset = () => 'octo-text'
+  const host = new DshHost(ctx, '/fixture', 1000)
+  const run = text => host.run({ session_id: agentId, created: 1 }, text,
+    () => assert.fail('must reuse'), new AbortController().signal)
+  assert.equal(await run('safe'), 'reply')
+  await assert.rejects(run('mixed'), /shared_turn_not_forwarded/)
+  assert.deepEqual(calls.slice(0, 5), ['restrict', 'guard', 'flush', 'release guard', 'release restriction'])
+  assert.ok(!calls.includes('dispose'))
+  ctx.agentPresets.composedPreset = () => 'default'
+  await assert.rejects(run('safe'), /session_preset_conflict/)
+})
