@@ -1,6 +1,6 @@
 # DSH Channel Octo
 
-在 DeepSeek Harness Web 中并列加载的 Octo IM 插件。使用宿主模型和原生会话，支持私聊、群聊和子区纯文本，以及回复进度卡。可选本地白名单或 Octo 好友与成员准入。见[基础方案](PLAN.md)与[完整能力及验收计划](OCTO-COVERAGE.md)。
+在 DeepSeek Harness Web 中并列加载的 Octo IM 插件。使用宿主模型和原生会话，支持私聊、群聊和子区的文字、文件与媒体附件，以及展示卡、确认卡和动态回复进度。可选本地白名单或 Octo 好友与成员准入。见[基础方案](PLAN.md)与[完整能力及验收计划](OCTO-COVERAGE.md)。
 
 ## 本地检查
 
@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.5.1.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.6.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -61,15 +61,20 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
 
-## 当前状态
+## 0.6.0
 
-0.5.0 复用已经在 DSH Web 打开的 Octo 会话，继续限制宿主工具，等待已有工作结束后再提交 Octo 消息。终态与该消息对应的回合绑定；同回合混入其他输入时停止转发。没有确认回复的旧任务仍留在待检查列表。
+账号管理参照 IM Connect 1.0.30。两个插件可共存，各自保留账号、会话与凭据。默认的文字模式可复用已经在 DSH Web 打开的空闲 Octo 会话。同回合混入其他来源的输入时不会向 Octo 转发。
 
-- **设置 → Octo 渠道**：0.5.1 使用 DSH 的控件和语言设置，把 Bot 账号、渠道设置、频道会话分开。连接详情默认折叠；渠道设置包含准入、名单、@ 触发、子区规则、进度和超时。保存后，新消息使用新设置。Bot 绑定和令牌仍由服务器管理，面板不会读取或显示令牌原文。
+- **设置 → Octo 渠道 → Bot 账号**：渠道卡片显示账号数量、连接状态和「接收消息」开关；添加与设置使用同一个双栏表单。每个账号独立选择 DSH 已登记的工作区、Agent 预设、模型、推理强度、权限、私聊准入和空闲新会话时间。已有服务器账号自动出现在列表中，沿用原有历史。
+- **添加、验证和更换令牌**：先由管理员在 DSH 配置中固定 `apiBase`。使用 HTTPS 管理入口（同机回环亦可），令牌仅写入 DSH 凭据库；账号文件只保存引用，不回显令牌。核验只请求 Octo 身份接口。来自外部 HTTPS 反代的请求须配置 `credentialProxyAddresses`，且受信任的反代必须覆盖 `X-Forwarded-Proto`；不要配置普通客户端地址。局域网明文 HTTP 可以管理非敏感设置，但不能提交令牌。
+- **权限**：默认为「仅文字（无工具）」。DSH 权限预设由宿主提供；如要开放某个预设，管理员须在部署配置 `hostPermissions` 中明确列出，并为该账号配置私聊用户名单。群聊和子区始终不执行工具；Octo 不转发宿主工具审批，也不执行任意 DSH 命令。默认排队；在实时连接、白名单私聊且当前回合由 Octo 独占时可选「插话发送」。
+- **渠道设置**：选择账号后独立配置群聊/子区名单、@ 触发、子区规则、进度和超时。修改工作区、模型或权限会在需要时开新 DSH 会话，旧会话仍可查看。
 - **侧栏 → Octo**：有宿主扩展页签时，显示一个 Octo 页签；没有时，在侧栏底部提供「Octo 频道」入口。私聊、群聊和子区自动归档；可按类型筛选、搜索并打开原生 DSH 会话。
 - **进度**：长回复优先使用 Octo 推理过程模板，或使用展示卡；卡片不可用时回退到“正在输入”。卡片只显示 DSH 的工作阶段和耗时。进度失败不阻止正文；明确失败有提示，旧任务不会自动重放。
 
-文件、媒体、任意内容卡和卡片按钮回调未接入。具体接口与验证边界见[能力矩阵](OCTO-COVERAGE.md)。
+- **文件**：启用账号的文件选项后，已通过准入的私聊、群聊和子区可以接收文件、图片、GIF、语音和视频附件。图片是否可识别取决于所选模型；其他非文本媒体保留为 DSH 附件，不自动转录。发送仅限已启用工具的白名单私聊，且仅发送本轮通过 DSH 正式交付的工作区文件。默认每个文件上限 16 MiB；部署需配置确切的 `mediaDownloadOrigins`、`mediaUploadOrigins` HTTPS 来源。文件上传与消息投递任一步无法确认时不会自动重放。
+- **卡片与安全命令**：在账号的私聊或群聊命令选项开启后，授权操作者可使用 `/help`、`/status`、`/new`、`/card` 和 `/choose`。群聊和子区还要求 Bot 所有者直接 @ Bot。卡片按钮只接受原账号、原会话与指定用户的有效回调。授权用户可直接要求展示卡片；不支持的卡片退回文字。长正文会分段发送。
+- **范围**：User Bot（`bf_`）是当前验收目标。没有通用 App Bot 绑定、任意 Adaptive Card 结构、原生逐字流、任意目标主动发送、Octo Drive/Docs 或宿主审批接管。详见[双方源码对照与验收边界](IM-CONNECT-PARITY.md)。
 
 自动测试覆盖权限校验、断线重连、收件确认和重复消息去重。隔离 DSH Web 与 IM Connect 共同加载，用模拟 Octo 和模型检查规则、会话隔离和进度卡更新。可另传 Playwright 模块与 Chromium 路径，验证浏览器设置页。
 
@@ -81,4 +86,4 @@ npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js events
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket /absolute/path/to/playwright-core/index.mjs /absolute/path/to/chrome
 ```
 
-浏览器验收默认与 IM Connect 1.0.30 共存。设置 `DSH_OCTO_SMOKE_CODEX_UI=2.0.19` 可同时安装该版本的 Codex UI；可选的 `DSH_OCTO_SMOKE_SCREENSHOTS` 指向已存在的截图目录，截图只含测试会话。
+浏览器验收默认与 IM Connect 1.0.30 共存。设置 `DSH_OCTO_SMOKE_CODEX_UI=2.0.19` 或 `DSH_OCTO_SMOKE_AUTOMATION` 可加测指定版本；可选的 `DSH_OCTO_SMOKE_SCREENSHOTS` 指向已存在的截图目录，截图只含测试账号和会话。

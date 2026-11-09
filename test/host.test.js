@@ -35,7 +35,7 @@ function fakeHost({ toolGuard = true, reason = 'completed' } = {}) {
     agentPresets: { async mount(_scoped, preset) { calls.push(['mount', preset]) } },
     agents: Object.fromEntries(['create', 'resume'].map(operation => [operation, async (options) => {
       calls.push([operation, options.sessionId ?? options.resumeSessionId])
-      await options.setup({ get: name => name === 'tools' ? tools : null })
+      await options.setup({ get: name => name === 'tools' ? tools : null }, handle.agent)
       return handle
     }])),
     sessions: { async flush() { calls.push('flush') } },
@@ -58,6 +58,30 @@ test('DSH scopes tools and only forwards the result of the claimed turn', async 
   calls.length = 0
   await host.run({ ...session, created: 1 }, 'hello again', () => assert.fail('should resume'), signal)
   assert.deepEqual(calls[0], ['resume', agentId])
+})
+
+test('account model, reasoning and preset are applied, and group turns remain tool-free', async () => {
+  const { ctx, calls, agentId } = fakeHost()
+  const optionsSeen = []
+  const create = ctx.agents.create
+  ctx.agents.create = options => { optionsSeen.push(options.agentOptions); return create(options) }
+  ctx.get = name => name === 'permissionPresets' ? { set: (_, mode) => calls.push(['permission', mode]) } : null
+  const host = new DshHost(ctx, '/fixture', 1000, {
+    provider: 'chosen-provider', model: 'chosen-model', reasoningEffort: 'high',
+    agentPreset: 'standard', permission: 'workspace-write',
+  })
+  const signal = new AbortController().signal
+  const run = allow => host.run({ session_id: agentId, created: 0 }, 'hello', () => {}, signal,
+    undefined, undefined, 1000, allow)
+  await run(true)
+  assert.deepEqual(optionsSeen[0], { provider: 'chosen-provider', model: 'chosen-model', reasoningEffort: 'high' })
+  assert.ok(calls.some(call => call[0] === 'mount' && call[1] === 'standard'))
+  assert.ok(calls.some(call => call[0] === 'permission' && call[1] === 'workspace-write'))
+  assert.ok(!calls.some(call => call[0] === 'guard'))
+  calls.length = 0
+  await run(false)
+  assert.ok(calls.some(call => call[0] === 'guard'))
+  assert.ok(!calls.some(call => call[0] === 'permission'))
 })
 
 test('DSH fails closed when the tool guard is missing or the turn fails', async () => {
@@ -104,4 +128,43 @@ test('reuses a Web-owned Octo session with scoped safety and suppresses mixed-tu
   assert.ok(!calls.includes('dispose'))
   ctx.agentPresets.composedPreset = () => 'default'
   await assert.rejects(run('safe'), /session_preset_conflict/)
+})
+
+test('steering joins only the claimed Octo-owned turn and replaces the earlier answer', async () => {
+  const { ctx, events, agentId } = fakeHost()
+  let started
+  const ready = new Promise(resolve => { started = resolve })
+  let offer, first, steered
+  const agent = {
+    id: agentId, status: 'running', session: { id: agentId },
+    followup(message) {
+      first = message
+      events.emit('agent/inbox/claimed', { agent, message, turn: 2 })
+      events.emit('session/event', agent.session, { type: 'assistant/message', data: {
+        turn: 2, message: { content: [{ type: 'text', text: 'earlier answer' }] },
+      } })
+      started()
+    },
+    steer(message) { steered = message },
+  }
+  ctx.agents.create = async ({ setup }) => {
+    await setup({ get: () => ({ restrict() {}, guard() {} }) }, agent)
+    return { agent, async dispose() {} }
+  }
+  const host = new DshHost(ctx, '/fixture', 1000)
+  const response = host.run({ session_id: agentId, created: 0 }, 'one', () => {}, new AbortController().signal,
+    undefined, undefined, 1000, false, { onSteer(value) { offer = value } })
+  await ready
+  let reserved = false
+  assert.equal(offer('two', () => { reserved = true }), true)
+  assert.equal(reserved, true)
+  assert.notEqual(steered.id, first.id)
+  assert.equal(steered.content[0].text, 'two')
+  events.emit('agent/inbox/claimed', { agent, message: steered, turn: 2 })
+  events.emit('session/event', agent.session, { type: 'assistant/message', data: {
+    turn: 2, message: { content: [{ type: 'text', text: 'new answer' }] },
+  } })
+  events.emit('session/event', agent.session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+  assert.equal(await response, 'new answer')
+  assert.equal(offer, undefined)
 })

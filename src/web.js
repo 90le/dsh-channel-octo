@@ -13,7 +13,7 @@ function overrides(value) {
   return Object.fromEntries(editable.filter(key => Object.hasOwn(value, key)).map(key => [key, value[key]]))
 }
 
-export function loadSettings(base, stateDir) {
+export function loadSettings(base, stateDir, token, validate = () => {}, admission = {}) {
   const file = join(stateDir, 'web-settings.json')
   let saved = {}
   try {
@@ -26,7 +26,12 @@ export function loadSettings(base, stateDir) {
     if (error?.code !== 'ENOENT') throw error
   }
   // Keep connection and credential destination controlled by the deployment.
-  const resolve = changes => resolveConfig({ ...base, ...changes })
+  const resolve = changes => {
+    const config = resolveConfig({ ...base, ...changes, ...admission }, token === undefined ? process.env
+      : { ...process.env, DSH_OCTO_BOT_TOKEN: token })
+    validate(config)
+    return config
+  }
   const config = resolve(saved)
   let revision = randomUUID()
   return {
@@ -49,7 +54,7 @@ export function loadSettings(base, stateDir) {
   }
 }
 
-function view(config) {
+export function channelView(config) {
   if (!config) return null
   const { botUid, spaceId, apiBase, cwd, transport, senderPolicy, channelPolicy,
     mentionPolicy, threadRuleMode, progress, timeoutMs, allowed, groups, threads } = config
@@ -69,7 +74,35 @@ async function body(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
-export function registerWeb(ctx, state) {
+export function credentialRequest(req, trustedProxy = []) {
+  const origin = URL.parse(req.headers.origin ?? '')
+  const address = req.socket.remoteAddress?.replace(/^::ffff:/, '')
+  const local = req.socket.localAddress?.replace(/^::ffff:/, '')
+  const loopback = address === '127.0.0.1' || address === '::1'
+  if (!origin || origin.origin !== req.headers.origin) return false
+  const sameHost = origin.host === req.headers.host
+  if (origin.protocol === 'http:') {
+    return sameHost && loopback && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)
+  }
+  if (origin.protocol !== 'https:') return false
+  return sameHost && req.socket.encrypted === true
+    || (loopback || address && address === local || trustedProxy.includes(address))
+      && req.headers['x-forwarded-proto'] === 'https'
+      && (sameHost || origin.host === req.headers['x-forwarded-host'])
+}
+
+const accountErrors = {
+  accounts_unavailable: 503, credential_provider_unavailable: 503, secure_connection_required: 403,
+  account_not_found: 404, account_changed: 409, account_busy: 409, duplicate_bot: 409,
+  invalid_account: 400, invalid_bot_token: 400, bot_identity_mismatch: 400, bot_verification_failed: 400,
+  workspace_unavailable: 400, model_unavailable: 400, reasoning_unavailable: 400, permission_unavailable: 400,
+  permission_requires_allowlist: 400, settings_changed: 409, channel_not_configured: 409,
+  transport_managed_by_host: 400, invalid_settings: 400, settings_not_saved: 500,
+}
+
+export function registerWeb(ctx, accounts) {
+  const modules = new Map(['account-editor.js', 'account-view.js'].map(name => [path + '/' + name,
+    readFileSync(new URL('./' + name, import.meta.url))]))
   return ctx.webServer.register({ kind: 'prefix', path, handler: async (req, res) => {
     const send = (status, payload) => {
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
@@ -82,23 +115,45 @@ export function registerWeb(ctx, state) {
       if (rejected !== undefined) return send(rejected, { error: 'authentication_required' })
       const target = new URL(req.url ?? '/', 'http://localhost').pathname
       if (req.method === 'GET' && target === path) {
-        return send(200, { status: state.status, config: view(state.settings?.config),
-          revision: state.settings?.revision(), ...(state.store?.overview() ?? { conversations: [], counts: [] }) })
+        return send(200, accounts.overview())
       }
-      if (req.method !== 'PUT' || target !== path + '/settings') return send(404, { error: 'not_found' })
+      if (req.method === 'GET' && modules.has(target)) {
+        res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8',
+          'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' })
+        return res.end(modules.get(target))
+      }
+      if (req.method === 'GET' && target === path + '/account-options') return send(200, await accounts.options())
+      if (!['POST', 'PUT'].includes(req.method)) return send(404, { error: 'not_found' })
       if (req.headers['x-dsh-octo-client'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site'
         || !/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) return send(403, { error: 'forbidden' })
-      if (!state.settings || !state.store) return send(409, { error: 'channel_not_configured' })
       try {
         const input = await body(req)
-        state.settings.save(input?.settings, input?.revision)
+        const secure = () => credentialRequest(req, accounts.trustedProxy)
+        if (req.method === 'POST' && target === path + '/accounts/verify') {
+          if (!secure()) throw new Error('secure_connection_required')
+          return send(200, await accounts.verify(input?.token))
+        }
+        const match = /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})(?:\/(settings|state|diagnose|reconnect|remove))?$/.exec(target)
+        if (req.method === 'PUT' && (target === path + '/settings' || match?.[2] === 'settings')) {
+          return send(200, await accounts.saveRules(match?.[1], input))
+        }
+        if (req.method === 'PUT' && match?.[2] === 'state') return send(200, await accounts.setEnabled(match[1], input))
+        if (req.method === 'POST' && match?.[2] === 'diagnose') return send(200, await accounts.diagnose(match[1]))
+        if (req.method === 'POST' && match?.[2] === 'reconnect') return send(200, await accounts.reconnect(match[1], input))
+        if (req.method === 'POST' && match?.[2] === 'remove') return send(200, await accounts.remove(match[1], input))
+        if (req.method === 'POST' && target === path + '/accounts' || req.method === 'PUT' && match && !match[2]) {
+          if (!secure() && (Object.hasOwn(input?.account ?? {}, 'token') || req.method === 'POST'
+            || input?.account?.permission && input.account.permission !== 'text-only')) {
+            throw new Error('secure_connection_required')
+          }
+          return send(200, await accounts.save(match?.[1], input))
+        }
+        return send(404, { error: 'not_found' })
       } catch (error) {
-        if (error?.message === 'settings_changed') return send(409, { error: 'settings_changed' })
-        if (error?.message === 'transport_managed_by_host') return send(400, { error: 'transport_managed_by_host' })
         if (error?.code && ['EACCES', 'EROFS', 'ENOSPC', 'EPERM'].includes(error.code)) return send(500, { error: 'settings_not_saved' })
-        return send(400, { error: 'invalid_settings' })
+        const code = Object.hasOwn(accountErrors, error?.message) ? error.message : 'invalid_settings'
+        return send(accountErrors[code], { error: code })
       }
-      return send(200, { config: view(state.settings.config), revision: state.settings.revision() })
     } catch { return send(500, { error: 'channel_status_unavailable' }) }
   } })
 }

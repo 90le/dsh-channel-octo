@@ -2,14 +2,17 @@
 window.__ModuleLoader__.load({
   id: 'dsh-channel-octo',
   factory(require) {
-    const { createElement: h, useEffect, useRef, useState, useSyncExternalStore } = require('react')
-    const { Button, Input, SegmentedTabs } = require('@deepseek-ai/dsh-client-ui-primitives')
+    const React = require('react')
+    const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+    const { createElement: h, useEffect, useRef, useState, useSyncExternalStore } = React
+    const { Button, Input, SegmentedTabs } = primitives
     const path = 'api/dsh-channel-octo'
     const words = {
       settings: ['Octo 渠道', 'Octo channel'], shortcut: ['Octo 频道', 'Octo conversations'],
       subtitle: ['管理 Octo 机器人、消息规则和会话。', 'Manage your Octo bot, message rules and conversations.'],
       account: ['Bot 账号', 'Bot account'], rules: ['渠道设置', 'Channel settings'], sessions: ['频道会话', 'Conversations'],
       nav: ['Octo 设置分类', 'Octo settings sections'], close: ['关闭', 'Close'],
+      selectedBot: ['选择账号', 'Choose account'], previousSession: ['历史会话', 'Past conversation'],
       loading: ['正在加载 Octo…', 'Loading Octo…'], retry: ['重新加载', 'Reload'],
       online: ['已连接', 'Connected'], connecting: ['正在连接', 'Connecting'],
       reconnecting: ['正在重连', 'Reconnecting'], disabled: ['尚未启用', 'Disabled'],
@@ -123,7 +126,7 @@ window.__ModuleLoader__.load({
 .dsho-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(210px,100%),1fr)); gap:12px; margin-top:12px; }
 .dsho-field { display:grid; gap:5px; min-width:0; align-content:start; }
 .dsho-field label { font-size:13px; font-weight:570; }
-.dsho-field input,.dsho-field textarea,.dsho-field select { width:100%; min-width:0; box-sizing:border-box; border:1px solid var(--dsho-edge); border-radius:8px; background:var(--dsho-soft); color:inherit; font:inherit; padding:7px 9px; }
+.dsho-field > input,.dsho-field textarea,.dsho-field select { width:100%; min-width:0; box-sizing:border-box; border:1px solid var(--dsho-edge); border-radius:8px; background:var(--dsho-soft); color:inherit; font:inherit; padding:7px 9px; }
 .dsho-field textarea { resize:vertical; }
 .dsho-field select { min-height:34px; max-width:100%; text-overflow:ellipsis; }
 .dsho-tools { align-items:stretch; flex-wrap:wrap; }
@@ -139,12 +142,34 @@ window.__ModuleLoader__.load({
 .dsho-row .dsho-muted { font-size:11px; }
 .dsho-row .dsho-badge { padding:2px 6px; }
 .dsho-row-icon { display:grid; place-items:center; width:28px; height:28px; border-radius:8px; background:var(--dsho-row); }
+.dsho-account-roster { display:grid; gap:12px; }
+.dsho-account-roster-header,.dsho-account-line,.dsho-account-controls {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0;
+}
+.dsho-account-roster-header,.dsho-account-line { justify-content:space-between; }
+.dsho-account-items { display:grid; gap:6px; margin:0; padding:0; list-style:none; }
+.dsho-account-line { padding:10px 12px; border-radius:9px; background:var(--dsho-row); }
+.dsho-account-name { min-width:0; overflow-wrap:anywhere; }
+.dsho-account-name small { display:block; }
+.dsho-account-controls { justify-content:flex-end; }
+.dsho-account-modal { width:min(760px,calc(100vw - 32px))!important; padding:20px!important; }
+.dsho-account-modal-top { display:flex; justify-content:flex-end; margin-bottom:-8px; }
+.dsho-editor-actions { justify-content:flex-end; }
+.dsho-danger-action { color:var(--dsw-alias-text-error,#b13c39); }
 .dsho-empty { border:1px dashed var(--dsho-edge); border-radius:10px; padding:15px; text-align:center; }
 .dsho-empty p { margin-top:4px; }
 .dsho-alert { padding:9px 10px; border-radius:8px; background:var(--dsho-row); margin:0; font-size:12px; line-height:1.55; }
 .dsho-savebar { position:sticky; z-index:1; bottom:0; padding:8px 0; background:#fff; border-top:1px solid var(--dsho-edge); }
 [data-ds-dark-theme] .dsho-savebar { background:#1e1f22; }
-.dsho-rail { padding:10px 12px; }
+[data-octo-rail].dsho-channels {
+  display:flex!important; flex-direction:column!important; justify-content:flex-start!important;
+  align-content:flex-start!important; align-items:stretch!important;
+  flex:1 1 auto; min-height:0; max-height:100%;
+  box-sizing:border-box; gap:8px!important; padding:10px 12px;
+  overflow-y:auto; overscroll-behavior-y:contain;
+}
+.dsho-rail > * { flex:none!important; margin-block:0!important; }
+.dsho-rail .dsho-tools { gap:6px; }
 .dsho-rail .dsho-search { flex-basis:100%; }
 .dsho-rail .dsho-row { padding-inline:4px; }
 .dsho-modal { width:min(520px,calc(100vw - 32px)); max-height:calc(100vh - 48px); box-sizing:border-box; border:1px solid var(--dsho-edge); border-radius:16px; background:var(--dsho-soft); padding:18px; }
@@ -169,6 +194,7 @@ window.__ModuleLoader__.load({
     }
     const jobTone = { sent: 'good', review: 'fault', running: 'busy', sending: 'busy' }
     const processingStates = ['queued', 'running', 'ready', 'sending', 'sent', 'review', 'ignored']
+    const replaceSnapshot = data => { revisionEpoch++; publish(data) }
 
     async function api(suffix = '', options = {}) {
       const res = await fetch(new URL(path + suffix, document.baseURI),
@@ -227,8 +253,9 @@ window.__ModuleLoader__.load({
         const term = query.trim().toLocaleLowerCase()
         const visible = entries.filter(({ row, title, kind }) =>
           (filter === 'all' || String(row.type) === filter)
-          && (!term || [title, kind, row.address].some(value => String(value).toLocaleLowerCase().includes(term))))
-        return h('section', { className: 'dsho-channels' + (rail ? ' dsho-rail' : ''), 'aria-label': t('sessions') },
+          && (!term || [title, kind, row.address, row.accountLabel].some(value => String(value ?? '').toLocaleLowerCase().includes(term))))
+        return h('section', { className: 'dsho-channels' + (rail ? ' dsho-rail' : ''), 'aria-label': t('sessions'),
+          ...(rail && { 'data-octo-rail': true }) },
           rail && h('div', { className: 'dsho-head' }, h('h3', null, 'Octo'), activeStatus(data, t)),
           data.error && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
           h('div', { className: 'dsho-tools' },
@@ -241,7 +268,8 @@ window.__ModuleLoader__.load({
           !data.status && !data.error && hint(t('loading')),
           visible.length ? h('ul', { className: 'dsho-list' }, ...visible.map(({ row, kind, title }) => {
             const issue = row.state === 'review' && issueLabel(row.issue, t)
-            const detail = [kind, row.scope && t('inherited'), issue].filter(Boolean).join(' · ')
+            const detail = [kind, data.accounts?.length > 1 && row.accountLabel, row.scope && t('inherited'),
+              row.historical && t('previousSession'), issue].filter(Boolean).join(' · ')
             return h('li', { key: row.id },
               h('button', { type: 'button', className: 'dsho-row', disabled: !!opening, title,
                 'aria-current': sessions.byId[row.id]?.retainedBy?.mainView ? 'true' : undefined,
@@ -258,42 +286,41 @@ window.__ModuleLoader__.load({
             note: t(entries.length ? 'noResultsNote' : 'emptyNote') }))
       }
 
-      function Account({ data, t, showRules }) {
-        const { config, counts = [] } = data
-        if (!config) return data.status
-          ? h(Empty, { title: t('notConfigured'), note: t('deployHint') })
-          : hint(t('loading'))
-        const facts = [['botId', config.botUid], ['space', config.spaceId], ['endpoint', config.apiBase],
-          ['directory', config.cwd], ['transport', t(config.transport)], ['credential', t('masked')]]
-        return h('div', { className: 'dsho-panel' },
-          h('section', { className: 'dsho-card' },
-            h('div', { className: 'dsho-account' },
-              h('div', { className: 'dsho-identity' }, h('span', { className: 'dsho-emblem' }, mark()),
-                h('div', null, h('h3', null, 'Octo Bot'), hint(t('serverManaged')))),
-              h(Button, { variant: 'outline', size: 'sm', onClick: showRules }, t('rules'))),
-            h('details', { className: 'dsho-details' }, h('summary', null, t('details')),
-              h('dl', { className: 'dsho-facts' }, ...facts.map(([key, value]) =>
-                h('div', { key }, h('dt', null, t(key)), h('dd', null, value)))))),
-          h('section', { className: 'dsho-card' }, h('h3', null, t('processed')), hint(t('queueNote')),
-            h('div', { className: 'dsho-counts' }, ...processingStates
-              .map(state => counts.find(row => row.state === state)).filter(Boolean)
-              .map(row => h('span', { key: row.state }, t(row.state), ' ', row.total))),
-            !counts.length && hint(t('noActivity'))))
+      let accountModule
+      function Account({ data, current, choose, t }) {
+        const [View, setView] = useState(null)
+        const [failed, setFailed] = useState(false)
+        const load = () => {
+          accountModule ??= import(new URL(path + '/account-view.js', document.baseURI).href)
+            .then(module => module.createAccountView(React, primitives, {
+              request: api, label: (key, lang) => tFor(lang)(key),
+              status: (key, lang) => activeStatus({ status: key }, tFor(lang)),
+            }))
+          return accountModule
+        }
+        useEffect(() => {
+          let cancelled = false
+          load().then(view => { if (!cancelled) setView(() => view) })
+            .catch(() => { if (!cancelled) setFailed(true) })
+          return () => { cancelled = true }
+        }, [])
+        return failed ? h(ErrorNotice, { t, message: t('unavailable') })
+          : View ? h(View, { data, current, choose, lang: locale()?.startsWith?.('zh') ? 'zh' : 'en',
+            publish: replaceSnapshot, refresh }) : hint(t('loading'))
       }
 
       const choices = {
-        senderPolicy: ['sender', [['octo', 'senderAuto'], ['allowlist', 'senderList']]],
         channelPolicy: ['routes', [['joined', 'routesAuto'], ['allowlist', 'routesList']]],
         mentionPolicy: ['mention', [['required', 'requireMention'], ['octo', 'followMention']]],
         threadRuleMode: ['threadRule', [['thread-only', 'threadOnly'], ['inherit-group', 'threadInherit']]],
         progress: ['progress', [['auto', 'card'], ['typing', 'typing'], ['off', 'off']]],
       }
-      const listKeys = ['allowedUids', 'allowedGroupIds', 'allowedThreadIds']
+      const listKeys = ['allowedGroupIds', 'allowedThreadIds']
       function initialDraft(config) {
         return { ...Object.fromEntries(Object.keys(choices).map(key => [key, config[key]])),
           ...Object.fromEntries(listKeys.map(key => [key, config[key].join('\n')])), timeout: config.timeoutMs / 1000 }
       }
-      function Config({ config, revision, t }) {
+      function Config({ config, revision, accountId, t }) {
         const [draft, setDraft] = useState(() => initialDraft(config))
         const [feedback, setFeedback] = useState(null)
         const [saving, setSaving] = useState(false)
@@ -322,16 +349,16 @@ window.__ModuleLoader__.load({
           try {
             const settings = Object.fromEntries(Object.keys(choices).map(k => [k, draft[k]]))
             for (const key of listKeys) {
-              const inactive = key === 'allowedUids' ? draft.senderPolicy === 'octo' : draft.channelPolicy === 'joined'
+              const inactive = draft.channelPolicy === 'joined'
               settings[key] = inactive ? [] : [...new Set(draft[key].split('\n').map(x => x.trim()).filter(Boolean))]
             }
             settings.timeoutMs = Math.round(Number(draft.timeout) * 1000)
-            const next = await api('/settings', { method: 'PUT', headers: {
+            const next = await api(accountId ? '/accounts/' + accountId + '/settings' : '/settings', { method: 'PUT', headers: {
               'Content-Type': 'application/json', 'x-dsh-octo-client': '1',
             }, body: JSON.stringify({ settings, revision: base.current }) })
             revisionEpoch++
             base.current = next.revision; setDraft(initialDraft(next.config)); setDirty(false)
-            publish({ ...snapshot, ...next }); setFeedback(['status', 'saved'])
+            publish(next.overview ?? { ...snapshot, ...next }); setFeedback(['status', 'saved'])
           } catch (error) {
             setFeedback(['alert', t(error.message) ? error.message : 'saveError'])
             if (error.message === 'settings_changed') refresh()
@@ -339,8 +366,7 @@ window.__ModuleLoader__.load({
         }
         const stale = dirty && base.current !== revision
         return h('form', { className: 'dsho-form', onSubmit: save, 'aria-label': t('rules') },
-          card('permission', 'permissionHint', select('senderPolicy'), select('channelPolicy'),
-            draft.senderPolicy === 'allowlist' && multi('allowedUids', 'users'),
+          card('permission', 'permissionHint', select('channelPolicy'),
             draft.channelPolicy === 'allowlist' && multi('allowedGroupIds', 'groups'),
             draft.channelPolicy === 'allowlist' && multi('allowedThreadIds', 'threads', 'threadFormat')),
           card('triggers', 'triggersHint', select('mentionPolicy', config.transport !== 'websocket' && 'requiresWebSocket'),
@@ -360,18 +386,27 @@ window.__ModuleLoader__.load({
         const t = useT()
         const data = useSyncExternalStore(subscribe, read)
         const [page, setPage] = useState('account')
+        const [selected, setSelected] = useState('')
+        const accounts = data.accounts ?? []
+        const current = accounts.find(account => account.id === selected) ?? accounts[0]
         const sections = ['account', 'rules', 'sessions']
         const panel = (key, content) => h('div', { id: 'dsho-panel-' + key, role: 'tabpanel',
           'aria-labelledby': 'dsho-tab-' + key, hidden: page !== key, key }, content)
         return h('div', { className: 'dsho-root', 'data-octo-settings': true },
-          h('header', { className: 'dsho-head' }, h('div', null, h('h2', null, t('settings')), hint(t('subtitle'))), activeStatus(data, t)),
+          h('header', { className: 'dsho-head' }, h('div', null, h('h2', null, t('settings')), hint(t('subtitle'))),
+            activeStatus(current ?? data, t)),
           h(SegmentedTabs, { className: 'dsho-nav', label: t('nav'), value: page, onChange: setPage,
             items: sections.map(key => ({ value: key, label: t(key), id: 'dsho-tab-' + key, panelId: 'dsho-panel-' + key })) }),
           data.error && page !== 'sessions' && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
-          panel('account', h(Account, { data, t, showRules: () => setPage('rules') })),
+          panel('account', h(Account, { data, t, current, choose: setSelected })),
           panel('rules',
-            data.config ? h(Config, { config: data.config, revision: data.revision, t })
-              : h(Empty, { title: t('notConfigured'), note: t('deployHint') })),
+            h('div', { className: 'dsho-panel' },
+              accounts.length > 1 && h('div', { className: 'dsho-field' },
+                h('label', { htmlFor: 'dsho-select-account' }, t('selectedBot')),
+                h('select', { id: 'dsho-select-account', value: current?.id ?? '', onChange: e => setSelected(e.target.value) },
+                  ...accounts.map(account => h('option', { key: account.id, value: account.id }, account.label)))),
+              current?.config ? h(Config, { key: current.id, config: current.config, revision: current.revision, accountId: current.id, t })
+                : h(Empty, { title: t('notConfigured'), note: t('deployHint') }))),
           panel('sessions', page === 'sessions' && h(ChannelList, { close })))
       }
       function ChannelShortcut({ wide }) {

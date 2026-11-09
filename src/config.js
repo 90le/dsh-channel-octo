@@ -3,7 +3,8 @@ import { isAbsolute, join } from 'node:path'
 import { statSync } from 'node:fs'
 import { ruleScope } from './rules.js'
 
-const validUid = (s) => typeof s === 'string' && /^[A-Za-z0-9_.:@-]{1,128}$/.test(s)
+export const validUid = (s) => typeof s === 'string' && /^[A-Za-z0-9_.:@-]{1,128}$/.test(s)
+export const validToken = (s) => typeof s === 'string' && /^(app|bf)_[A-Za-z0-9_-]{1,512}$/.test(s)
 
 function scopeList(value, type) {
   if (value === undefined) return new Set()
@@ -13,14 +14,22 @@ function scopeList(value, type) {
   return new Set(value)
 }
 
-export function resolveConfig(config, env = process.env) {
-  const url = new URL(config.apiBase)
+export function apiEndpoint(input) {
+  const url = new URL(input)
   if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
     throw new Error('api_base_must_be_https')
   }
-  const apiBase = url.href.replace(/\/+$/, '')
+  return url.href.replace(/\/+$/, '')
+}
+
+export function privateStateDir(config, env = process.env) {
+  return config.stateDir ?? join(env.DSH_HOME ?? join(homedir(), '.dsh'), 'dsh-channel-octo')
+}
+
+export function resolveConfig(config, env = process.env) {
+  const apiBase = apiEndpoint(config.apiBase)
   const token = env.DSH_OCTO_BOT_TOKEN
-  if (!/^(app|bf)_[A-Za-z0-9_-]+$/.test(token ?? '')) throw new Error('missing_bot_token')
+  if (!validToken(token)) throw new Error('missing_bot_token')
   const groups = scopeList(config.allowedGroupIds, 2)
   const threads = scopeList(config.allowedThreadIds, 5)
   const senderPolicy = config.senderPolicy ?? 'allowlist'
@@ -43,7 +52,7 @@ export function resolveConfig(config, env = process.env) {
   if (!Array.isArray(allowedUids) || allowedUids.length > 20
     || (senderPolicy === 'allowlist' ? !allowedUids.length : allowedUids.length > 0)
     || allowedUids.some(uid => !validUid(uid) || uid === config.botUid)) throw new Error('invalid_user_allowlist')
-  const stateDir = config.stateDir ?? join(env.DSH_HOME ?? join(homedir(), '.dsh'), 'dsh-channel-octo')
+  const stateDir = privateStateDir(config, env)
   if (!isAbsolute(stateDir) || typeof config.cwd !== 'string' || !isAbsolute(config.cwd) || !statSync(config.cwd).isDirectory()) {
     throw new Error('invalid_working_or_state_directory')
   }
@@ -57,5 +66,7 @@ export function resolveConfig(config, env = process.env) {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
     botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
     senderPolicy, channelPolicy, mentionPolicy, transport, progress,
+    mediaDownloadOrigins: config.mediaDownloadOrigins, mediaUploadOrigins: config.mediaUploadOrigins,
+    mediaMaxBytes: config.mediaMaxBytes, mediaTimeoutMs: config.mediaTimeoutMs,
   }
 }

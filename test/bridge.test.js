@@ -30,7 +30,7 @@ test('HTTP round trip persists before ACK, gates inputs, preserves IDs, and dedu
   t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }) })
   const captured = []
   const errors = []
-  let runs = 0
+  let runs = 0, polls = 0
   const e = event()
   const wire = JSON.stringify({ status: 1, results: [
     e,
@@ -56,7 +56,7 @@ test('HTTP round trip persists before ACK, gates inputs, preserves IDs, and dedu
       }
       assert.equal(req.headers.authorization, 'Bearer app_fixture')
       if (req.url === '/api/v1/bot/events') {
-        assert.deepEqual(body, { event_id: 0, limit: 20, wait: 15 })
+        assert.deepEqual(body, { event_id: polls++ ? Number(e.event_id) : 0, limit: 20, wait: 15 })
         res.end(wire)
       } else if (req.url.endsWith('/ack')) {
         if (req.url.includes(e.event_id)) {
@@ -90,7 +90,7 @@ test('HTTP round trip persists before ACK, gates inputs, preserves IDs, and dedu
   await worker.ingest(signal)
   assert.equal(next(store), undefined)
   assert.equal(runs, 1)
-  assert.equal(captured.filter(([route]) => route.endsWith('/ack')).length, 12)
+  assert.equal(captured.filter(([route]) => route.endsWith('/ack')).length, 6)
   assert.equal(captured.filter(([route]) => route.endsWith('/sendMessage')).length, 1)
   const row = store.db.prepare('SELECT state,result_id,input,reply FROM jobs').get()
   assert.deepEqual({ ...row }, { state: 'sent', result_id: '9223372036854775807', input: '', reply: null })

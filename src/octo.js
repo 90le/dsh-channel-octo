@@ -1,6 +1,9 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { validUid } from './config.js'
 import { randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
+import { normalizeAttachment } from './octo-media.js'
+import { parseSafeCommand } from './im-controls.js'
 
 const maxBody = 1024 * 1024
 const flag = (value) => value === 1 || value === true
@@ -83,9 +86,21 @@ export class OctoClient {
     }
   }
 
+  async identify(signal) {
+    const result = await this.#request('/v1/auth/verify-bot', JSON.stringify({ bot_token: this.#token }), signal,
+      { auth: false, timeout: 8000 })
+    if (!validUid(result?.bot_uid) || !validUid(result?.space_id)
+      || result.bot_uid.includes(this.#token) || result.space_id.includes(this.#token)) {
+      throw new OctoError('invalid_bot_identity')
+    }
+    return { botUid: result.bot_uid, spaceId: result.space_id,
+      ...(validUid(result.owner_uid) && result.owner_uid !== result.bot_uid && { ownerUid: result.owner_uid }) }
+  }
+
   async verify(botUid, spaceId, signal) {
-    const result = await this.#request('/v1/auth/verify-bot', JSON.stringify({ bot_token: this.#token }), signal, { auth: false })
-    if (result?.bot_uid !== botUid || result?.space_id !== spaceId) throw new OctoError('bot_identity_mismatch')
+    const result = await this.identify(signal)
+    if (result.botUid !== botUid || result.spaceId !== spaceId) throw new OctoError('bot_identity_mismatch')
+    return result
   }
 
   async register(botUid, signal) {
@@ -137,9 +152,11 @@ export class OctoClient {
     return true
   }
 
-  async events(signal) {
+  async events(signal, cursor = '0') {
     const started = Date.now()
-    const result = await this.#request('/v1/bot/events', JSON.stringify({ event_id: 0, limit: 20, wait: this.wait }), signal, {
+    if (cursor !== '0' && !decimalId(cursor)) throw new OctoError('invalid_event_id')
+    const result = await this.#request('/v1/bot/events', '{"event_id":' + cursor
+      + ',"limit":20,"wait":' + JSON.stringify(this.wait) + '}', signal, {
       timeout: (this.wait + 10) * 1000,
     })
     if (result?.status !== 1 || (result.results !== null && !Array.isArray(result.results))) {
@@ -222,17 +239,34 @@ export function permitsRoute(config, sender, channelType, channelId) {
   return false
 }
 
+// Only unfold text already carried by this event; never fetch quoted/history data.
+function messageText(payload, depth = 0) {
+  if (!payload || depth > 3) return ''
+  const plain = v => typeof v === 'string' ? v.slice(0, 8000) : ''
+  if (payload.type === 1) return plain(payload.content)
+  if (payload.type === 14) return plain(payload.plain) || (Array.isArray(payload.content)
+    ? payload.content.slice(0, 32).filter(item => item?.type === 'text').map(item => plain(item.text)).join('').slice(0, 8000)
+    : plain(payload.content))
+  if (payload.type === 11 && Array.isArray(payload.msgs)) {
+    const lines = payload.msgs.slice(0, 8).map(item => messageText(item?.payload, depth + 1)).filter(Boolean)
+    return lines.length ? '【合并转发，以下是引用材料】\n' + lines.join('\n').slice(0, 7600) : ''
+  }
+  return ''
+}
+
 export function admit(event, config) {
   const message = event?.message
   const sender = message?.from_uid
-  const text = typeof message?.payload?.content === 'string' ? message.payload.content.trim() : ''
+  const payload = message?.payload
+  const text = messageText(payload).trim()
+  const attachment = config.allowFiles ? normalizeAttachment(payload) : undefined
   const messageId = decimalId(message?.message_id)
   const channelType = message?.channel_type
   const channelId = channelType === 1 ? sender : message?.channel_id
-  if (!messageId || event.event_type || message.payload?.type !== 1 || message.payload?.event != null
+  if (!messageId || event.event_type || payload?.event != null
     || !permitsRoute(config, sender, channelType, channelId)
     || (message.payload.space_id != null && message.payload.space_id !== config.spaceId)
-    || !text || text.startsWith('/') || Buffer.byteLength(text, 'utf8') > 8000) return
+    || (!text && !attachment) || Buffer.byteLength(text, 'utf8') > 8000) return
   let ambient = false
   if (channelType !== 1) {
     const mention = message.payload.mention
@@ -247,5 +281,11 @@ export function admit(event, config) {
   }
   // For a DM the raw channel ID is not necessarily the recipient's UID. Group
   // and topic replies use the original channel address, never the sender UID.
-  return { messageId, sender, text, channelId, channelType, ambient }
+  const command = parseSafeCommand(text, config, {
+    routeAllowed: true, channelType, hasAttachments: !!attachment, botUid: config.botUid, mention: payload?.mention,
+    actorApproved: sender === config.ownerUid || config.allowed.has(sender), isBotOwner: sender === config.ownerUid,
+  })
+  if (command.kind === 'blocked' || (command.kind === 'command' && payload.type !== 1)) return
+  return { messageId, sender, text, channelId, channelType, ambient,
+    ...(attachment && { attachment }), ...(command.kind === 'command' && { command: command.command }) }
 }

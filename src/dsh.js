@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { ruleContext } from './rules.js'
+import { prepareInput } from './dsh-media.js'
 
-const preset = 'octo-text'
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
-  'missing_scoped_tool_controls', 'missing_scoped_rule_context', 'shared_turn_not_forwarded', 'no_confirmed_final_text'])
+  'missing_scoped_tool_controls', 'missing_scoped_rule_context', 'missing_host_permission', 'session_requires_owned_writer',
+  'shared_turn_not_forwarded', 'no_confirmed_final_text', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
 
 function wait(promise, signal) {
   return new Promise((resolve, reject) => {
@@ -17,34 +18,56 @@ function wait(promise, signal) {
 
 export class DshHost {
   #borrowed = new WeakMap()
-  constructor(ctx, cwd, timeoutMs) {
-    Object.assign(this, { ctx, cwd, timeoutMs })
+  constructor(ctx, cwd, timeoutMs, profile = {}) {
+    Object.assign(this, { ctx, cwd, timeoutMs, profile })
   }
 
-  async run(session, text, onCreated, lifetime, rules, onStage = () => {}, timeoutMs = this.timeoutMs) {
+  async run(session, text, onCreated, lifetime, rules, onStage = () => {}, timeoutMs = this.timeoutMs, toolsAllowed = false, extras = {}) {
     const signal = AbortSignal.any([lifetime, AbortSignal.timeout(timeoutMs)])
     signal.throwIfAborted()
     const ctx = this.ctx
-    const selected = ctx.agentDefaultModel.currentSelection()
+    const selected = this.profile.provider ? this.profile : ctx.agentDefaultModel.currentSelection()
     if (!selected?.provider || !selected?.model) throw new Error('missing_host_model')
-    const agentOptions = { provider: selected.provider, model: selected.model }
+    const agentOptions = { provider: selected.provider, model: selected.model,
+      ...(this.profile.provider && selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) }
+    const permission = toolsAllowed && this.profile.permission !== 'text-only' ? this.profile.permission : null
+    const chosen = this.profile.agentPreset ?? 'octo-text'
+    const preset = permission && chosen === 'octo-text' ? 'standard' : chosen
+    const applyPermission = (agent) => {
+      if (!permission) return
+      const service = ctx.get?.('permissionPresets')
+      if (!service?.set || !agent?.session) throw new Error('missing_host_permission')
+      service.set(agent.session, permission)
+    }
     const controls = (scoped, cleanup) => {
-      const tools = scoped.get('tools')
-      if (!tools?.restrict || !tools?.guard) throw new Error('missing_scoped_tool_controls')
-      cleanup.push(tools.restrict({ allow: [] }))
-      cleanup.push(tools.guard(() => denial))
-      if (rules) {
+      if (!permission) {
+        const tools = scoped.get('tools')
+        if (!tools?.restrict || !tools?.guard) throw new Error('missing_scoped_tool_controls')
+        cleanup.push(tools.restrict({ allow: [] }))
+        cleanup.push(tools.guard(() => denial))
+        // The tool restriction masks inherited definitions; a host plugin may
+        // still mount scope-local definitions. Strip the assembled model schema
+        // in this scope as well, without changing any other Web/IM agent.
+        if (typeof scoped.on === 'function') cleanup.push(scoped.on('system-prompt/assemble',
+          async (_assembly, _context, next) => ({ ...await next(), tools: [] })))
+      }
+      if (rules || extras.authorCard) {
         const prompt = scoped.get('systemPrompt')
         if (typeof prompt?.context !== 'function') throw new Error('missing_scoped_rule_context')
         // DSH projects runtime facts into a user-role snapshot, not the system role.
-        cleanup.push(prompt.context({
+        if (rules) cleanup.push(prompt.context({
           name: 'dsh-channel-octo.channel-rules',
           order: 50, required: true, interpolate: false, text: ruleContext(rules),
         }))
+        if (extras.authorCard) cleanup.push(prompt.context({
+          name: 'dsh-channel-octo.card-format', order: 51, interpolate: false,
+          text: 'The Octo user requested a card. For a display card, respond with only a fenced octo-card JSON block. Use the keys title and text (title <= 160 UTF-8 bytes, text <= 2048 UTF-8 bytes). Use literal text only. Do not include commands, URLs or actions.',
+        }))
       }
     }
-    const setup = async (scoped) => {
+    const setup = async (scoped, agent) => {
       await ctx.agentPresets.mount(scoped, preset)
+      applyPermission(agent)
       controls(scoped, []) // Automatically released with the owned agent scope.
     }
     const find = () => ctx.agents.get?.(session.session_id)
@@ -68,6 +91,7 @@ export class DshHost {
         }
       }
       if (!handle) {
+        if (permission) throw new Error('session_requires_owned_writer')
         if (agent.session?.header?.cwd !== this.cwd || ctx.agentPresets.composedPreset?.(agent.ctx) !== preset) {
           throw new Error('session_preset_conflict')
         }
@@ -75,7 +99,8 @@ export class DshHost {
         const previous = this.#borrowed.get(agent)
         if (previous) await wait(previous, signal)
         await wait(agent.whenIdle(), signal)
-        if (find() !== agent || agent.status !== 'idle' || agent.inbox?.hasPending) throw new Error('session_busy')
+        if (find() !== agent || agent.status !== 'idle' || agent.inbox?.hasPending ||
+          agent.inbox?.nextTurn?.length || agent.inbox?.nextStep?.length) throw new Error('session_busy')
         controls(agent.ctx, cleanup)
         onStage('reused')
       }
@@ -86,7 +111,8 @@ export class DshHost {
       }
       signal.throwIfAborted()
       failure = 'session_turn_failed'
-      const reply = await this.#turn(agent, text, signal, onStage)
+      const content = await prepareInput(ctx, agent, text, extras.attachments, signal)
+      const reply = await this.#turn(agent, content, signal, onStage, permission ? extras.onDeliverables : undefined, handle ? extras.onSteer : undefined)
       failure = 'session_flush_failed'
       await ctx.sessions.flush(agent.session)
       return reply
@@ -108,10 +134,11 @@ export class DshHost {
     }
   }
 
-  async #turn(agent, text, signal, onStage) {
+  async #turn(agent, content, signal, onStage, onDeliverables, onSteer) {
     const requestId = randomUUID()
-    let claimedTurn, finalText = ''
-    const otherTurns = new Set()
+    let claimedTurn, attempt, finalText = '', open = true
+    const steering = new Map()
+    const otherTurns = new Set(), deliverables = new Set()
     const dispose = []
     try {
       return await new Promise((resolve, reject) => {
@@ -121,11 +148,21 @@ export class DshHost {
         const matches = (payload) => payload?.agent?.id === agent.id && payload?.message?.id === requestId
         dispose.push(this.ctx.on('agent/inbox/claimed', (payload) => {
           if (payload?.agent?.id !== agent.id || !Number.isSafeInteger(payload.turn)) return
-          if (matches(payload)) { claimedTurn = payload.turn; onStage('answering') }
-          else if (payload?.message?.source?.kind !== 'runtime-context') otherTurns.add(payload.turn)
+          if (matches(payload)) { claimedTurn = payload.turn; onStage('running') }
+          else if (payload.turn === claimedTurn && steering.has(payload?.message?.id)) {
+            finalText = ''
+            steering.get(payload.message.id).claimed = true
+          } else if (payload?.message?.source?.kind !== 'runtime-context') otherTurns.add(payload.turn)
         }, { global: true }))
         dispose.push(this.ctx.on('agent/inbox/discarded', (payload) => {
           if (matches(payload)) reject(new Error('prompt_discarded'))
+          if (steering.has(payload?.message?.id)) reject(new Error('prompt_discarded'))
+        }, { global: true }))
+        dispose.push(this.ctx.on('agent/assistant-stream', ({ agent: owner, frame } = {}) => {
+          if (owner?.id !== agent.id || claimedTurn === undefined) return
+          if (frame?.type === 'start' && frame.turn === claimedTurn) attempt = frame.attemptId
+          if (attempt !== undefined && frame?.type === 'chunk' && frame.attemptId === attempt
+            && frame.chunk?.type === 'text-delta' && (frame.chunk.text || frame.chunk.delta)) onStage('responding')
         }, { global: true }))
         dispose.push(this.ctx.on('session/event', (session, event) => {
           if (session?.id !== agent.id || claimedTurn === undefined || event?.data?.turn !== claimedTurn) return
@@ -135,19 +172,46 @@ export class DshHost {
               ? parts.filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text).join('')
               : ''
             if (text.trim()) finalText = text
+          } else if (event.type === 'deliverables/presented' && onDeliverables) {
+            for (const file of (Array.isArray(event.data.files) ? event.data.files.slice(0, 8) : [])) {
+              if (typeof file?.path === 'string' && deliverables.size < 5) deliverables.add(file.path)
+            }
           } else if (event.type === 'turn/end') {
-            if (otherTurns.has(claimedTurn)) reject(new Error('shared_turn_not_forwarded'))
-            else if (event.data.reason?.kind === 'completed' && finalText.trim()) resolve(finalText)
+            open = false
+            if ([...steering.values()].some(item => !item.claimed)) reject(new Error('prompt_discarded'))
+            else if (otherTurns.has(claimedTurn)) reject(new Error('shared_turn_not_forwarded'))
+            else if (event.data.reason?.kind === 'completed' && (finalText.trim() || deliverables.size)) {
+              if (deliverables.size) onDeliverables([...deliverables])
+              resolve(finalText.trim() ? finalText : '已生成文件。')
+            }
             else reject(new Error('no_confirmed_final_text'))
           }
         }, { global: true }))
+        if (onSteer && typeof agent.steer === 'function') {
+          onSteer((text, reserve) => {
+            if (!open || signal.aborted || claimedTurn === undefined || agent.status !== 'running' || steering.size >= 4) return false
+            const id = randomUUID()
+            reserve()
+            steering.set(id, { claimed: false })
+            try {
+              agent.steer({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user', rpcId: id } })
+              return true
+            } catch {
+              open = false
+              reject(new Error('prompt_discarded'))
+              return false
+            }
+          })
+        }
         signal.throwIfAborted()
         agent.followup({
-          id: requestId, role: 'user', content: [{ type: 'text', text }],
+          id: requestId, role: 'user', content,
           source: { kind: 'user', rpcId: requestId },
         })
       })
     } finally {
+      open = false
+      onSteer?.(undefined)
       for (const cleanup of dispose.reverse()) cleanup()
     }
   }

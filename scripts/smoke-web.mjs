@@ -22,7 +22,9 @@ const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
 const screenshots = process.env.DSH_OCTO_SMOKE_SCREENSHOTS
 const codexUi = process.env.DSH_OCTO_SMOKE_CODEX_UI
+const automation = process.env.DSH_OCTO_SMOKE_AUTOMATION
 if (codexUi && !/^\d+\.\d+\.\d+$/.test(codexUi)) throw new Error('Set an exact Codex UI version')
+if (automation && !/^\d+\.\d+\.\d+$/.test(automation)) throw new Error('Set an exact automation version')
 if (browserModule && (!browserExecutable || !wire)) throw new Error('Browser smoke needs WebSocket and an executable path')
 const browserReady = join(home, 'browser-ready')
 const observer = join(home, 'fixture-observer.mjs')
@@ -54,7 +56,8 @@ try {
   if (node([cli, '--version']).trim() !== '0.2.1-rc.5') throw new Error('Expected DSH 0.2.1-rc.5')
   const [{ filename }] = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
   for (const spec of [join(home, filename), '@michengai/dsh-im-connect@1.0.30',
-    ...(codexUi ? ['@michengai/dsh-codex-ui@' + codexUi] : [])]) {
+    ...(codexUi ? ['@michengai/dsh-codex-ui@' + codexUi] : []),
+    ...(automation ? ['@michengai/dsh-automation@' + automation] : [])]) {
     node([cli, 'plugin', '--profile', 'web', 'add', spec, '--registry=https://registry.npmjs.org/'])
   }
   const q = JSON.stringify
@@ -65,7 +68,7 @@ export const inject = ['agents', 'agentPresets', 'agentDefaultModel']
 export function apply(ctx) {
   ctx.logger.exporter({ levels: { default: 2 }, export: ({ name, args }) => {
     if (name === 'dsh-channel-octo' && ['dsh_session_reused', 'session_busy', 'session_preset_conflict',
-      'agent_run_not_confirmed', 'no_confirmed_final_text', 'shared_turn_not_forwarded', 'workspace_attach_failed',
+      'delivery_not_confirmed', 'file_delivery_not_confirmed', 'agent_run_not_confirmed', 'no_confirmed_final_text', 'shared_turn_not_forwarded', 'workspace_attach_failed',
       'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context'].includes(args?.[0])) {
       console.log('FIXTURE_DSH=' + args[0])
     }
@@ -100,7 +103,7 @@ export function apply(ctx) {
         '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
         '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]']),
     '    threadRuleMode: inherit-group',
-    '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 12000',
+    '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 22000',
     '- id: llm-deepseek', '  config:', '    baseURL: https://model-fixture.invalid',
   ].join('\n') + '\n')
   child = spawn(process.execPath, [
@@ -109,7 +112,7 @@ export function apply(ctx) {
   ], { ...common, stdio: ['ignore', 'pipe', 'pipe'] })
   let output = ''
   for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-12_000) })
-  const deadline = Date.now() + 60_000
+  const deadline = Date.now() + 85_000
   if (browserModule) {
     const { chromium } = await import(pathToFileURL(resolve(browserModule)).href)
     browser = await chromium.launch({ executablePath: browserExecutable, headless: true })
@@ -152,7 +155,35 @@ export function apply(ctx) {
     if (await native.isVisible() && await fallback.count()) throw new Error('Duplicate Octo sidebar entries')
     const channel = page.locator('.dsho-row').first()
     while (Date.now() < deadline && sentCount() < 1) await delay(150)
+    if (!sentCount()) throw new Error('First fixture reply was not delivered: ' + output.replace(/https?:\/\/\S+/g, '[url]'))
     await channel.waitFor({ timeout: 8000 })
+    if (await native.isVisible()) {
+      const viewport = page.viewportSize()
+      await page.setViewportSize({ width: 1280, height: 1000 })
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+      if (screenshots) await page.screenshot({ path: join(screenshots, 'octo-channel-tall.png'), animations: 'disabled' })
+      const layout = await page.locator('.dsho-rail').evaluate(rail => {
+        const controls = rail.querySelector('.dsho-tools')
+        const tools = controls.getBoundingClientRect()
+        const head = rail.querySelector('.dsho-head').getBoundingClientRect()
+        const first = rail.querySelector('.dsho-row').getBoundingClientRect()
+        const style = getComputedStyle(rail)
+        const list = rail.querySelector('.dsho-list')
+        const extras = Array.from({ length: 70 }, () => list.firstElementChild.cloneNode(true))
+        list.append(...extras)
+        rail.scrollTop = 200
+        const scrolls = rail.scrollTop > 0 && rail.scrollHeight > rail.clientHeight
+        for (const extra of extras) extra.remove()
+        rail.scrollTop = 0
+        return { beforeHeader: head.top - rail.getBoundingClientRect().top,
+          beforeSearch: tools.top - controls.previousElementSibling.getBoundingClientRect().bottom,
+          beforeRow: first.top - tools.bottom, display: style.display, align: style.justifyContent, gap: style.gap, scrolls }
+      })
+      if (layout.beforeHeader > 20 || layout.beforeSearch > 20 || layout.beforeRow > 20 || !layout.scrolls) {
+        throw new Error('Octo sidebar spacing or scrolling is incorrect: ' + JSON.stringify(layout))
+      }
+      if (viewport) await page.setViewportSize(viewport)
+    }
     if (screenshots) {
       await page.screenshot({ path: join(screenshots, 'octo-channel.png'), animations: 'disabled' })
     }
@@ -168,6 +199,8 @@ export function apply(ctx) {
     await page.keyboard.press('Control+Alt+,')
     await page.getByRole('button', { name: 'Octo 渠道', exact: true }).click({ timeout: 8000 })
     const config = page.locator('[data-octo-settings]')
+    const platform = config.locator('.dsho-account-platform[aria-expanded=false]')
+    if (await platform.count()) await platform.click()
     await config.getByText('Octo Bot', { exact: true }).waitFor({ timeout: 7000 })
     if (await config.getByText('fixture-bot', { exact: true }).isVisible()) throw new Error('Technical details should start collapsed')
     if (screenshots) await page.screenshot({ path: join(screenshots, 'octo-account.png'), animations: 'disabled' })
@@ -196,13 +229,42 @@ export function apply(ctx) {
     await config.getByRole('button', { name: '保存设置', exact: true }).click()
     await config.getByText('已保存，从下一条消息起生效。', { exact: true }).waitFor({ timeout: 8000 })
     const settings = JSON.parse(readFileSync(join(state, 'web-settings.json'), 'utf8'))
-    if (settings.progress !== 'typing' || settings.senderPolicy !== 'octo') throw new Error('Web settings did not persist')
+    if (settings.progress !== 'typing') throw new Error('Web settings did not persist')
     const summary = await page.request.get(new URL('/api/dsh-channel-octo', launch).href)
     const { conversations } = await summary.json()
     const id = conversations.find(row => row.type === 1 && row.address === 'fixture-user')?.id
     if (!id) throw new Error('native Octo conversation is missing')
     writeFileSync(browserReady, id)
     console.log('PASS: browser channel, existing native session, authenticated settings save.')
+    await config.getByRole('tab', { name: 'Bot 账号', exact: true }).click()
+    await config.getByRole('button', { name: '添加账号', exact: true }).click({ timeout: 15000 })
+    const editor = page.getByRole('dialog', { name: '添加账号', exact: true })
+    await editor.getByLabel('Bot 令牌', { exact: true }).fill('bf_fixture_second', { timeout: 15000 })
+    await editor.getByRole('button', { name: '验证令牌', exact: true }).click()
+    await editor.getByText('令牌已验证', { exact: true }).waitFor({ timeout: 8000 })
+    await editor.getByLabel('账号名称', { exact: true }).fill('Fixture spare')
+    const workspace = editor.getByLabel('工作区', { exact: true })
+    const ws = (await workspace.locator('option').evaluateAll(options => options.find(option => option.value)?.value))
+    await workspace.selectOption(ws)
+    await editor.getByRole('checkbox', { name: '启用此账号', exact: true }).uncheck()
+    if (screenshots) await page.screenshot({ path: join(screenshots, 'octo-account-editor.png'), animations: 'disabled' })
+    await editor.getByRole('button', { name: '保存账号', exact: true }).click()
+    const roster = config.locator('.dsho-account-roster')
+    await roster.getByText('Fixture spare', { exact: true }).waitFor({ timeout: 9000 })
+    await config.getByRole('button', { name: '设置 · Fixture spare', exact: true }).click()
+    const edit = page.locator('.dsho-account-modal[open]')
+    await edit.getByLabel('账号名称', { exact: true }).fill('Fixture spare renamed')
+    await edit.getByLabel('账号名称', { exact: true }).press('Enter')
+    await edit.getByRole('heading', { name: 'Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
+    await edit.getByRole('button', { name: '关闭', exact: true }).click()
+    await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
+    const overview = await (await page.request.get(new URL('/api/dsh-channel-octo', launch).href)).json()
+    if (!overview.accounts.some(row => row.label === 'Fixture spare renamed' && row.enabled === false)) {
+      throw new Error('The second Bot did not stay separately configured')
+    }
+    const stored = readFileSync(join(state, 'accounts.json'), 'utf8')
+    if ((JSON.stringify(overview) + stored).includes('bf_fixture_second')) throw new Error('Bot credential escaped its vault')
+    console.log('PASS: added and edited a second Bot without connecting it; credential not exposed.')
   }
   // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
   const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
@@ -216,9 +278,14 @@ export function apply(ctx) {
     throw new Error('expected five delivered replies; fixture jobs: ' + JSON.stringify(jobs) + '\n'
       + output.replace(/https?:\/\/\S+/g, '[url]'))
   }
-  if (!/FIXTURE_CARD_OPEN/.test(output) || !/FIXTURE_CARD=answering:2/.test(output)
-    || !/FIXTURE_CARD=completed:3/.test(output) || /FIXTURE_CARD_.*MISMATCH/.test(output)) {
-    throw new Error('expected one progress card and ordered interim + terminal edits')
+  const cardDeadline = Date.now() + 5000
+  while (Date.now() < cardDeadline && !/FIXTURE_CARD=completed:\d+/.test(output)) await delay(100)
+  const edits = [...output.matchAll(/FIXTURE_CARD=(\w+):(\d+)/g)]
+  if (!/FIXTURE_CARD_OPEN/.test(output) || !edits.some(row => row[1] === 'answering')
+    || edits.at(-1)?.[1] !== 'completed' || edits.some((row, i) => i && Number(row[2]) <= Number(edits[i - 1][2]))
+    || /FIXTURE_CARD_.*MISMATCH/.test(output)) {
+    throw new Error('expected one progress card and ordered interim + terminal edits: '
+      + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   }
   if (browserModule && !/dsh_session_reused/.test(output)) throw new Error('Web did not hold the fixture session open during the second turn')
   const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')

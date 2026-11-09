@@ -33,7 +33,11 @@ globalThis.fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : String(input))
   const json = value => Response.json(value)
   if (url.hostname === 'octo-fixture.invalid') {
-    if (url.pathname.endsWith('/verify-bot')) return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space' })
+    if (url.pathname.endsWith('/verify-bot')) {
+      const { bot_token: token } = JSON.parse(init.body)
+      if (token === 'bf_fixture_second') return json({ bot_uid: 'fixture-bot-second', space_id: 'fixture-space' })
+      return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space' })
+    }
     if (url.pathname.endsWith('/register') && peer) {
       return json({ robot_id: 'fixture-bot', im_token: 'fixture-im-secret', ws_url: peer.wsUrl })
     }
@@ -142,10 +146,17 @@ globalThis.fetch = async (input, init) => {
       {type:'message_delta',delta:{stop_reason:'end_turn'},usage:{output_tokens:5}},
       {type:'message_stop'},
     ]
-    if (round === 1) await delay(6400)
-    return new Response(frames.map(f => 'event: ' + f.type + '\ndata: ' + JSON.stringify(f) + '\n\n').join(''), {
-      headers: {'Content-Type':'text/event-stream'},
-    })
+    const encode = items => items.map(f => 'event: ' + f.type + '\ndata: ' + JSON.stringify(f) + '\n\n').join('')
+    const bodyStream = round === 1 ? new ReadableStream({
+      async start(controller) {
+        await delay(4500)
+        controller.enqueue(new TextEncoder().encode(encode(frames.slice(0, 3))))
+        await delay(1600)
+        controller.enqueue(new TextEncoder().encode(encode(frames.slice(3))))
+        controller.close()
+      },
+    }) : encode(frames)
+    return new Response(bodyStream, { headers: {'Content-Type':'text/event-stream'} })
   }
   if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return realFetch(input, init)
   return new Response(null, {status: 503})
