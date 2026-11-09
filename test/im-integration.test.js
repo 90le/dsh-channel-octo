@@ -116,6 +116,7 @@ test('WebSocket sidecar consumes only its own click, persists before ACK and doe
   api.ack = async id => {
     acks.push(id)
     assert.equal(store.hasEvent(id), true)
+    assert.deepEqual(store.pendingCardAcks(), [id])
   }
   await worker.ingest(signal, true)
   await worker.process(store.next(Date.now()), signal)
@@ -124,6 +125,7 @@ test('WebSocket sidecar consumes only its own click, persists before ACK and doe
   assert.equal(responses.length, 1)
   assert.match(responses[0], /B/)
   assert.equal(store.next(Date.now()), undefined)
+  assert.deepEqual(store.pendingCardAcks(), [])
 })
 
 test('agent question accepts an authenticated choice once, and later text is a new message', async t => {
@@ -145,7 +147,12 @@ test('agent question accepts an authenticated choice once, and later text is a n
   }
   const api = new OctoClient(config)
   api.events = async () => [click]
-  api.ack = async () => {}
+  let ackAttempts = 0
+  api.ack = async id => {
+    assert.equal(id, '6')
+    assert.deepEqual(store.pendingCardAcks(), ['6'])
+    if (++ackAttempts === 1) throw new Error('fixture ACK response lost')
+  }
   const worker = new Worker({ api, store, config, log() {}, host: {
     async run(_session, _text, created, _signal, _rules, _progress, _timeout, allowed, extra) {
       assert.equal(allowed, true)
@@ -167,10 +174,15 @@ test('agent question accepts an authenticated choice once, and later text is a n
   await worker.ingest(signal, true)
   assert.equal(answerSeen, undefined)
   click = { ...click, event_id: '6', event_data: { ...click.event_data, operator_uid: 'alice' } }
-  await worker.ingest(signal, true)
+  await assert.rejects(worker.ingest(signal, true), /fixture ACK response lost/)
   await doing
   assert.deepEqual(answerSeen, { answers: [{ id: 'fixture-q', selected: ['Two'] }] })
   assert.equal(store.hasEvent('6'), true)
+  assert.equal(store.hasOpenCard(), false)
+  await worker.flushCardAcks(signal)
+  assert.equal(ackAttempts, 2)
+  assert.deepEqual(store.pendingCardAcks(), [])
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE message_id='card_action:6'").get().n, 1)
   worker.acceptInbound('7', admit(msg('7', { type: 1, content: 'follow-up' }), config))
   assert.equal(store.next(Date.now()).input, 'follow-up')
 })

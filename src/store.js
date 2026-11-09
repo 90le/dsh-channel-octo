@@ -52,6 +52,7 @@ export class Store {
       if (!columns.has('message_seq')) this.db.exec('ALTER TABLE jobs ADD COLUMN message_seq INTEGER')
       this.db.exec('CREATE INDEX IF NOT EXISTS jobs_by_session ON jobs(session_id, seq)')
       this.db.exec(`
+        CREATE TABLE IF NOT EXISTS pending_card_acks (event_id TEXT PRIMARY KEY NOT NULL);
         CREATE INDEX IF NOT EXISTS jobs_by_route
           ON jobs(channel_type, COALESCE(channel_id, sender), seq) WHERE state IN ('queued','ready','running','sending');
         CREATE INDEX IF NOT EXISTS jobs_route_history ON jobs(channel_type, COALESCE(channel_id, sender), seq);
@@ -87,7 +88,25 @@ export class Store {
   }
 
   hasEvent(id) {
-    return !!this.db.prepare('SELECT 1 FROM jobs WHERE message_id=?').get('card_action:' + id)
+    return !!this.db.prepare('SELECT 1 FROM jobs WHERE message_id=? AND event_id=?').get('card_action:' + id, id)
+  }
+
+  queueCardAck(id) {
+    // Never coerce an int64 through Number, or enqueue an ACK without our receipt.
+    if (typeof id !== 'string' || !/^[1-9]\d{0,18}$/.test(id) || BigInt(id) > 9223372036854775807n) {
+      throw new Error('invalid_card_event_id')
+    }
+    if (!this.hasEvent(id)) return false
+    this.db.prepare('INSERT OR IGNORE INTO pending_card_acks (event_id) VALUES (?)').run(id)
+    return true
+  }
+
+  pendingCardAcks() {
+    return this.db.prepare('SELECT event_id FROM pending_card_acks ORDER BY rowid LIMIT 20').all().map(row => row.event_id)
+  }
+
+  cardAcked(id) {
+    this.db.prepare('DELETE FROM pending_card_acks WHERE event_id=?').run(id)
   }
 
   hasOpenCard() {
@@ -122,6 +141,8 @@ export class Store {
       let inserted = false
       if (claimed) inserted = sessionId !== undefined ? this.rememberAnswer(action.eventId, m, sessionId)
         : this.add(action.eventId, m).changes > 0
+      // Claim, local action receipt and retry obligation survive or roll back together.
+      if (inserted) this.queueCardAck(action.eventId)
       this.db.exec('COMMIT')
       return inserted
     } catch (error) {
@@ -132,7 +153,8 @@ export class Store {
 
   steerCandidate(job) {
     return this.db.prepare(`SELECT * FROM jobs WHERE state='queued' AND seq>?
-      AND channel_type=1 AND COALESCE(channel_id,sender)=? ORDER BY seq LIMIT 1`).get(job.seq, job.sender)
+      AND channel_type=? AND COALESCE(channel_id,sender)=? AND sender=? ORDER BY seq LIMIT 1`)
+      .get(job.seq, job.channel_type, job.channel_id ?? job.sender, job.sender)
   }
 
   next(now) {

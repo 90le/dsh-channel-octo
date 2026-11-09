@@ -77,11 +77,11 @@ export class OctoClient {
       : undefined
   }
 
-  async #request(path, body, signal, { timeout = 15_000, auth = true, method } = {}) {
+  async #request(path, body, signal, { timeout = 15_000, auth = true, method, multipart = false } = {}) {
     try {
       const response = await this.fetch(this.base + path, {
         method: method ?? (body === undefined ? 'GET' : 'POST'), redirect: 'manual',
-        headers: { ...(body !== undefined && { 'Content-Type': 'application/json' }), ...(auth && { Authorization: 'Bearer ' + this.#token }) },
+        headers: { ...(body !== undefined && !multipart && { 'Content-Type': 'application/json' }), ...(auth && { Authorization: 'Bearer ' + this.#token }) },
         body, signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
       })
       if (!response.ok) {
@@ -97,6 +97,24 @@ export class OctoClient {
       if (error instanceof OctoError) throw error
       throw new OctoError('transport_or_invalid_response')
     }
+  }
+
+  async transcribe(attachment, mode, signal) {
+    if (!this.#token.startsWith('bf_')) throw new OctoError('voice_requires_user_bot')
+    if (!['append', 'edit'].includes(mode) || !(attachment?.bytes instanceof Uint8Array)
+      || !attachment.bytes.byteLength || attachment.bytes.byteLength > 16 * 1024 * 1024
+      || !/^audio\/[a-z0-9][a-z0-9.+_-]{0,70}$/i.test(attachment.mime ?? '')) throw new OctoError('invalid_voice_attachment')
+    const name = typeof attachment.name === 'string' ? attachment.name.split(/[/\\]/).at(-1)
+      .replace(/[\x00-\x1f\x7f"<>]/g, '_').slice(0, 160) : 'recording'
+    const form = new FormData()
+    // Bot adapter forwards multipart keys unchanged. The actual speech service
+    // requires "audio"; its proxy unit fixture's "file" key is not sufficient.
+    form.set('audio', new Blob([attachment.bytes], { type: attachment.mime }), name || 'recording')
+    form.set('mode', mode)
+    const result = await this.#request('/v1/bot/voice/transcribe', form, signal, { multipart: true, timeout: 60_000 })
+    if (!result || typeof result.text !== 'string' || !result.text.trim() || result.text.length > 24_000
+      || result.status != null && result.status !== 200) throw new OctoError('invalid_voice_transcript')
+    return { text: result.text, mode }
   }
 
   async identify(signal) {

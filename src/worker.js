@@ -10,6 +10,7 @@ import { createCard, parseCardAction, resolveCardAction, sendCard } from './octo
 import { finalMentions, textSegments, hasMarkdown, boundedMarkdown, mentionGuidance } from './outbound-text.js'
 import { CHANNEL_API_OPERATIONS as operationSpecs } from './channel-api.js'
 import { spec as displayCardSpec, sendDisplayCard } from './display-card.js'
+import { voiceTool } from './voice-tool.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
@@ -131,7 +132,20 @@ export class Worker {
     }
   }
 
+  async ackCardEvent(id, signal) {
+    if (!this.store.queueCardAck(id)) return
+    signal.throwIfAborted()
+    await this.api.ack(id, signal)
+    // A failed/ambiguous ACK keeps the durable obligation, never reruns the action.
+    this.store.cardAcked(id)
+  }
+
+  async flushCardAcks(signal) {
+    for (const id of this.store.pendingCardAcks()) await this.ackCardEvent(id, signal)
+  }
+
   async ingest(signal, cardsOnly = false) {
+    await this.flushCardAcks(signal)
     const events = await this.api.events(signal, this.cursor)
     const ordered = events.slice().sort((a, b) => {
       const aa = BigInt(decimalId(a?.event_id) ?? 0), bb = BigInt(decimalId(b?.event_id) ?? 0)
@@ -160,8 +174,8 @@ export class Worker {
               await this.questions.closeCard(binding, '这次提问的等待已结束，答案未交给 DSH。请重新发起提问。', signal)
             }
           } else this.store.claimCard(selection, message)
-          await this.api.ack(id, signal)
-        } else if (this.store.hasEvent(id)) await this.api.ack(id, signal)
+          await this.ackCardEvent(id, signal)
+        } else if (this.store.hasEvent(id)) await this.ackCardEvent(id, signal)
       } else if (!cardsOnly) {
         const message = admit(event, this.config)
         if (message) this.acceptInbound(id, message)
@@ -300,6 +314,7 @@ export class Worker {
             this.channelContext(config, route, job, meta, signal),
           ])
           const { attachments, order } = material
+          const voice = config.allowFiles ? voiceTool(this.api, attachments) : undefined
           let session = this.store.session(conversation, config.idleMinutes)
           if (session.created && await host.exists?.(session.session_id, signal) === false) {
             this.store.forgetSession(session.session_id)
@@ -350,8 +365,13 @@ export class Worker {
                         || ['space.members.search', 'groups.create'].includes(spec.name)))).map(spec => ({
                   name: 'octo_' + spec.name.replaceAll('.', '_'), description: spec.description, parameters: spec.parameters,
                 })),
-                  displayCardSpec],
+                  displayCardSpec, ...(voice ? [voice.spec] : [])],
                 execute: (name, args, toolSignal) => {
+                  if (name === voice?.spec.name) return (async () => {
+                    if (!this.config.allowFiles || this.config.toolPermission === 'text-only'
+                      || !await this.api.allowsMessage(this.config, job, toolSignal)) throw new Error('octo_access_denied')
+                    return voice.execute(args, toolSignal)
+                  })()
                   if (name === displayCardSpec.name) return (async () => {
                     if (!await this.api.allowsMessage(this.config, job, toolSignal)) throw new Error('octo_access_denied')
                     const receipt = await sendDisplayCard({ api: this.api, route, args, signal: toolSignal })
@@ -540,6 +560,26 @@ export class Worker {
     }
   }
 
+  async pollCardEvents(signal) {
+    let failures = 0
+    while (!signal.aborted) {
+      try {
+        if (this.store.hasOpenCard()) await this.ingest(signal, true)
+        else {
+          // The last claim closes its form before ACK. Retry by exact receipt ID
+          // even with no forms left, after expiry, or in a newly started worker.
+          await this.flushCardAcks(signal)
+          await delay(500, undefined, { signal })
+        }
+        failures = 0
+      } catch (error) {
+        if (signal.aborted) return
+        this.log('card_action_poll_failed')
+        await delay(Math.max(error?.retryAfterMs ?? 0, Math.min(30_000, 1000 * 2 ** Math.min(5, ++failures))), undefined, { signal })
+      }
+    }
+  }
+
   async runRealtime(lifetime) {
     const stop = new AbortController()
     const signal = AbortSignal.any([lifetime, stop.signal])
@@ -554,23 +594,7 @@ export class Worker {
     }
     const receiving = receiveRealtime({ api: this.api, botUid: this.config.botUid, accept, signal, log: this.log })
     const draining = this.drain(signal)
-    const cardEvents = (async () => {
-      let failures = 0
-      while (!signal.aborted) {
-        if (!this.store.hasOpenCard()) {
-          await delay(500, undefined, { signal })
-          continue
-        }
-        try {
-          await this.ingest(signal, true)
-          failures = 0
-        } catch {
-          if (signal.aborted) return
-          this.log('card_action_poll_failed')
-          await delay(Math.min(30_000, 1000 * 2 ** Math.min(5, ++failures)), undefined, { signal })
-        }
-      }
-    })()
+    const cardEvents = this.pollCardEvents(signal)
     try {
       await Promise.all([receiving, draining, cardEvents])
     } finally {

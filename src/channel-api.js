@@ -19,6 +19,26 @@ const text = { type: 'string', minLength: 1, maxLength: 4000 }
 const limit = { type: 'integer', minimum: 1, maximum: MAX_ROWS }
 const threadArgs = { short_id: shortID }
 const schema = (properties = {}, required = []) => ({ type: 'object', properties, required, additionalProperties: false })
+// octo-server f984d405 modules/messages_search/{validate,util,search_*}.go.
+// Explicit endpoint map: model input never participates in routing.
+const searchEndpoints = Object.freeze({
+  'messages.search': '/v1/bot/messages/_search',
+  'messages.search_files': '/v1/bot/messages/_search_files',
+  'messages.search_media': '/v1/bot/messages/_search_media',
+  'messages.search_all': '/v1/bot/messages/_search_all',
+  'messages.search_around': '/v1/bot/messages/_search_around',
+})
+const searchTimePattern = '^\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])(?:T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d{1,9})?(?:Z|[+-](?:[01]\\d|2[0-3]):[0-5]\\d))?$'
+const searchTime = { type: 'string', maxLength: 35, pattern: searchTimePattern,
+  description: 'RFC3339 with timezone, or YYYY-MM-DD (Asia/Shanghai start/end of day).' }
+const searchFilters = schema({
+  sender_ids: { type: 'array', items: uid, minItems: 1, maxItems: 50, uniqueItems: true },
+  sent_at_from: searchTime, sent_at_to: searchTime,
+})
+const searchLimit = { type: 'integer', minimum: 1, maximum: 10 }
+const searchPage = { filters: searchFilters, limit: searchLimit, cursor: { type: 'string', maxLength: 4096 },
+  sort: { type: 'string', enum: ['time_desc', 'time_asc', 'relevance'] } }
+const searchKeyword = { type: 'string', maxLength: 64 }
 const spec = (name, description, parameters = schema(), mutating = false, unavailableReason) => ({
   name, description, parameters, mutating, available: !unavailableReason,
   ...(unavailableReason && { unavailableReason }),
@@ -76,9 +96,16 @@ export const CHANNEL_API_OPERATIONS = freeze([
   spec('messages.recent', 'Read one bounded page of current-channel history; before_seq is exclusive.',
     schema({ limit, before_seq: { type: 'integer', minimum: 1, maximum: 0xffffffff } })),
   spec('messages.read', 'Read one message from the current channel.', schema({ message_id: messageID }, ['message_id'])),
-  spec('messages.search', 'Search only the current channel when server search is enabled; no global or OBO search.',
-    schema({ keyword: { type: 'string', minLength: 1, maxLength: 64 }, limit: { type: 'integer', minimum: 1, maximum: 10 },
-      cursor: { type: 'string', maxLength: 4096 } }, ['keyword'])),
+  spec('messages.search', 'Search current-channel messages as a User Bot with server search enabled. Supply a keyword or sender/time filter. One page, at most 10 verified hits; no global or OBO search.',
+    schema({ keyword: searchKeyword, ...searchPage })),
+  spec('messages.search_files', 'Search/list files in the current channel as a User Bot with server search enabled. Keyword optional; one page of at most 10 verified messages and attachment metadata, without downloads or indexed snippets.',
+    schema({ keyword: searchKeyword, ...searchPage })),
+  spec('messages.search_media', 'List images/videos in the current channel as a User Bot with server search enabled. Sender/time filters only, no keyword or relevance sort. One page of at most 10 verified messages; no media downloads.',
+    schema({ ...searchPage, sort: { type: 'string', enum: ['time_desc', 'time_asc'] } })),
+  spec('messages.search_all', 'Search messages and files together in the current channel as a User Bot with server search enabled. Supply a keyword or sender/time filter. One page of at most 10 individually verified hits; no cross-channel search.',
+    schema({ keyword: searchKeyword, ...searchPage })),
+  spec('messages.search_around', 'Read context around a visible current-channel message as a User Bot with server search enabled. limit is per side (default 5, max 10): at most 21 verified messages including the anchor. Sender/time filters affect neighbors, not the anchor. No cursor or automatic paging.',
+    schema({ anchor_message_id: messageID, filters: searchFilters, limit: searchLimit }, ['anchor_message_id'])),
   spec('messages.notify', 'Send text with visible native @name mentions for current member UIDs. Explicit all=true requires a current requester group owner/admin and notifies humans, never all bots.',
     schema({ text, uids: { type: 'array', items: { type: 'string', pattern: '^[A-Za-z0-9_.:@-]{1,128}$' }, maxItems: 10, uniqueItems: true },
       all: { type: 'boolean' } }, ['text']), true),
@@ -125,8 +152,8 @@ const statusError = status => statusErrors.get(status)
   ?? (Number.isInteger(status) && status >= 500 && status <= 599 ? 'api_server_error' : 'api_request_failed')
 
 export class ChannelApiError extends Error {
-  constructor(code) {
-    super(code + (errorHints[code] ? ': ' + errorHints[code] : ''))
+  constructor(code, hint = '') {
+    super(code + (errorHints[code] ? ': ' + errorHints[code] : '') + (hint ? ' ' + hint : ''))
     this.name = 'ChannelApiError'
     this.code = code
   }
@@ -137,6 +164,26 @@ const id = value => {
   return /^[1-9]\d{0,18}$/.test(s) && BigInt(s) <= 9223372036854775807n ? s : undefined
 }
 const seq = value => Number.isInteger(value) && value > 0 && value <= 0xffffffff
+function searchTimeSeconds(value, endOfDay = false) {
+  // Date.parse alone accepts impossible dates such as February 30. Check the
+  // calendar independently, then mirror Go's seconds precision and +08 day bounds.
+  if (!new RegExp(searchTimePattern).test(value)) fail('invalid_arguments')
+  const day = Date.parse(value.slice(0, 10) + 'T00:00:00Z')
+  if (!Number.isFinite(day) || new Date(day).toISOString().slice(0, 10) !== value.slice(0, 10)) fail('invalid_arguments')
+  const time = value.length === 10 ? day / 1000 - 8 * 3600 + (endOfDay ? 86399 : 0) : Math.floor(Date.parse(value) / 1000)
+  if (!Number.isFinite(time)) fail('invalid_arguments')
+  return time
+}
+function validateSearch(operation, args) {
+  const filters = args.filters ?? {}
+  const from = filters.sent_at_from === undefined ? undefined : searchTimeSeconds(filters.sent_at_from)
+  const to = filters.sent_at_to === undefined ? undefined : searchTimeSeconds(filters.sent_at_to, true)
+  if (from !== undefined && to !== undefined && from > to) fail('invalid_arguments')
+  if (['messages.search', 'messages.search_all'].includes(operation)
+    && !args.keyword?.trim() && !filters.sender_ids?.length && from === undefined && to === undefined) fail('invalid_arguments')
+  if (args.sort === 'relevance' && !args.keyword?.trim()) fail('invalid_arguments')
+  if (operation === 'messages.search_around' && !id(args.anchor_message_id)) fail('invalid_arguments')
+}
 const boundedText = (value, max) => typeof value === 'string'
   ? Array.from(value.slice(0, max * 2)).slice(0, max).join('').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '') : ''
 const messageText = value => {
@@ -191,7 +238,8 @@ function validate(value, def) {
   } else if (def.type === 'string') {
     if (typeof value !== 'string' || value.length > (def.maxLength ?? 4096) * 2
       || Array.from(value).length > (def.maxLength ?? 4096)
-      || (def.minLength && !value.trim()) || (def.pattern && !new RegExp(def.pattern).test(value))) fail('invalid_arguments')
+      || (def.minLength && !value.trim()) || (def.pattern && !new RegExp(def.pattern).test(value))
+      || (def.enum && !def.enum.includes(value))) fail('invalid_arguments')
   } else if (def.type === 'integer') {
     if (!Number.isSafeInteger(value) || value < def.minimum || value > def.maximum) fail('invalid_arguments')
   } else if (def.type === 'boolean') {
@@ -365,7 +413,7 @@ export class ChannelApi {
     return { ok: true, version: raw.version }
   }
 
-  #message(raw, scope, sender) {
+  #message(raw, scope, sender, details = false) {
     if (!object(raw) || !id(raw.message_id) || !seq(raw.message_seq) || !validUid(raw.from_uid)
       || raw.channel_type !== scope.route.channel_type) fail('invalid_message_response')
     const channel = scope.route.channel_id
@@ -389,18 +437,100 @@ export class ChannelApi {
       try { payload = JSON.parse(edited) } catch { payload = { type: 1, content: edited } }
       if (!object(payload) || payload.visibles != null || payload.event != null) fail('invalid_message_response')
     }
+    const normalized = normalizeOctoContent(payload, { allowFiles: details })
+    const attachments = normalized?.attachment ? [normalized.attachment] : normalized?.attachments ?? []
     return { message_id: id(raw.message_id), message_seq: raw.message_seq, from_uid: raw.from_uid,
-      type: payload.type, text: messageText(normalizeOctoContent(payload)?.text) }
+      type: payload.type, text: messageText(normalized?.text),
+      // Metadata comes from the live, visibility-checked message, not the index.
+      // No URLs, indexed file-body excerpts, downloads, or unbounded attachments.
+      ...(details && attachments.length && { attachments: attachments.slice(0, 2).map(item => ({
+        kind: item.kind, name: boundedText(item.name, 80), mime: boundedText(item.mime, 100),
+        ...(item.size !== undefined && { size: item.size }),
+      })), attachments_truncated: attachments.length > 2 }) }
   }
 
-  async #readMessage(scope, sender, messageId, signal) {
+  async #readMessage(scope, sender, messageId, signal, details = false) {
     if (!id(messageId)) fail('invalid_arguments')
     const base = scope.group ? scope.root + (scope.thread ? '/threads/' + scope.thread : '')
       : '/v1/bot/messages/person/' + encodeURIComponent(scope.route.channel_id)
     const path = scope.group ? base + '/messages/' + messageId : base + '/' + messageId
-    const result = this.#message(await this.#call(path, undefined, signal), scope, sender)
+    const result = this.#message(await this.#call(path, undefined, signal), scope, sender, details)
     if (result.message_id !== messageId) fail('message_outside_channel')
     return result
+  }
+
+  async #search(scope, sender, operation, args, signal) {
+    const around = operation === 'messages.search_around'
+    const size = args.limit ?? (around ? 5 : 10)
+    // A bot-visible anchor need not be visible to the requester. Verify it BEFORE
+    // asking for its neighbors, and again after the search to catch changed visibility.
+    if (around) await this.#readMessage(scope, sender, args.anchor_message_id, signal)
+    const body = { ...scope.route, page_size: size, ...(args.filters && { filters: args.filters }),
+      ...(around ? { anchor_message_id: args.anchor_message_id }
+        : { sort: args.sort ?? 'time_desc', ...(args.keyword !== undefined && { keyword: args.keyword.trim() }),
+          ...(args.cursor && { cursor: args.cursor }) }) }
+    let raw
+    try { raw = await this.#call(searchEndpoints[operation], body, signal) }
+    catch (error) {
+      if (error instanceof ChannelApiError && error.code.startsWith('api_')) {
+        throw new ChannelApiError(error.code, 'Search requires a User Bot, an enabled server search backend, and current channel access. No retry or identity fallback was attempted.')
+      }
+      throw error
+    }
+    const rows = value => {
+      if (!Array.isArray(value)) fail('invalid_search_response')
+      if (value.length > size) fail('response_limit_exceeded')
+      return value
+    }
+    const seen = new Set()
+    const hit = (row, kind, channelRequired = true) => {
+      if (!object(row) || typeof row.message_id !== 'string' || !id(row.message_id) || !seq(row.message_seq)
+        || !validUid(row.sender_id) || seen.has(row.message_id)
+        || (channelRequired || Object.hasOwn(row, 'channel_id')) && row.channel_id !== scope.route.channel_id
+        || Object.hasOwn(row, 'channel_type') && row.channel_type !== scope.route.channel_type) fail('invalid_search_response')
+      seen.add(row.message_id)
+      return { row, kind }
+    }
+    let entries, before, anchor, after
+    if (around) {
+      if (!object(raw) || typeof raw.has_more_before !== 'boolean' || typeof raw.has_more_after !== 'boolean'
+        || raw.anchor?.message_id !== args.anchor_message_id) fail('invalid_search_response')
+      anchor = hit(raw.anchor)
+      before = rows(raw.before).map(row => hit(row))
+      after = rows(raw.after).map(row => hit(row))
+      entries = [anchor, ...before, ...after]
+    } else {
+      if (!object(raw?.pagination) || typeof raw.pagination.has_more !== 'boolean'
+        || typeof raw.pagination.next_cursor !== 'string' || raw.pagination.next_cursor.length > 4096
+        || raw.pagination.has_more && !raw.pagination.next_cursor) fail('invalid_search_response')
+      entries = rows(raw.data).map(row => {
+        if (operation === 'messages.search_all') {
+          if (!object(row) || !['message', 'file'].includes(row.result_type)
+            || Object.hasOwn(row, row.result_type === 'file' ? 'message' : 'file')) fail('invalid_search_response')
+          return hit(row[row.result_type], row.result_type)
+        }
+        if (operation === 'messages.search_media') {
+          if (!['image', 'video'].includes(row?.media_kind)) fail('invalid_search_response')
+          return hit(row, row.media_kind, false)
+        }
+        return hit(row, operation === 'messages.search_files' ? 'file' : undefined, operation !== 'messages.search_files')
+      })
+    }
+    for (const entry of entries) {
+      const { row, kind } = entry
+      const message = await this.#readMessage(scope, sender, row.message_id, signal, true)
+      if (!Number.isInteger(message.type) || message.type < 1 || message.type >= 99
+        || message.message_seq !== row.message_seq || message.from_uid !== row.sender_id
+        || kind === 'file' && message.type !== 8 || kind === 'message' && message.type === 8
+        || kind === 'image' && message.type !== 2 || kind === 'video' && message.type !== 5) fail('invalid_search_response')
+      entry.value = { ...message, name: boundedText(row.sender_name, 100), ...(kind && { result_type: kind }) }
+    }
+    // Search and verification may take time; membership loss during either must
+    // prevent returning even an otherwise valid page. No cursor traversal/retries.
+    await this.#access(scope, sender, false, signal)
+    return around ? { before: before.map(entry => entry.value), anchor: anchor.value, after: after.map(entry => entry.value),
+      has_more_before: raw.has_more_before, has_more_after: raw.has_more_after }
+      : { messages: entries.map(entry => entry.value), more: raw.pagination.has_more, next_cursor: raw.pagination.next_cursor }
   }
 
   async dispatch(route, sender, operation, args = {}, signal = new AbortController().signal) {
@@ -409,6 +539,8 @@ export class ChannelApi {
     validate(args, definition.parameters)
     // Copy admitted inputs before the first await; do not retain mutable model args.
     args = JSON.parse(JSON.stringify(args))
+    const search = Object.hasOwn(searchEndpoints, operation)
+    if (search) validateSearch(operation, args)
     if (['rules.edit', 'thread.rules.edit'].includes(operation) && Buffer.byteLength(args.content, 'utf8') > 10240) fail('invalid_arguments')
     if (operation === 'group.edit' && !Object.keys(args).length) fail('invalid_arguments')
     const scope = this.#scope(route)
@@ -416,7 +548,7 @@ export class ChannelApi {
     const voice = operation.startsWith('voice.context.')
     if (voice) this.#requireOwnerDM(scope, sender)
     if (operation === 'groups.create') this.#requireOwner(sender)
-    if (!scope.group && !voice && !['inspect', 'messages.recent', 'messages.read', 'messages.search', 'messages.edit', 'messages.notify',
+    if (!scope.group && !voice && !search && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
       'messages.mark_read', 'space.members.search', 'groups.create'].includes(operation)) fail('group_required')
     const thread = operation.startsWith('thread.') ? this.#threadPath(scope, args) : undefined
     const access = await this.#access(scope, sender, definition.mutating, signal)
@@ -598,24 +730,7 @@ export class ChannelApi {
       }
       return { messages: messages.sort((a, b) => a.message_seq - b.message_seq), more: flag(raw.more) || rows.length === size }
     }
-    if (operation === 'messages.search') {
-      const size = args.limit ?? 10
-      const raw = await this.#call('/v1/bot/messages/_search', { ...scope.route, keyword: args.keyword,
-        page_size: size, sort: 'time_desc', ...(args.cursor && { cursor: args.cursor }) }, signal)
-      if (!object(raw?.pagination) || typeof raw.pagination.has_more !== 'boolean'
-        || typeof raw.pagination.next_cursor !== 'string' || raw.pagination.next_cursor.length > 4096) fail('invalid_search_response')
-      const messages = []
-      for (const row of list(raw.data, size)) {
-        if (!id(row?.message_id) || !seq(row.message_seq) || !validUid(row.sender_id)
-          || row.channel_id !== scope.route.channel_id || row.channel_type != null && row.channel_type !== scope.route.channel_type) fail('invalid_search_response')
-        // Search snippets omit payload.visibles. Read at most ten hits before
-        // returning text so a bot-only visible message cannot leak to a human.
-        // No retries or automatic cursor traversal; one failed read fails closed.
-        const message = await this.#readMessage(scope, sender, id(row.message_id), signal)
-        messages.push({ ...message, name: boundedText(row.sender_name, 100) })
-      }
-      return { messages, more: raw.pagination.has_more, next_cursor: raw.pagination.next_cursor }
-    }
+    if (search) return this.#search(scope, sender, operation, args, signal)
     if (operation === 'messages.notify') {
       const uids = args.uids ?? []
       if (args.all && uids.length) fail('invalid_arguments')

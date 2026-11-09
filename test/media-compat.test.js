@@ -32,6 +32,46 @@ function fixture(t) {
   return { cwd, store }
 }
 
+test('current voice attachment gets a scoped transcription tool and revocation takes effect before another call', async t => {
+  const { cwd, store } = fixture(t)
+  let transcriptions = 0
+  const current = { ...config, cwd, fetchImpl: async (input, init) => {
+    const url = new URL(input)
+    if (url.origin === cdn) return new Response(Buffer.from('RIFF-fixture'), { headers: { 'Content-Type': 'audio/wav' } })
+    if (url.pathname.endsWith('/messages/sync')) return Response.json({ messages: [] })
+    if (url.pathname.endsWith('/readReceipt')) return Response.json({ status: 200 })
+    if (url.pathname.endsWith('/voice/transcribe')) {
+      transcriptions++
+      assert.equal(init.body.get('audio').type, 'audio/wav')
+      return Response.json({ text: '这是语音测试。' })
+    }
+    if (url.pathname.endsWith('/sendMessage')) {
+      assert.equal(JSON.parse(init.body).payload.content, '收到语音：这是语音测试。')
+      return Response.json({ message_id: '999' })
+    }
+    throw new Error('unexpected voice fixture route')
+  } }
+  const api = new OctoClient(current)
+  const worker = new Worker({ config: current, store, api, log() {}, host: {
+    async run(session, text, created, signal, rules, stage, timeout, allowed, extras) {
+      await created()
+      assert.equal(allowed, true)
+      assert.equal(extras.attachments[0].mime, 'audio/wav')
+      assert.ok(extras.channelTools.specs.some(spec => spec.name === 'octo_voice_transcribe'))
+      const result = await extras.channelTools.execute('octo_voice_transcribe', { attachment: 0 }, signal)
+      current.allowFiles = false
+      await assert.rejects(extras.channelTools.execute('octo_voice_transcribe', { attachment: 0 }, signal), /octo_access_denied/)
+      return '收到语音：' + result.text
+    },
+  } })
+  const message = admit(send('701', { type: 4, url: cdn + '/voice.wav', name: 'voice.wav', timeTrad: 1 }), current)
+  assert.ok(message)
+  store.add('701', message)
+  await worker.process(store.next(Date.now()), control().signal)
+  assert.equal(transcriptions, 1)
+  assert.equal(store.db.prepare('SELECT state FROM jobs').get().state, 'sent')
+})
+
 test('ordered rich text, inline quote, duplicated media, and nested forwards use bounded safe content', () => {
   const payload = { type: 14, plain: 'obsolete plain projection', content: [
     { type: 'text', text: 'Before ' },
