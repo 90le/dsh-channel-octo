@@ -15,7 +15,7 @@ window.__ModuleLoader__.load({
       selectedBot: ['选择账号', 'Choose account'], previousSession: ['历史会话', 'Past conversation'],
       loading: ['正在加载 Octo…', 'Loading Octo…'], retry: ['重新加载', 'Reload'],
       online: ['已连接', 'Connected'], connecting: ['正在连接', 'Connecting'],
-      reconnecting: ['正在重连', 'Reconnecting'], disabled: ['尚未启用', 'Disabled'],
+      reconnecting: ['正在重连', 'Reconnecting'], disconnecting: ['正在停止接收', 'Stopping'], disabled: ['尚未启用', 'Disabled'],
       invalid_configuration: ['连接配置有误', 'Invalid connection settings'],
       configuration_or_state_error: ['无法读取渠道设置', 'Channel settings are unavailable'],
       worker_stopped: ['连接已停止', 'Connection stopped'],
@@ -196,7 +196,7 @@ window.__ModuleLoader__.load({
     const read = () => snapshot
     const subscribe = fn => { listeners.add(fn); return () => listeners.delete(fn) }
     const notify = () => { for (const fn of listeners) fn() }
-    const publish = data => { snapshot = data; notify() }
+    const publish = data => { snapshot = { accountUiVersion: snapshot.accountUiVersion, ...data }; notify() }
     const tFor = locale => key => words[key]?.[locale === 'zh' || locale?.startsWith?.('zh-') ? 0 : 1] ?? ''
     const channelNames = { 1: 'dm', 2: 'group', 5: 'topic' }
     const connectionTone = {
@@ -345,12 +345,15 @@ window.__ModuleLoader__.load({
             note: t(entries.length ? 'noResultsNote' : 'emptyNote') }))
       }
 
-      let accountModule
+      let accountModule, accountUiVersion
       function Account({ data, current, choose, t }) {
         const [View, setView] = useState(null)
         const [failed, setFailed] = useState(false)
         const load = () => {
-          accountModule ??= import(new URL(path + '/account-view.js', document.baseURI).href)
+          const url = new URL(path + '/account-view.js', document.baseURI)
+          if (data.accountUiVersion) url.searchParams.set('v', data.accountUiVersion)
+          if (accountUiVersion !== url.href) { accountUiVersion = url.href; accountModule = undefined }
+          accountModule ??= import(url.href)
             .then(module => module.createAccountView(React, primitives, {
               request: api, label: (key, lang) => tFor(lang)(key),
               status: (key, lang) => activeStatus({ status: key }, tFor(lang)),
@@ -359,10 +362,11 @@ window.__ModuleLoader__.load({
         }
         useEffect(() => {
           let cancelled = false
+          setFailed(false)
           load().then(view => { if (!cancelled) setView(() => view) })
             .catch(() => { if (!cancelled) setFailed(true) })
           return () => { cancelled = true }
-        }, [])
+        }, [data.accountUiVersion])
         return failed ? h(ErrorNotice, { t, message: t('unavailable') })
           : View ? h(View, { data, current, choose, lang: locale()?.startsWith?.('zh') ? 'zh' : 'en',
             publish: replaceSnapshot, refresh }) : hint(t('loading'))

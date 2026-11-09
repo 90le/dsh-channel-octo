@@ -7,6 +7,7 @@ const labels = {
   responding: '正在生成回复',
   delivering: '正在发送回复与交付文件',
   tool: '正在执行工具',
+  question: '等待你的回答',
   completed: '回复已发送',
   stopped: '回复发送待确认',
   error: '本次回复未完成，请稍后重发',
@@ -14,7 +15,7 @@ const labels = {
 
 const stages = ['queued', 'running', 'responding', 'delivering']
 const outcomes = ['completed', 'stopped', 'error']
-const wireStates = { queued: 'reasoning', running: 'reasoning', responding: 'answering', delivering: 'answering', tool: 'reasoning' }
+const wireStates = { queued: 'reasoning', running: 'reasoning', responding: 'answering', delivering: 'answering', tool: 'reasoning', question: 'reasoning' }
 const templateStates = ['reasoning', 'answering', ...outcomes]
 const initialDelay = 450
 const editInterval = 800
@@ -50,7 +51,7 @@ const action = (tool, detail, status = 'active') => ({
 
 function frame(mode, reasoningId, phase, seconds, stats, detail) {
   const terminal = outcomes.includes(phase)
-  const actual = !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
+  const actual = !terminal && stats.waiting ? 'question' : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
   const label = labels[actual]
   const state = wireStates[actual] ?? actual
   const elapsed = '已用时 ' + seconds + ' 秒'
@@ -123,7 +124,7 @@ export class Progress {
     const reasoningId = 'dsh-octo-' + (decimalId(job.message_id) ?? randomUUID())
     const started = Date.now()
     let revision = 0
-    const stats = { steps: 0, calls: 0, files: 0, active: 0, failed: 0, recent: new Map(), pending: new Set() }
+    const stats = { steps: 0, calls: 0, files: 0, active: 0, failed: 0, waiting: false, recent: new Map(), pending: new Set() }
     let phase = 'queued', shown, closed = false, timer, flight, finishing, id, format, seq = 1
     let tryCard = mode === 'auto', probeAt = started, dueAt = started + initialDelay
     let editAt, refreshAt, scheduledAt
@@ -231,6 +232,7 @@ export class Progress {
       trace(event) {
         if (!active()) return
         if (event?.kind === 'step') stats.steps = Math.min(999, stats.steps + 1)
+        else if (event?.kind === 'question-open' || event?.kind === 'question-closed') stats.waiting = event.kind === 'question-open'
         else if (event?.kind === 'tool-start' && typeof event.id === 'string' && event.id.length <= 256 && !stats.pending.has(event.id)
           && stats.pending.size < 128) {
           stats.calls = Math.min(999, stats.calls + 1)

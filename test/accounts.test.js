@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { Accounts } from '../src/accounts.js'
-import { credentialRequest } from '../src/web.js'
+import { registerWeb } from '../src/web.js'
+import { createServer } from 'node:http'
 import { Store } from '../src/store.js'
 
 test('Bot credentials stay out of account JSON, rotation keeps identity and account queues are separate', async () => {
@@ -82,17 +83,28 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
   }
 })
 
-test('credential inputs reject plain LAN HTTP and untrusted forwarded HTTPS', () => {
-  const req = (origin, host, address, forwarded, encrypted = false) => ({
-    headers: { origin, host, 'x-forwarded-proto': forwarded },
-    socket: { remoteAddress: address, localAddress: '192.0.2.10', encrypted },
-  })
-  assert.equal(credentialRequest(req('http://example.invalid', 'example.invalid', '192.0.2.20', 'https')), false)
-  assert.equal(credentialRequest(req('https://example.invalid', 'example.invalid', '192.0.2.20', 'https')), false)
-  assert.equal(credentialRequest(req('https://example.invalid', 'example.invalid', '192.0.2.20', 'https'), ['192.0.2.20']), true)
-  assert.equal(credentialRequest(req('https://example.invalid', 'example.invalid', '192.0.2.20', '', true)), true)
-  assert.equal(credentialRequest(req('https://other.invalid', 'example.invalid', '192.0.2.20', '', true)), false)
-  assert.equal(credentialRequest(req('http://localhost:1234', 'localhost:1234', '127.0.0.1')), true)
+test('authenticated HTTP can manage credentials; forged origins and anonymous requests cannot', async () => {
+  let route, verified = 0
+  const ctx = {
+    webServer: { register(value) { route = value; return () => {} } },
+    get: () => ({ requestRejection: request => request.headers.authorization === 'fixture-session' ? undefined : 401 }),
+  }
+  registerWeb(ctx, { async verify(token) { verified++; assert.equal(token, 'bf_synthetic'); return { botUid: 'fixture' } } })
+  const server = createServer(route.handler)
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const headers = { authorization: 'fixture-session', 'content-type': 'application/json', 'x-dsh-octo-client': '1' }
+    const base = 'http://127.0.0.1:' + server.address().port
+    const post = fields => fetch(base + '/api/dsh-channel-octo/accounts/verify', {
+      method: 'POST', headers: fields, body: JSON.stringify({ token: 'bf_synthetic' }),
+    })
+    assert.equal((await post({ ...headers, 'sec-fetch-site': 'same-site' })).status, 403)
+    assert.equal((await post({ ...headers, authorization: 'wrong' })).status, 401)
+    const result = await post({ ...headers, origin: base, 'sec-fetch-site': 'same-origin' })
+    assert.equal(result.status, 200)
+    assert.deepEqual(await result.json(), { botUid: 'fixture' })
+    assert.equal(verified, 1)
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) }
 })
 
 test('idle rotation retains the previous native session in channel history', () => {
@@ -116,6 +128,56 @@ test('idle rotation retains the previous native session in channel history', () 
       [[second.session_id, 0], [first.session_id, 1]])
   } finally {
     store.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an in-flight legacy account accepts a partial hot edit without reconnecting; removal survives restart', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-octo-hot-'))
+  const fixture = {
+    botUid: 'fixture-bot', spaceId: 'fixture-space', stateDir: root, cwd: root, enabled: true,
+    apiBase: 'https://octo.invalid/api', transport: 'events', senderPolicy: 'octo',
+  }
+  let identified = 0
+  const make = () => new Accounts({
+    get: () => undefined,
+    logger: () => ({ info() {}, error() {} }),
+  }, fixture, { env: { DSH_OCTO_BOT_TOKEN: 'bf_fixture_legacy' }, fetchImpl: async (input, init) => {
+    if (new URL(input).pathname.endsWith('/verify-bot')) {
+      identified++
+      return Response.json({ bot_uid: fixture.botUid, space_id: fixture.spaceId, owner_uid: 'owner' })
+    }
+    return new Promise((_, reject) => {
+      const stop = () => reject(init.signal.reason)
+      init.signal.addEventListener('abort', stop, { once: true })
+      if (init.signal.aborted) stop()
+    })
+  } })
+  let accounts = make()
+  try {
+    await accounts.initialize()
+    const runtime = accounts.runtimes.get('legacy')
+    const worker = runtime.worker
+    const active = worker.inFlight = Promise.withResolvers().promise
+    worker.store.add('1', { messageId: '1', sender: 'owner', text: 'in flight' })
+    worker.store.running(1)
+    const updated = await accounts.save('legacy', { revision: accounts.overview().accountRevision,
+      account: { label: 'Renamed immediately', sendMode: 'steer' } })
+    assert.equal(updated.accounts[0].label, 'Renamed immediately')
+    assert.equal(runtime.worker, worker)
+    assert.equal(worker.config.sendMode, 'steer')
+    assert.equal(worker.inFlight, active)
+    assert.equal(identified, 1)
+    worker.inFlight = undefined
+    worker.store.sent(1, '11')
+    await accounts.remove('legacy', { revision: accounts.overview().accountRevision })
+    await accounts.dispose()
+    accounts = make()
+    await accounts.initialize()
+    assert.equal(accounts.overview().accounts.length, 0)
+    assert.equal(identified, 1)
+  } finally {
+    await accounts.dispose().catch(() => {})
     rmSync(root, { recursive: true, force: true })
   }
 })

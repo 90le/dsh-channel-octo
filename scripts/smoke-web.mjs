@@ -124,7 +124,7 @@ export function apply(ctx) {
         '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
         '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]']),
     '    threadRuleMode: inherit-group',
-    '    hostPermissions: [read-only, workspace-write]',
+    '    hostPermissions: [read-only, workspace-write, danger-full-access, auto]',
     ...(ownerSmoke ? ['    mediaDownloadOrigins: ["https://files-fixture.invalid"]',
       '    mediaUploadOrigins: ["https://storage-fixture.invalid"]'] : []),
     '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 22000',
@@ -157,6 +157,7 @@ export function apply(ctx) {
         browserErrors.push(msg.text().replace(/https?:\/\/\S+/g, '[url]'))
       }
     })
+    await page.addInitScript(() => { Object.defineProperty(window, 'isSecureContext', { value: false }) })
     await page.goto(launch)
     const native = page.getByRole('tab', { name: 'Octo', exact: true })
     const fallback = page.locator('[data-octo-shortcut]')
@@ -293,18 +294,36 @@ export function apply(ctx) {
     const policy = edit.getByLabel('权限策略', { exact: true })
     await policy.selectOption({ label: '工作区写入' })
     await edit.getByText('已保存', { exact: true }).waitFor({ timeout: 9000 })
+    const sendMode = edit.getByLabel('发送方式', { exact: true })
+    await sendMode.selectOption('steer')
+    await edit.getByText('已保存', { exact: true }).waitFor({ timeout: 9000 })
     await edit.getByLabel('账号名称', { exact: true }).fill('Fixture spare renamed')
     await edit.getByLabel('账号名称', { exact: true }).press('Enter')
     await edit.getByRole('heading', { name: 'Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
     await edit.getByRole('button', { name: '关闭', exact: true }).click()
     await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
     const overview = await (await page.request.get(new URL('/api/dsh-channel-octo', launch).href)).json()
-    if (!overview.accounts.some(row => row.label === 'Fixture spare renamed' && row.enabled === false && row.permission === 'workspace-write' && row.senderPolicy === 'octo')) {
+    if (!overview.accounts.some(row => row.label === 'Fixture spare renamed' && row.enabled === false && row.permission === 'workspace-write' && row.senderPolicy === 'octo' && row.sendMode === 'steer')) {
       throw new Error('The second Bot did not stay separately configured')
     }
     const stored = readFileSync(join(state, 'accounts.json'), 'utf8')
     if ((JSON.stringify(overview) + stored).includes('bf_fixture_second')) throw new Error('Bot credential escaped its vault')
-    console.log('PASS: added and edited a second Bot without connecting it; credential not exposed.')
+    await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).click()
+    const rotated = page.locator('.dsho-account-modal[open]')
+    const preset = rotated.getByLabel('Agent 预设', { exact: true })
+    await preset.locator('option', { hasText: '标准模式' }).waitFor({ state: 'attached' })
+    const full = rotated.getByLabel('权限策略', { exact: true }).locator('option[value="danger-full-access"]')
+    if (await full.getAttribute('disabled') !== null || await full.textContent() !== '完全访问') throw new Error('full access not selectable in Chinese')
+    await rotated.getByRole('button', { name: '更换 Bot 令牌', exact: true }).click()
+    await rotated.getByLabel('新 Bot 令牌', { exact: true }).fill('bf_fixture_second_rotated')
+    await rotated.getByRole('button', { name: '验证令牌', exact: true }).click()
+    await rotated.getByRole('button', { name: '保存新令牌', exact: true }).click({ timeout: 9000 })
+    await rotated.getByText('已保存', { exact: true }).waitFor({ timeout: 9000 })
+    await rotated.getByRole('button', { name: '移除账号', exact: true }).click()
+    await page.getByRole('dialog', { name: '移除账号', exact: true }).getByRole('button', { name: '移除账号', exact: true }).click()
+    await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ state: 'detached', timeout: 9000 })
+    if (readFileSync(join(state, 'accounts.json'), 'utf8').includes('bf_fixture_second_rotated')) throw new Error('Rotated credential escaped its vault')
+    console.log('PASS: HTTP account add, partial edits, credential rotation and confirmed removal; credentials not exposed.')
   }
   // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
   const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
@@ -329,9 +348,9 @@ export function apply(ctx) {
   }
   if (browserModule && !/dsh_session_reused/.test(output)) throw new Error('Web did not hold the fixture session open during the second turn')
   if (ownerSmoke && (readFileSync(join(home, 'octo-tool-fixture.txt'), 'utf8') !== 'written by native DSH'
-    || !output.includes('FIXTURE_FILE_OK'))) throw new Error('Native write/present/delivery failed: '
+    || !output.includes('FIXTURE_FILE_OK') || !output.includes('FIXTURE_QUESTION_ANSWERED'))) throw new Error('Native write/present/delivery failed: '
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
-  if (ownerSmoke) console.log('PASS: verified Octo owner ran DSH write and present, and the same bytes reached the mock file recipient.')
+  if (ownerSmoke) console.log('PASS: native question resumed from an Octo reply, then DSH wrote and delivered identical file bytes.')
   if (!ownerSmoke) {
     const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')
     if (!imLog.includes('API 已注册') || !imLog.includes('attachMappedSessions')) throw new Error('IM Connect did not initialize')

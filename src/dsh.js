@@ -57,6 +57,22 @@ export class DshHost {
         if (!tools?.guard) throw new Error('missing_scoped_tool_controls')
         cleanup.push(tools.guard(() => !authority.active || authority.mixed || signal.aborted ? denial : undefined))
       }
+      if (permission && extras.onQuestion && typeof scoped.on === 'function') {
+        cleanup.push(scoped.on('user-questions/request', async (request, next) => {
+          if (!authority.active || authority.mixed || request.agent?.id !== session.session_id) return next()
+          const askSignal = request.signal ? AbortSignal.any([signal, request.signal]) : signal
+          let claim
+          try {
+            if (request.wait?.timed) {
+              const api = ctx.get?.('userQuestions')
+              if (typeof api?.attachWait !== 'function') return next()
+              claim = api.attachWait(request.agent, request.wait.callId, askSignal)[Symbol.asyncIterator]()
+              if ((await claim.next()).done) return next()
+            }
+            return await extras.onQuestion(request.questions, askSignal)
+          } finally { await claim?.return?.() }
+        }, { prepend: true }))
+      }
       if (rules || extras.authorCard || extras.taskContext) {
         const prompt = scoped.get('systemPrompt')
         if (typeof prompt?.context !== 'function') throw new Error('missing_scoped_rule_context')

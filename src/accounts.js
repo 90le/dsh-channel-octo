@@ -67,8 +67,7 @@ export class Accounts {
     this.lifetime = new AbortController()
     this.ops = Promise.resolve()
     this.status = 'disabled'
-    this.trustedProxy = (Array.isArray(deployment.credentialProxyAddresses) ? deployment.credentialProxyAddresses : [])
-      .filter(v => typeof v === 'string' && /^[\da-f.:]+$/i.test(v))
+
   }
 
   get vault() { return this.ctx.get('credentials') }
@@ -122,6 +121,7 @@ export class Accounts {
   async dispose() {
     this.lifetime.abort()
     await this.ops.catch(() => {})
+    await Promise.allSettled([...this.runtimes.values()].map(runtime => runtime.transition))
     await Promise.allSettled([...this.runtimes.values()].map(async runtime => {
       await this.stop(runtime)
       runtime.store.close()
@@ -169,37 +169,44 @@ export class Accounts {
     return { record, settings, store, status: 'disabled' }
   }
 
-  start(runtime, attachExisting = false) {
-    const { record, settings, store } = runtime
-    if (this.lifetime.signal.aborted || !record.enabled) { runtime.status = 'disabled'; return }
-    const config = settings.config
-    const signaler = new AbortController()
-    runtime.controller = signaler
-    const signal = AbortSignal.any([signaler.signal, this.lifetime.signal])
-    runtime.status = 'connecting'
+  runtimeConfig(record, config) {
     if (record.id !== legacy || record.cwd !== this.deployment.cwd || record.provider || record.reasoningEffort
       || (record.permission && record.permission !== textOnly) || (record.agentPreset && record.agentPreset !== 'octo-text')) {
       config.sessionProfile = createHash('sha256').update(JSON.stringify([
         record.cwd, record.provider, record.model, record.reasoningEffort, record.permission, record.agentPreset,
       ])).digest('hex').slice(0, 24)
     }
+    else delete config.sessionProfile
     config.idleMinutes = record.idleMinutes ?? 0
     config.toolPermission = record.permission ?? textOnly
     Object.assign(config, normalizeImControls({ ...this.deployment, ...record }), { fetchImpl: this.fetchImpl })
-    let workspace
-    const attach = async sessionId => {
+    return config
+  }
+
+  start(runtime, attachExisting = false) {
+    const { record, settings, store } = runtime
+    if (this.lifetime.signal.aborted || !record.enabled) { runtime.status = 'disabled'; return }
+    const config = this.runtimeConfig(record, settings.config)
+    const signaler = new AbortController()
+    runtime.controller = signaler
+    const signal = AbortSignal.any([signaler.signal, this.lifetime.signal])
+    runtime.status = 'connecting'
+    const workspaces = new Map()
+    const attach = async (sessionId, cwd = config.cwd) => {
       try {
         const registry = this.ctx.get('workspaceRegistry')
         if (!registry || registry.archivedSessionIds?.includes(sessionId)) return
-        workspace ??= await registry.create(config.cwd, 'Octo')
+        let workspace = workspaces.get(cwd)
+        if (!workspace) { workspace = await registry.create(cwd, 'Octo'); workspaces.set(cwd, workspace) }
         await workspace.attachSession(sessionId)
       } catch { this.log.info('workspace_attach_failed') }
     }
-    const worker = new Worker({
+    const worker = runtime.worker = new Worker({
       api: new OctoClient({ ...config, fetchImpl: this.fetchImpl }), store,
       host: new DshHost(this.ctx, config.cwd, config.timeoutMs, record),
       config, attach, isArchived: sessionId => this.ctx.get('workspaceRegistry')?.archivedSessionIds?.includes(sessionId),
       log: (line) => {
+        if (runtime.changing) return
         if (line === 'octo_ws_connected' || line === 'octo_poll_ok') runtime.status = 'online'
         else if (line.startsWith('octo_ws_retry_') || line.startsWith('octo_poll_')) runtime.status = 'reconnecting'
         if (line !== 'octo_poll_ok') this.log.info(line)
@@ -226,7 +233,38 @@ export class Accounts {
     await runtime.stopped
     runtime.controller = undefined
     runtime.stopped = undefined
+    runtime.worker = undefined
     runtime.status = 'disabled'
+  }
+
+  async changeConnection(runtime, { removing = false, priorSecret } = {}) {
+    if (runtime.changing) fail('account_transition')
+    runtime.changing = true
+    runtime.status = runtime.record.enabled ? 'reconnecting' : 'disconnecting'
+    const inFlight = runtime.worker?.pause(removing || !runtime.record.enabled)
+    const operation = (async () => {
+      try {
+        await inFlight?.catch(() => {})
+        await this.stop(runtime)
+        if (removing) {
+          runtime.store.retirePending()
+          runtime.store.close()
+          this.runtimes.delete(runtime.record.id)
+        } else {
+          runtime.changing = false
+          this.start(runtime)
+        }
+        if (priorSecret) await this.vault?.unset?.(priorSecret).catch(() => {})
+      } catch {
+        runtime.status = 'worker_stopped'
+        this.log.error('account_connection_transition_failed')
+      } finally {
+        runtime.changing = false
+        runtime.transition = undefined
+      }
+    })()
+    runtime.transition = operation
+    if (!inFlight) await operation
   }
 
   publicAccount(record) {
@@ -373,8 +411,10 @@ export class Accounts {
 
   async editFields(data, old) {
     if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(key => !inputKeys.has(key))) fail('invalid_account')
+    const prior = old && this.publicAccount(old)
+    const fields = { ...prior, ...data }
     const { label, cwd, provider = '', model = '', reasoningEffort = '', permission = textOnly,
-      agentPreset: requestedPreset = 'octo-text', enabled = true, idleMinutes = 0 } = data
+      agentPreset: requestedPreset = 'octo-text', enabled = true, idleMinutes = 0 } = fields
     const agentPreset = requestedPreset || 'octo-text'
     const im = normalizeImControls({ ...this.deployment, ...old, ...data })
     for (const key of Object.keys(im)) if (Object.hasOwn(data, key) && im[key] !== data[key]) fail('invalid_account')
@@ -382,7 +422,7 @@ export class Accounts {
       || !str(permission, 128) || !str(agentPreset, 128) || typeof enabled !== 'boolean' || !idleOptions.includes(idleMinutes)
       || (!!provider !== !!model) || (reasoningEffort && !model)) fail('invalid_account')
     if (!this.workspaces().some(row => row.path === cwd)) fail('workspace_unavailable')
-    if (provider) {
+    if (provider && (!old || provider !== prior.provider || model !== prior.model || reasoningEffort !== prior.reasoningEffort)) {
       const { models } = await this.options()
       const item = models.find(m => m.provider === provider && m.model === model)
       if (!item && (old?.provider !== provider || old?.model !== model || old?.reasoningEffort !== reasoningEffort)) fail('model_unavailable')
@@ -391,8 +431,8 @@ export class Accounts {
         if (!detail?.reasoning?.efforts?.some(value => value.id === reasoningEffort)) fail('reasoning_unavailable')
       }
     }
-    if (!(await this.presets()).some(row => row.id === agentPreset)) fail('invalid_account')
-    if (!this.policies().some(row => row.id === permission && !row.disabled)) fail('permission_unavailable')
+    if ((!old || agentPreset !== prior.agentPreset) && !(await this.presets()).some(row => row.id === agentPreset)) fail('invalid_account')
+    if ((!old || permission !== prior.permission) && !this.policies().some(row => row.id === permission && !row.disabled)) fail('permission_unavailable')
     const senderPolicy = data.senderPolicy ?? this.runtimes.get(old?.id)?.settings.config.senderPolicy ?? old?.senderPolicy ?? 'octo'
     const rawUids = data.allowedUids ?? [...(this.runtimes.get(old?.id)?.settings.config.allowed ?? old?.allowedUids ?? [])]
     if (!['octo', 'allowlist'].includes(senderPolicy) || !Array.isArray(rawUids) || rawUids.length > 20
@@ -425,11 +465,12 @@ export class Accounts {
         transport: old?.transport ?? (token.startsWith('bf_') ? 'websocket' : 'events'),
       }
       const active = this.runtimes.get(record.id)
+      if (active?.changing) fail('account_transition')
+      const rotate = !!active && (changedToken || active.record.enabled !== record.enabled)
       let candidate
       try {
         candidate = active ? this.settingsFor(record, token) : this.open(record, token)
         if (changedToken) await this.vault.set(newRef, token)
-        if (active?.record.enabled && active.store.hasPending()) fail('account_busy')
         this.persist(record)
       } catch (error) {
         if (!active) candidate?.store.close()
@@ -437,14 +478,17 @@ export class Accounts {
         throw error
       }
       if (active) {
-        await this.stop(active)
         active.record = record; active.settings = candidate
-        this.start(active)
+        if (rotate) await this.changeConnection(active, { priorSecret: changedToken ? old?.secretRef : undefined })
+        else if (active.worker) {
+          const config = this.runtimeConfig(record, candidate.config)
+          active.worker.reconfigure(config, new DshHost(this.ctx, config.cwd, config.timeoutMs, record))
+        }
       } else {
         this.runtimes.set(record.id, candidate)
         this.start(candidate)
       }
-      if (changedToken && old?.secretRef) await this.vault?.unset?.(old.secretRef).catch(() => {})
+      if (!active && changedToken && old?.secretRef) await this.vault?.unset?.(old.secretRef).catch(() => {})
       return { accountId: record.id, ...this.overview() }
     })
   }
@@ -454,6 +498,7 @@ export class Accounts {
       const record = accountId ? this.record(accountId) : [...this.records.values()].find(item => !item.removed)
       const runtime = this.runtimes.get(record?.id)
       if (!runtime) fail('channel_not_configured')
+      if (runtime.changing) fail('account_transition')
       const next = { ...input?.settings }
       // The account editor owns sender admission after that field is edited.
       if (record.senderPolicy) { delete next.senderPolicy; delete next.allowedUids }
@@ -470,12 +515,11 @@ export class Accounts {
       const runtime = this.runtimes.get(accountId)
       if (!runtime) fail('channel_not_configured')
       if (record.enabled === input.enabled) return this.overview()
-      if (record.enabled && runtime.store.hasPending()) fail('account_busy')
+      if (runtime.changing) fail('account_transition')
       const next = { ...record, enabled: input.enabled }
       this.persist(next)
-      await this.stop(runtime)
       runtime.record = next
-      this.start(runtime)
+      await this.changeConnection(runtime)
       return this.overview()
     })
   }
@@ -495,9 +539,7 @@ export class Accounts {
       const record = this.record(accountId)
       const runtime = this.runtimes.get(accountId)
       if (!record.enabled || !runtime) fail('channel_not_configured')
-      if (runtime.store.hasPending()) fail('account_busy')
-      await this.stop(runtime)
-      this.start(runtime)
+      await this.changeConnection(runtime)
       return this.overview()
     })
   }
@@ -506,12 +548,14 @@ export class Accounts {
     return this.locked(async () => {
       this.checkRevision(input)
       const record = this.record(accountId)
-      if (record.id === legacy) fail('invalid_account')
       const runtime = this.runtimes.get(accountId)
-      if (runtime?.store.hasPending()) fail('account_busy')
-      this.persist({ ...record, removed: true, enabled: false, secretRef: undefined })
-      if (runtime) { await this.stop(runtime); runtime.store.close(); this.runtimes.delete(accountId) }
-      if (record.secretRef) await this.vault?.unset?.(record.secretRef).catch(() => {})
+      if (runtime?.changing) fail('account_transition')
+      const tombstone = { ...record, removed: true, enabled: false, secretRef: undefined }
+      this.persist(tombstone)
+      if (runtime) {
+        runtime.record = tombstone
+        await this.changeConnection(runtime, { removing: true, priorSecret: record.secretRef })
+      } else if (record.secretRef) await this.vault?.unset?.(record.secretRef).catch(() => {})
       return this.overview()
     })
   }

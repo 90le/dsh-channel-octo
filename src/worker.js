@@ -3,6 +3,7 @@ import { isAbsolute, relative } from 'node:path'
 import { admit, decimalId, OctoError, permitsRoute } from './octo.js'
 import { receiveRealtime } from './realtime.js'
 import { Progress } from './progress.js'
+import { QuestionBridge } from './questions.js'
 import { downloadAttachment, uploadAttachment } from './octo-media.js'
 import { readDeliverable } from './dsh-media.js'
 import { createCard, parseCardAction, resolveCardAction, sendCard } from './octo-cards.js'
@@ -56,7 +57,41 @@ export class Worker {
   constructor({ api, store, host, config, log, attach, isArchived }) {
     Object.assign(this, { api, store, host, config, log, attach, isArchived })
     this.progress = new Progress(api, log)
+    this.questions = new QuestionBridge({ api, store, log })
     this.cursor = '0'
+  }
+
+  reconfigure(config, host) {
+    config.ownerUid = this.config.ownerUid
+    this.config = config
+    this.host = host
+  }
+
+  pause(stopIntake = false) {
+    this.paused = true
+    this.stopIntake = stopIntake
+    return this.inFlight
+  }
+
+  acceptInbound(eventId, message) {
+    const question = !message.attachment && !message.command && this.questions.match(message)
+    if (question && authorizedToolDm(this.config, { sender: message.sender, channel_type: message.channelType })) {
+      if (this.store.rememberAnswer(eventId, message, question.sessionId)) this.questions.text(question, message.text)
+      return
+    }
+    if (this.stopIntake) return
+    const inserted = this.store.add(eventId, message)
+    if (inserted.changes && !this.paused) this.attemptSteering(message.messageId)
+  }
+
+  async drain(signal) {
+    while (!signal.aborted) {
+      const job = !this.paused && this.store.next(Date.now())
+      if (!job) { await delay(150, undefined, { signal }); continue }
+      const work = this.process(job, signal)
+      this.inFlight = work
+      try { await work } finally { if (this.inFlight === work) this.inFlight = undefined }
+    }
   }
 
   async ingest(signal, cardsOnly = false) {
@@ -75,15 +110,21 @@ export class Worker {
         const binding = this.store.cardBinding(action.messageId)
         const selection = resolveCardAction(event, binding, this.config)
         if (selection && permitsRoute(this.config, selection.operatorUid, selection.route.channel_type, selection.route.channel_id)) {
-          this.store.claimCard(selection, {
+          const message = {
             messageId: 'card_action:' + id, sender: selection.operatorUid, channelId: selection.route.channel_id,
             channelType: selection.route.channel_type, text: '', cardAction: { selection: selection.selection },
-          })
+          }
+          if (binding.questionKey) {
+            const pending = this.questions.match(message)
+            if (pending?.key === binding.questionKey && authorizedToolDm(this.config, { sender: message.sender, channel_type: message.channelType })) {
+              if (this.store.claimCard(selection, message, pending.sessionId ?? null)) this.questions.card(pending, binding.questionKey, selection.selection)
+            } else this.store.claimCard(selection, message, null) // expired question clicks never become prompts
+          } else this.store.claimCard(selection, message)
           await this.api.ack(id, signal)
         } else if (this.store.hasEvent(id)) await this.api.ack(id, signal)
       } else if (!cardsOnly) {
         const message = admit(event, this.config)
-        if (message) this.store.add(id, message)
+        if (message) this.acceptInbound(id, message)
         await this.api.ack(id, signal)
       }
       // In WebSocket mode this poll consumes only this plugin's own card actions.
@@ -92,11 +133,13 @@ export class Worker {
     }
   }
 
-  attemptSteering() {
+  attemptSteering(messageId) {
     const active = this.steerActive
-    if (!active) return
+    if (!active || this.config.sendMode !== 'steer' || this.questions.current
+      || this.config.sessionProfile !== active.profile
+      || !authorizedToolDm(this.config, active.job)) return
     const next = this.store.steerCandidate(active.job)
-    if (!next || next.sender !== active.job.sender || next.metadata || !next.input) return
+    if (!next || next.message_id !== messageId || next.sender !== active.job.sender || next.metadata || !next.input) return
     active.offer(next.input, () => {
       this.store.running(next.seq, active.sessionId)
       active.merged.push(next.seq)
@@ -105,6 +148,7 @@ export class Worker {
 
   async process(job, signal) {
     const config = { ...this.config }
+    const host = this.host
     const channelType = job.channel_type
     const recipient = job.channel_id ?? job.sender
     if (!permitsRoute(config, job.sender, channelType, recipient)) {
@@ -178,15 +222,18 @@ export class Worker {
           this.store.running(job.seq, session.session_id)
           const authorCard = safeCommand(config, job) && !attachments.length
             && /卡片|\bcard\b/iu.test(job.input)
-          reply = await this.host.run(session, job.input, async () => {
+          reply = await host.run(session, job.input, async () => {
             this.store.sessionCreated(conversation)
-            await this.attach?.(session.session_id)
+            await this.attach?.(session.session_id, config.cwd)
           }, signal, rules,
             phase => { if (phase === 'reused') this.log('dsh_session_reused'); else progress.stage(phase) }, config.timeoutMs, toolsAllowed,
             { attachments, authorCard, taskContext: channelType === 1, onTrace: trace => progress.trace(trace),
+              ...(toolsAllowed && { onQuestion: (questions, askSignal) => this.questions.ask(questions,
+                { ...job, session_id: session.session_id }, config, askSignal,
+                waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' })) }),
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
-              ...(toolsAllowed && config.transport === 'websocket' && config.sendMode === 'steer' && !attachments.length
-                && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id } : undefined } }) })
+              ...(toolsAllowed && config.transport === 'websocket' && !attachments.length
+                && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })
           if (channelType === 1 && asksForFile(job.input) && !deliverables?.length) {
             const issue = !config.allowFiles ? 'files_disabled' : !toolsAllowed || config.toolPermission === 'text-only'
               ? 'file_tools_unavailable' : 'file_not_presented'
@@ -286,13 +333,17 @@ export class Worker {
     if (identity?.ownerUid) this.config.ownerUid = identity.ownerUid
     this.log('bot_verified')
     if (this.config.transport === 'websocket') return this.runRealtime(signal)
+    const stop = new AbortController()
+    const lifetime = AbortSignal.any([signal, stop.signal])
+    const draining = this.drain(lifetime)
+    const receiving = this.poll(lifetime)
+    try { await Promise.all([receiving, draining]) }
+    finally { stop.abort(); await Promise.allSettled([receiving, draining]) }
+  }
+
+  async poll(signal) {
     let failures = 0
     while (!signal.aborted) {
-      const job = this.store.next(Date.now())
-      if (job) {
-        await this.process(job, signal)
-        continue
-      }
       try {
         await this.ingest(signal)
         if (failures || !this.pollReady) this.log('octo_poll_ok')
@@ -317,20 +368,11 @@ export class Worker {
         message_id: m.messageId, from_uid: m.fromUid, channel_type: m.channelType,
         channel_id: m.channelId, payload: m.payload,
       } }, this.config)
-      if (candidate) {
-        this.store.add('ws:' + candidate.messageId, candidate)
-        this.attemptSteering()
-      }
+      if (candidate) this.acceptInbound('ws:' + candidate.messageId, candidate)
       // WukongConnection sends RECVACK only after this function returns.
     }
     const receiving = receiveRealtime({ api: this.api, botUid: this.config.botUid, accept, signal, log: this.log })
-    const draining = (async () => {
-      while (!signal.aborted) {
-        const job = this.store.next(Date.now())
-        if (job) await this.process(job, signal)
-        else await delay(250, undefined, { signal })
-      }
-    })()
+    const draining = this.drain(signal)
     const cardEvents = (async () => {
       let failures = 0
       while (!signal.aborted) {

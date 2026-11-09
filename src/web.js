@@ -1,9 +1,14 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveConfig } from './config.js'
 
 const path = '/api/dsh-channel-octo'
+const editor = readFileSync(new URL('./account-editor.js', import.meta.url), 'utf8')
+const view = readFileSync(new URL('./account-view.js', import.meta.url), 'utf8')
+const uiVersion = createHash('sha256').update(editor).update(view).digest('hex').slice(0, 16)
+const modules = new Map([[path + '/account-editor.js', editor],
+  [path + '/account-view.js', view.replace('./account-editor.js', './account-editor.js?v=' + uiVersion)]])
 const editable = ['senderPolicy', 'channelPolicy', 'mentionPolicy', 'threadRuleMode',
   'allowedUids', 'allowedGroupIds', 'allowedThreadIds', 'progress', 'timeoutMs']
 
@@ -74,26 +79,9 @@ async function body(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
-export function credentialRequest(req, trustedProxy = []) {
-  const origin = URL.parse(req.headers.origin ?? '')
-  const address = req.socket.remoteAddress?.replace(/^::ffff:/, '')
-  const local = req.socket.localAddress?.replace(/^::ffff:/, '')
-  const loopback = address === '127.0.0.1' || address === '::1'
-  if (!origin || origin.origin !== req.headers.origin) return false
-  const sameHost = origin.host === req.headers.host
-  if (origin.protocol === 'http:') {
-    return sameHost && loopback && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)
-  }
-  if (origin.protocol !== 'https:') return false
-  return sameHost && req.socket.encrypted === true
-    || (loopback || address && address === local || trustedProxy.includes(address))
-      && req.headers['x-forwarded-proto'] === 'https'
-      && (sameHost || origin.host === req.headers['x-forwarded-host'])
-}
-
 const accountErrors = {
-  accounts_unavailable: 503, credential_provider_unavailable: 503, secure_connection_required: 403,
-  account_not_found: 404, account_changed: 409, account_busy: 409, duplicate_bot: 409,
+  accounts_unavailable: 503, credential_provider_unavailable: 503,
+  account_not_found: 404, account_changed: 409, account_transition: 409, duplicate_bot: 409,
   invalid_account: 400, invalid_bot_token: 400, bot_identity_mismatch: 400, bot_verification_failed: 400,
   workspace_unavailable: 400, model_unavailable: 400, reasoning_unavailable: 400, permission_unavailable: 400,
   permission_requires_allowlist: 400, settings_changed: 409, channel_not_configured: 409,
@@ -101,8 +89,6 @@ const accountErrors = {
 }
 
 export function registerWeb(ctx, accounts) {
-  const modules = new Map(['account-editor.js', 'account-view.js'].map(name => [path + '/' + name,
-    readFileSync(new URL('./' + name, import.meta.url))]))
   return ctx.webServer.register({ kind: 'prefix', path, handler: async (req, res) => {
     const send = (status, payload) => {
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
@@ -115,7 +101,7 @@ export function registerWeb(ctx, accounts) {
       if (rejected !== undefined) return send(rejected, { error: 'authentication_required' })
       const target = new URL(req.url ?? '/', 'http://localhost').pathname
       if (req.method === 'GET' && target === path) {
-        return send(200, accounts.overview())
+        return send(200, { ...accounts.overview(), accountUiVersion: uiVersion })
       }
       if (req.method === 'GET' && modules.has(target)) {
         res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8',
@@ -124,13 +110,11 @@ export function registerWeb(ctx, accounts) {
       }
       if (req.method === 'GET' && target === path + '/account-options') return send(200, await accounts.options())
       if (!['POST', 'PUT'].includes(req.method)) return send(404, { error: 'not_found' })
-      if (req.headers['x-dsh-octo-client'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site'
+      if (req.headers['x-dsh-octo-client'] !== '1' || ['cross-site', 'same-site'].includes(req.headers['sec-fetch-site'])
         || !/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) return send(403, { error: 'forbidden' })
       try {
         const input = await body(req)
-        const secure = () => credentialRequest(req, accounts.trustedProxy)
         if (req.method === 'POST' && target === path + '/accounts/verify') {
-          if (!secure()) throw new Error('secure_connection_required')
           return send(200, await accounts.verify(input?.token))
         }
         const match = /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})(?:\/(settings|state|diagnose|reconnect|remove))?$/.exec(target)
@@ -142,10 +126,6 @@ export function registerWeb(ctx, accounts) {
         if (req.method === 'POST' && match?.[2] === 'reconnect') return send(200, await accounts.reconnect(match[1], input))
         if (req.method === 'POST' && match?.[2] === 'remove') return send(200, await accounts.remove(match[1], input))
         if (req.method === 'POST' && target === path + '/accounts' || req.method === 'PUT' && match && !match[2]) {
-          if (!secure() && (Object.hasOwn(input?.account ?? {}, 'token') || req.method === 'POST'
-            || input?.account?.permission && input.account.permission !== 'text-only')) {
-            throw new Error('secure_connection_required')
-          }
           return send(200, await accounts.save(match?.[1], input))
         }
         return send(404, { error: 'not_found' })

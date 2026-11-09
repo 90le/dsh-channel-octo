@@ -6,7 +6,7 @@ let received = 0
 let sent = 0
 let openedCard = false
 const ownerSmoke = process.env.DSH_OCTO_FIXTURE_OWNER === '1'
-let ownerStep = 0, uploaded = false
+let ownerStep = 0, uploaded = false, questionAnswered = false
 const browserReady = process.env.DSH_OCTO_BROWSER_READY
 const group = '00112233445566778899aabbccddeeff'
 const thread = '123456789012345678'
@@ -41,7 +41,7 @@ globalThis.fetch = async (input, init) => {
   if (url.hostname === 'octo-fixture.invalid') {
     if (url.pathname.endsWith('/verify-bot')) {
       const { bot_token: token } = JSON.parse(init.body)
-      if (token === 'bf_fixture_second') return json({ bot_uid: 'fixture-bot-second', space_id: 'fixture-space' })
+      if (token === 'bf_fixture_second' || token === 'bf_fixture_second_rotated') return json({ bot_uid: 'fixture-bot-second', space_id: 'fixture-space' })
       return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space', ...(ownerSmoke && { owner_uid: 'fixture-user' }) })
     }
     if (url.pathname.endsWith('/register') && peer) {
@@ -72,7 +72,8 @@ globalThis.fetch = async (input, init) => {
     }
     if (url.pathname.endsWith('/ack')) return json({ status: 200 })
     if (url.pathname.endsWith('/card/profile')) return json({
-      enabled: true, config: { card_enabled: true, reasoning_enabled: true,
+      enabled: true, card_version: '1.5', profiles: ['octo/v1', 'octo/v2'], inputs: ['Input.ChoiceSet'],
+      config: { card_enabled: true, display_enabled: true, interaction_enabled: true, reasoning_enabled: true,
         reasoning_template_ref: { id: 'ai.reasoning-process', version: '0.4.1' } },
       templating: { supported: true, templates: [{ id: 'ai.reasoning-process', version: '0.4.1',
         views: [{ states: ['reasoning', 'answering', 'completed', 'stopped', 'error'] }] }] },
@@ -99,6 +100,13 @@ globalThis.fetch = async (input, init) => {
         if (!uploaded || body.channel_type !== 1 || body.channel_id !== 'fixture-user') return new Response(null, { status: 400 })
         console.log('FIXTURE_FILE_OK')
         return json({ message_id: 300 })
+      }
+      if (ownerSmoke && body.payload.profile === 'octo/v2') {
+        if (body.channel_id !== 'fixture-user' || body.channel_type !== 1) return new Response(null, { status: 400 })
+        setTimeout(() => peer.send({ messageId: '901', sender: 'fixture-user', channelType: 1,
+          channelId: 'fixture-user', payload: { type: 1, content: '1' } }), 300).unref()
+        console.log('FIXTURE_QUESTION_SENT')
+        return json({ message_id: 299 })
       }
       if (body.payload.type === 17) {
         if (openedCard || received !== 1 || body.channel_type !== 1 || body.channel_id !== 'fixture-user'
@@ -137,19 +145,30 @@ globalThis.fetch = async (input, init) => {
     const tail = JSON.stringify(body.messages.at(-1))
     const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
     const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-5])/g)).at(-1)?.[1] ?? 0)
-    if (ownerSmoke && round === 1 && ownerStep < 2) {
+    if (ownerSmoke && round === 1 && ownerStep < 3) {
       const names = (body.tools ?? []).map(tool => tool.name)
-      if (!names.includes('write') || !names.includes('present')) {
+      if (!names.includes('write') || !names.includes('present') || !names.includes('ask_user_question')) {
         console.error('FIXTURE_OWNER_TOOLS_MISSING')
         return new Response(null, { status: 400 })
       }
-      const first = ownerStep++ === 0
+      const step = ownerStep++
+      if (step === 1) {
+        questionAnswered = history.includes('Fixture answer one')
+        if (!questionAnswered) return new Response(null, { status: 400 })
+        console.log('FIXTURE_QUESTION_ANSWERED')
+      }
+      const tool = ['ask_user_question', 'write', 'present'][step]
+      const args = [
+        { questions: [{ id: 'fixture-choice', question: 'Which test file?', options: [
+          { label: 'Fixture answer one', description: 'Text file' }, { label: 'Other answer', description: 'Another option' },
+        ] }] },
+        { file_path: 'octo-tool-fixture.txt', content: 'written by native DSH' },
+        { files: [{ path: 'octo-tool-fixture.txt' }] },
+      ][step]
       const frames = [
         { type: 'message_start', message: { id: 'fixture-tool', model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
-        { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: first ? 'toolu_fixture_write' : 'toolu_fixture_present', name: first ? 'write' : 'present', input: {} } },
-        { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(first
-          ? { file_path: 'octo-tool-fixture.txt', content: 'written by native DSH' }
-          : { files: [{ path: 'octo-tool-fixture.txt' }] }) } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_fixture_' + tool, name: tool, input: {} } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(args) } },
         { type: 'content_block_stop', index: 0 },
         { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } },
         { type: 'message_stop' },

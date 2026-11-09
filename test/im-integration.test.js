@@ -125,3 +125,70 @@ test('WebSocket sidecar consumes only its own click, persists before ACK and doe
   assert.match(responses[0], /B/)
   assert.equal(store.next(Date.now()), undefined)
 })
+
+test('agent question accepts an authenticated choice once, and later text is a new message', async t => {
+  const { store, config } = fixture(t, { senderPolicy: 'octo', toolPermission: 'workspace-write' })
+  let frame, answerSeen, click
+  let presented = Promise.withResolvers()
+  config.fetchImpl = async (input, init) => {
+    const path = new URL(input).pathname
+    if (path.endsWith('/card/profile')) return Response.json({ enabled: true, card_version: '1.5',
+      profiles: ['octo/v2'], inputs: ['Input.ChoiceSet'],
+      config: { card_enabled: true, display_enabled: true, interaction_enabled: true } })
+    if (path.endsWith('/sendMessage')) {
+      const { payload } = JSON.parse(init.body)
+      if (payload.type === 17) { frame = payload; presented.resolve() }
+      return Response.json({ message_id: '420' })
+    }
+    if (path.endsWith('/messages/sync')) return Response.json({ messages: [] })
+    assert.fail('unexpected synthetic request')
+  }
+  const api = new OctoClient(config)
+  api.events = async () => [click]
+  api.ack = async () => {}
+  const worker = new Worker({ api, store, config, log() {}, host: {
+    async run(_session, _text, created, _signal, _rules, _progress, _timeout, allowed, extra) {
+      assert.equal(allowed, true)
+      await created()
+      answerSeen = await extra.onQuestion([{ id: 'fixture-q', question: 'Choose', options: [
+        { label: 'One' }, { label: 'Two' },
+      ] }], AbortSignal.timeout(3000))
+      return 'finished'
+    },
+  } })
+  store.add('1', admit(msg('1', { type: 1, content: 'test a question' }), config))
+  const doing = worker.process(store.next(Date.now()), signal)
+  await presented.promise
+  await new Promise(resolve => setImmediate(resolve))
+  click = { event_id: '5', event_type: 'card_action', event_data: {
+    message_id: '420', action_id: 'answer', space_id: 'space', channel_id: 'alice', channel_type: 1,
+    operator_uid: 'other', inputs: { selection: 'q2' }, data: frame.card.actions[0].data,
+  } }
+  await worker.ingest(signal, true)
+  assert.equal(answerSeen, undefined)
+  click = { ...click, event_id: '6', event_data: { ...click.event_data, operator_uid: 'alice' } }
+  await worker.ingest(signal, true)
+  await doing
+  assert.deepEqual(answerSeen, { answers: [{ id: 'fixture-q', selected: ['Two'] }] })
+  assert.equal(store.hasEvent('6'), true)
+  worker.acceptInbound('7', admit(msg('7', { type: 1, content: 'follow-up' }), config))
+  assert.equal(store.next(Date.now()).input, 'follow-up')
+})
+
+test('hot send-mode change applies to the next eligible message in the running conversation', t => {
+  const { store, config } = fixture(t, { senderPolicy: 'octo', sendMode: 'queue', sessionProfile: 'same-session' })
+  const worker = new Worker({ api: {}, store, host: {}, config, log() {} })
+  store.add('1', admit(msg('1', { type: 1, content: 'run task' }), config))
+  const job = store.next(Date.now())
+  store.running(job.seq, 'session-fixture')
+  const received = []
+  worker.steerActive = { job, profile: 'same-session', sessionId: 'session-fixture', merged: [],
+    offer(text, reserve) { received.push(text); reserve() } }
+  worker.reconfigure({ ...config, ownerUid: undefined, sendMode: 'steer' }, {})
+  worker.acceptInbound('2', admit(msg('2', { type: 1, content: 'new instruction' }), config))
+  worker.acceptInbound('2', admit(msg('2', { type: 1, content: 'new instruction' }), config))
+  worker.reconfigure({ ...config, sendMode: 'queue' }, {})
+  worker.acceptInbound('3', admit(msg('3', { type: 1, content: 'queued instruction' }), config))
+  assert.deepEqual(received, ['new instruction'])
+  assert.equal(store.db.prepare("SELECT state FROM jobs WHERE message_id='3'").get().state, 'queued')
+})

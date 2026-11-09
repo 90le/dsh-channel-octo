@@ -3,14 +3,14 @@ const builtinPolicy = {
   'read-only': ['只读', 'Read only'],
   'workspace-write': ['工作区写入', 'Workspace write'],
   'danger-full-access': ['完全访问', 'Full access'],
-  auto: ['自动权限', 'Auto'],
+  auto: ['自动（逐次审批）', 'Auto (per-call review)'],
 }
 const builtinPreset = {
   'octo-text': ['Octo 文字模式', 'Octo text mode'],
   standard: ['标准模式', 'Standard'],
-  minimal: ['精简模式', 'Minimal'],
-  ptc: ['程序化工具调用', 'Programmatic tool calling'],
-  cordis: ['Cordis 开发模式', 'Cordis development'],
+  minimal: ['极简模式', 'Minimal'],
+  ptc: ['PTC 模式', 'PTC mode'],
+  cordis: ['创造模式', 'Creator mode'],
 }
 const copy = {
   unnamed: ['Octo 账号', 'Octo account'],
@@ -22,7 +22,7 @@ const copy = {
   replaceToken: ['更换 Bot 令牌', 'Replace bot token'],
   cancelReplacement: ['取消更换令牌', 'Cancel token replacement'],
   keepToken: ['验证并保存后才会更换原有令牌。', 'The existing token stays in use until you verify and save the new one.'],
-  secure: ['请通过安全连接添加或更换 Bot 令牌。', 'Use a secure connection to add or replace a bot token.'],
+  noVault: ['DSH 凭据库暂不可用。', 'The DSH credential store is unavailable.'],
   verify: ['验证令牌', 'Verify token'],
   verifying: ['正在验证令牌…', 'Verifying token…'],
   verified: ['令牌已验证', 'Token verified'],
@@ -48,7 +48,6 @@ const copy = {
   noPolicies: ['暂无可选权限策略', 'No permissions available'],
   policyDisabled: ['灰色选项需要管理员在服务器上开放。', 'A server administrator must enable the unavailable options.'],
   policyScope: ['跟随 Octo 准入时，工具仅对已验证的 Bot 所有者私聊开放；其他好友、群聊和子区可正常对话。', 'When following Octo access, only the verified bot owner can use tools in DMs. Other friends and group or topic members can still chat.'],
-  permissionHttps: ['请从 HTTPS 管理入口修改工具权限。', 'Open the HTTPS management page to change tool permissions.'],
   senderPolicy: ['私聊准入', 'Private chat access'],
   senderAllowlist: ['仅允许名单中的用户', 'Allowlisted users only'],
   senderOcto: ['跟随 Octo 好友和群成员权限', 'Follow Octo friend and group access'],
@@ -76,6 +75,7 @@ const copy = {
   save: ['保存账号', 'Save account'],
   saving: ['正在保存…', 'Saving…'],
   saved: ['已保存', 'Saved'],
+  saveEdits: ['保存设置', 'Save settings'],
   saveFailed: ['未能保存账号。请稍后重试。', 'Could not save the account. Try again.'],
   retry: ['重试保存', 'Retry save'],
   diagnose: ['诊断连接', 'Diagnose connection'],
@@ -115,7 +115,7 @@ export function accountFields(account) {
 export function createAccountEditor(React, { Button, Input }) {
   const { createElement: h, useEffect, useId, useRef, useState } = React
 
-  function AccountForm({ account, options, allowCredentials, secureSettings, onVerify, onSave, onCancel,
+  function AccountForm({ account, options, allowCredentials, onVerify, onSave, onCancel,
     onDiagnose, onReconnect, onRemove, t, lang = 'zh', connectionStatus, errorMessage }) {
     const tr = key => {
       const id = 'octo.accountEditor.' + key
@@ -214,12 +214,12 @@ export function createAccountEditor(React, { Button, Input }) {
     const modelItems = choices(models.map(item => ({
       value: modelChoice(item.provider, item.model), label: (item.label || item.model) + ' · ' + item.provider,
     })), originalModel, [initial.model, initial.provider].filter(Boolean).join(' · '))
-    const catalogChoices = (items, builtins, checkSecure = false) => items.map(item => ({
+    const catalogChoices = (items, builtins) => items.map(item => ({
       value: item.id,
       label: (Object.hasOwn(builtins, item.id) ? builtins[item.id][lang === 'zh' ? 0 : 1] : null) || item.label || item.id,
-      disabled: item.disabled === true || (checkSecure && !secureSettings && item.id !== 'text-only' && item.id !== initial.permission),
+      disabled: item.disabled === true,
     }))
-    const policyItems = choices(catalogChoices(policies, builtinPolicy, true), initial.permission)
+    const policyItems = choices(catalogChoices(policies, builtinPolicy), initial.permission)
     const presetOptions = catalogChoices(presets, builtinPreset)
     if (!presetOptions.some(item => item.value === 'octo-text')) {
       presetOptions.unshift({ value: 'octo-text', label: tr('defaultPreset') })
@@ -269,7 +269,10 @@ export function createAccountEditor(React, { Button, Input }) {
           const credential = next === fields ? token : ''
           const signature = JSON.stringify(next)
           if (credential || signature !== saved.current) {
-            await onSave({ ...next, ...(credential ? { token: credential } : {}) })
+            const previous = JSON.parse(saved.current)
+            const changes = editing ? Object.fromEntries(Object.entries(next).filter(([key, value]) =>
+              JSON.stringify(value) !== JSON.stringify(previous[key]))) : next
+            await onSave({ ...changes, ...(credential ? { token: credential } : {}) })
             if (pending.current !== request) return
             saved.current = signature
             if (credential) {
@@ -360,7 +363,6 @@ export function createAccountEditor(React, { Button, Input }) {
       select('policy', 'permission', policyItems, draft.permission, permission => update({ permission }),
         policyItems.length ? 'pickPolicy' : 'noPolicies'),
       select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),
-      !secureSettings && hint('permissionHttps', { className: 'dsho-account-note dsho-account-wide' }),
       policies.some(item => item.disabled) && hint('policyDisabled', { className: 'dsho-account-note dsho-account-wide' }),
       draft.senderPolicy === 'octo' && hint('policyScope', { className: 'dsho-account-note dsho-account-wide' }),
       draft.senderPolicy === 'allowlist' && field('uids', 'allowedUids', h(React.Fragment, null,
@@ -381,7 +383,7 @@ export function createAccountEditor(React, { Button, Input }) {
 
     const cancelReplacement = () => { clearToken(); setReplacing(false); setFeedback(null) }
     const cancelToken = () => editing ? cancelReplacement() : clearToken()
-    const credentials = !allowCredentials ? hint('secure')
+    const credentials = !allowCredentials ? hint('noVault')
       : editing && !replacing
         ? h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!busy,
           onClick: () => { setReplacing(true); setFeedback(null) } }, tr('replaceToken'))
@@ -410,7 +412,7 @@ export function createAccountEditor(React, { Button, Input }) {
       feedback?.retry && h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!busy,
         onClick: () => save(draft, uidText) }, tr('retry')))
     return h('form', { className: 'dsho-account-editor', autoComplete: 'off',
-      onSubmit: event => { event.preventDefault(); if (!editing) void save(draft, uidText, true) } },
+      onSubmit: event => { event.preventDefault(); void save(draft, uidText, !editing) } },
       h('div', { className: 'dsho-account-body' },
         editing && h('header', { className: 'dsho-account-inspector' },
           h('span', { className: 'dsho-account-logo', 'aria-hidden': true }, 'O'),
@@ -421,7 +423,8 @@ export function createAccountEditor(React, { Button, Input }) {
         editing && labelField,
         h('div', { className: editing ? undefined : 'dsho-account-setup' }, settings),
         credentials,
-        editing && feedbackLine,
+        editing && h('div', { className: 'dsho-account-buttons' },
+          h(Button, { type: 'submit', variant: 'outline', disabled: !!busy }, tr('saveEdits')), feedbackLine),
         editing && actions.length > 0 && h('div', { className: 'dsho-account-buttons dsho-account-edit-actions' },
           ...actions.map(([kind, action]) =>
             h(Button, { key: kind, type: 'button', variant: 'outline', disabled: !!busy,

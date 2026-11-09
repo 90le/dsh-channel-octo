@@ -64,11 +64,17 @@ export class Store {
   }
 
   add(eventId, m) {
-    this.db.prepare(`
+    return this.db.prepare(`
       INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient,metadata) VALUES (?,?,?,?,?,?,?,?)
       ON CONFLICT(message_id) DO NOTHING
     `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender, m.ambient ? 1 : 0,
       m.attachment || m.command || m.cardAction ? JSON.stringify({ attachment: m.attachment, command: m.command, cardAction: m.cardAction }) : null)
+  }
+
+  rememberAnswer(eventId, message, sessionId) {
+    return this.db.prepare(`INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,state,session_id)
+      VALUES (?,?,?,'',?,?,'ignored',?) ON CONFLICT(message_id) DO NOTHING`)
+      .run(message.messageId, eventId, message.sender, message.channelType, message.channelId, sessionId ?? null).changes > 0
   }
 
   bindCard(binding) {
@@ -91,12 +97,16 @@ export class Store {
     return row ? JSON.parse(row.binding) : null
   }
 
-  claimCard(action, m) {
+  claimCard(action, m, sessionId) {
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      if (this.db.prepare('UPDATE card_bindings SET claimed=1 WHERE message_id=? AND expires_ms>? AND claimed=0')
-        .run(action.messageId, Date.now()).changes) this.add(action.eventId, m)
+      const claimed = this.db.prepare('UPDATE card_bindings SET claimed=1 WHERE message_id=? AND expires_ms>? AND claimed=0')
+        .run(action.messageId, Date.now()).changes > 0
+      let inserted = false
+      if (claimed) inserted = sessionId !== undefined ? this.rememberAnswer(action.eventId, m, sessionId)
+        : this.add(action.eventId, m).changes > 0
       this.db.exec('COMMIT')
+      return inserted
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
@@ -175,6 +185,9 @@ export class Store {
     `).all()
     const counts = this.db.prepare('SELECT state, count(*) AS total FROM jobs GROUP BY state').all()
     return { conversations, counts }
+  }
+  retirePending() {
+    this.db.prepare("UPDATE jobs SET state='review', issue='account_removed', input='', reply=NULL, metadata=NULL WHERE state IN ('queued','ready')").run()
   }
   hasPending() {
     return !!this.db.prepare("SELECT 1 FROM jobs WHERE state IN ('queued','running','ready','sending') LIMIT 1").get()

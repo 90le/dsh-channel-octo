@@ -1,4 +1,4 @@
-import { accountFields, createAccountEditor } from './account-editor.js'
+import { createAccountEditor } from './account-editor.js'
 
 const styles = `
 .dsho-account-roster {
@@ -87,18 +87,16 @@ const caption = {
   edit: ['设置', 'Settings'], rename: ['修改账号名称', 'Rename account'], name: ['账号名称', 'Account name'],
   loading: ['正在读取工作区、模型与权限…', 'Loading workspaces, models and permissions…'],
   noServer: ['请先在 DSH 服务器配置受信任的 Octo 地址。', 'Configure a trusted Octo endpoint on the DSH server first.'],
-  secure: ['添加账号和更换令牌请从 HTTPS 管理入口打开。', 'Use the HTTPS management page to add an account or replace a token.'],
   noVault: ['DSH 凭据库暂不可用，不能添加账号或更换令牌。', 'The DSH credential store is unavailable.'],
   cancel: ['取消', 'Cancel'], close: ['关闭', 'Close'], unnamed: ['Octo 账号', 'Octo account'],
   processing: ['处理中…', 'Processing…'],
   failure: ['操作未完成，请稍后重试。', 'Could not complete the request. Try again.'],
-  account_busy: ['该账号正在处理消息，请等回复完成后再操作。', 'Wait for this account to finish its current messages.'],
+  account_transition: ['账号正在切换连接，请稍后再试。', 'The account is changing its connection. Try again shortly.'],
   account_changed: ['账号设置已在别处更新，请重新打开设置后再试。', 'The account changed elsewhere. Reopen its settings and try again.'],
   duplicate_bot: ['这个 Bot 已经添加，请编辑原账号。', 'This bot already has an account. Edit the existing account.'],
   invalid_bot_token: ['Bot 令牌无效或尚未配置。', 'The bot token is invalid or missing.'],
   bot_identity_mismatch: ['新令牌不属于原来的 Bot 和空间。', 'The replacement token belongs to a different bot or space.'],
   bot_verification_failed: ['Octo 未确认令牌，请检查令牌和服务地址。', 'Octo could not verify this token. Check the token and server.'],
-  secure_connection_required: ['当前连接不能提交令牌。请从 HTTPS 管理入口打开。', 'This connection cannot submit a token. Open the HTTPS management page.'],
   credential_provider_unavailable: ['DSH 凭据库暂不可用。', 'The DSH credential store is unavailable.'],
   permission_unavailable: ['该权限预设未在 Octo 的服务器配置中开放。', 'This permission preset is not enabled for Octo.'],
   permission_requires_allowlist: ['启用工具前，请选择仅允许名单中的用户并填写名单。', 'Set a private-chat allowlist before enabling tools.'],
@@ -151,7 +149,7 @@ export function createAccountView(React, primitives, { request, status, label })
     const [failed, setFailed] = useState(false)
     const [busy, setBusy] = useState(false)
     const [confirming, setConfirming] = useState(false)
-    const allowCredentials = window.isSecureContext && data.credentialAvailable === true
+    const allowCredentials = data.credentialAvailable === true
     useEffect(() => {
       if (!dialog.current.open) dialog.current.showModal()
       const controller = new AbortController()
@@ -197,7 +195,7 @@ export function createAccountView(React, primitives, { request, status, label })
       failed ? h('div', { className: 'dsho-account-body' }, h('p', { className: 'dsho-alert', role: 'alert' }, tr('failedOptions'))) : !options
         ? h('div', { className: 'dsho-account-body' }, h('p', { role: 'status' }, tr('loading')))
         : h(Editor, {
-          account, options, allowCredentials, secureSettings: window.isSecureContext, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
+          account, options, allowCredentials, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
           connectionStatus: account && status(account.enabled === false ? 'disabled' : account.status, lang),
           onVerify: ({ token }) => perform('POST', '/accounts/verify', { token }),
           onSave: fields => perform(account ? 'PUT' : 'POST', account ? endpoint(account.id) : '/accounts',
@@ -205,7 +203,7 @@ export function createAccountView(React, primitives, { request, status, label })
           onDiagnose: account && (() => perform('POST', endpoint(account.id) + '/diagnose', {})),
           onReconnect: account?.enabled && (() => perform('POST', endpoint(account.id) + '/reconnect',
             { revision: revision.current })),
-          onRemove: account && !account.legacy && (() => { setConfirming(true); return false }),
+          onRemove: account && (() => { setConfirming(true); return false }),
         }),
       confirming && h(ConfirmRemove, { tr, onClose: () => setConfirming(false),
         remove: () => perform('POST', endpoint(account.id) + '/remove', { revision: revision.current }, true) }))
@@ -251,8 +249,8 @@ export function createAccountView(React, primitives, { request, status, label })
     const writing = useRef(false)
     const accounts = data.accounts ?? []
     const selected = accounts.find(account => account.id === modal?.id)
-    const canAdd = window.isSecureContext && data.canManage && data.credentialAvailable
-    const noAdd = !data.canManage ? tr('noServer') : !window.isSecureContext ? tr('secure') : !data.credentialAvailable ? tr('noVault') : ''
+    const canAdd = data.canManage && data.credentialAvailable
+    const noAdd = !data.canManage ? tr('noServer') : !data.credentialAvailable ? tr('noVault') : ''
     const mutate = async (account, suffix, body) => {
       if (writing.current) return
       writing.current = true
@@ -268,7 +266,7 @@ export function createAccountView(React, primitives, { request, status, label })
         setBusy('')
       }
     }
-    const rename = (account, name) => mutate(account, '', { account: { ...accountFields(account), label: name } })
+    const rename = (account, name) => mutate(account, '', { account: { label: name } })
     const open = accounts.length > 0 && expanded
     const platformName = [
       h('span', { key: 'logo', className: 'dsho-account-logo', 'aria-hidden': true }, 'O'),
