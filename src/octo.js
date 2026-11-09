@@ -188,7 +188,10 @@ export class OctoClient {
       if (app) {
         let sourceId = decimalId(job.message_id)
         if (!sourceId && job.metadata) {
-          try { sourceId = decimalId(JSON.parse(job.metadata).cardAction?.sourceMessageId) } catch {}
+          try {
+            const meta = JSON.parse(job.metadata)
+            sourceId = decimalId((meta.cardAction ?? meta.deferredForm)?.sourceMessageId)
+          } catch {}
         }
         if (!sourceId || !this.channel) return false
         try { await this.channel.appMessage({ channel_id: sender, channel_type: 1 }, sender, sourceId, signal) }

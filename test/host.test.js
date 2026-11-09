@@ -76,6 +76,28 @@ test('only a confirmed missing native session permits recovery without replaying
     new AbortController().signal), { message: 'session_open_failed' })
 })
 
+test('deferred continuation verifies both followed defaults and the loaded session model before prompting', async () => {
+  const { ctx, agentId, calls } = fakeHost()
+  const host = new DshHost(ctx, '/fixture', 1000), policy = host.modelProfile()
+  const session = { session_id: agentId, created: 1 }, signal = new AbortController().signal
+  const extras = { expectedModel: { policy, effective: policy } }
+  ctx.agentDefaultModel.currentSelection = () => ({ provider: 'fixture', model: 'changed-default' })
+  await assert.rejects(host.run(session, 'answer', () => {}, signal, null, () => {}, 1000, false, extras),
+    { message: 'deferred_configuration_changed' })
+  assert.equal(calls.length, 0)
+  ctx.agentDefaultModel.currentSelection = () => ({ provider: 'fixture', model: 'fixture' })
+  const resume = ctx.agents.resume
+  ctx.agents.resume = async options => {
+    const handle = await resume(options)
+    handle.agent.model = { current: () => ({ provider: 'fixture', model: 'changed-session-model' }) }
+    return handle
+  }
+  await assert.rejects(host.run(session, 'answer', () => {}, signal, null, () => {}, 1000, false, extras),
+    { message: 'deferred_configuration_changed' })
+  assert.equal(calls.some(call => Array.isArray(call) && call[0] === 'prompt'), false)
+  assert.ok(calls.includes('dispose'))
+})
+
 test('account model, reasoning and preset are applied, and group turns remain tool-free', async () => {
   const { ctx, calls, agentId } = fakeHost()
   const optionsSeen = []

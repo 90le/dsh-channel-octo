@@ -74,6 +74,8 @@ const toolLabels = new Map([
   ['octo_voice_context_update', '更新语音词汇'], ['octo_voice_context_delete', '清除语音词汇'],
   ['octo_display_card', '发送展示卡片'],
   ['octo_form', '等待填写表单'],
+  ['octo_form_publish', '发布稍后填写的表单'],
+  ['octo_form_manage', '管理已发布表单'],
 ])
 const action = (tool, detail, status = 'active') => ({
   tool, detail, statusGlyph: status === 'done' ? '✓' : status === 'failed' ? '!' : '●',

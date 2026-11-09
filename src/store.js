@@ -91,8 +91,9 @@ export class Store {
       INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient,metadata,message_seq,route_order) VALUES (?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(message_id) DO NOTHING
     `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender, m.ambient ? 1 : 0,
-      m.attachment || m.attachments || m.parts || m.quoteId || m.command || m.cardAction ? JSON.stringify({
+      m.attachment || m.attachments || m.parts || m.quoteId || m.command || m.cardAction || m.deferredForm ? JSON.stringify({
         attachment: m.attachment, attachments: m.attachments, parts: m.parts, quoteId: m.quoteId, command: m.command, cardAction: m.cardAction,
+        deferredForm: m.deferredForm,
       }) : null, m.messageSeq ?? null, m.messageSeq ??
         (this.db.prepare('SELECT MAX(message_seq) AS n FROM jobs WHERE channel_type=? AND COALESCE(channel_id,sender)=?')
           .get(m.channelType ?? 1, m.channelId ?? m.sender).n ?? 0) + 0.5)
@@ -175,9 +176,137 @@ export class Store {
   }
 
   bindCard(binding) {
-    this.db.prepare('DELETE FROM card_bindings WHERE expires_ms <= ?').run(Date.now())
+    const now = Date.now()
+    // Deferred feedback is a durable obligation, including after expiry/restart.
+    this.db.prepare(`DELETE FROM card_bindings WHERE expires_ms <= ? AND (
+      json_extract(binding,'$.deferred') IS NULL OR (expires_ms <= ?
+        AND json_extract(binding,'$.deferred.state') <> 'pending'
+        AND json_extract(binding,'$.deferred.feedback') = 1))`).run(now, now - 30 * 86_400_000)
     this.db.prepare('INSERT INTO card_bindings (message_id,binding,expires_ms) VALUES (?,?,?)')
       .run(binding.messageId, JSON.stringify(binding), binding.expiresAt)
+  }
+
+  canPublishDeferred(sessionId) {
+    // Each Store is already bound to one account. Check before the external send;
+    // confirmed receipts must still be saved if concurrent sends fill the quota.
+    const row = this.db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(json_extract(binding,'$.deferred.sessionId') = ?),0) AS session_total
+      FROM card_bindings WHERE expires_ms > ? AND claimed=0
+        AND json_extract(binding,'$.deferred.state') = 'pending'`).get(sessionId, Date.now())
+    return row.total < 50 && row.session_total < 10
+  }
+
+  bindDeferredCard(binding, jobSeq) {
+    if (binding.deferred?.state !== 'pending') throw new Error('invalid_deferred_card_state')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.bindCard(binding)
+      const recorded = this.db.prepare('UPDATE jobs SET result_id=? WHERE seq=?').run(binding.messageId, jobSeq)
+      if (!recorded.changes) throw new Error('deferred_job_missing')
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  deferredCard(id) {
+    const row = this.db.prepare(`SELECT binding FROM card_bindings WHERE message_id=?
+      AND json_extract(binding,'$.deferred') IS NOT NULL`).get(id)
+    if (!row) return null
+    const binding = JSON.parse(row.binding)
+    if (binding.deferred.responseId) {
+      const response = this.db.prepare('SELECT state FROM jobs WHERE message_id=?').get(binding.deferred.responseId)
+      if (response) binding.responseState = response.state
+    }
+    return binding
+  }
+
+  claimDeferredCard(action, m) {
+    if (m.messageId !== 'card_action:' + action.eventId) throw new Error('invalid_deferred_response_id')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const claimed = this.db.prepare(`UPDATE card_bindings SET claimed=1,
+        binding=json_set(binding,'$.deferred.state','submitted','$.deferred.responseId',?,
+          '$.deferred.feedback',json('false'))
+        WHERE message_id=? AND expires_ms>? AND claimed=0
+          AND json_extract(binding,'$.deferred.state')='pending'`).run(m.messageId, action.messageId, Date.now()).changes > 0
+      if (!claimed || !this.add(action.eventId, m).changes) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      if (!this.queueCardAck(action.eventId)) throw new Error('deferred_ack_receipt_missing')
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  closeDeferredCard(id, state, summary) {
+    if (!['cancelled', 'expired', 'invalid', 'unavailable'].includes(state)) throw new Error('invalid_deferred_card_state')
+    // One statement, so rejection can include this transition in its transaction.
+    return this.db.prepare(`UPDATE card_bindings SET claimed=1,
+      binding=json_set(binding,'$.deferred.state',?,'$.deferred.summary',?,'$.deferred.feedback',json('false'))
+      WHERE message_id=? AND json_extract(binding,'$.deferred.state')='pending'`).run(state, summary, id).changes > 0
+  }
+
+  rejectDeferredCard(action, m, state, summary) {
+    if (m.messageId !== 'card_action:' + action.eventId) throw new Error('invalid_deferred_response_id')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const eligible = this.db.prepare(`SELECT 1 FROM card_bindings WHERE message_id=? AND expires_ms>? AND claimed=0
+        AND json_extract(binding,'$.deferred.state')='pending'`).get(action.messageId, Date.now())
+      if (!eligible || !this.closeDeferredCard(action.messageId, state, summary)
+        || !this.rememberAnswer(action.eventId, m, null)) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      if (!this.queueCardAck(action.eventId)) throw new Error('deferred_ack_receipt_missing')
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  acknowledgeDeferredEvent(action, m) {
+    if (m.messageId !== 'card_action:' + action.eventId) throw new Error('invalid_deferred_response_id')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      // The caller validates account/route/operator/nonce/action even for a
+      // closed card. A new event on that card is a receipt, never another task.
+      const known = this.db.prepare(`SELECT 1 FROM card_bindings WHERE message_id=?
+        AND json_extract(binding,'$.deferred.state') IS NOT NULL
+        AND (json_extract(binding,'$.deferred.state') <> 'pending' OR expires_ms<=?)`).get(action.messageId, Date.now())
+      if (!known) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      const inserted = this.rememberAnswer(action.eventId, m, null)
+      if (!this.queueCardAck(action.eventId)) throw new Error('deferred_ack_receipt_missing')
+      this.db.exec('COMMIT')
+      return inserted
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  expireDeferredCards(now = Date.now()) {
+    return this.db.prepare(`UPDATE card_bindings SET claimed=1,
+      binding=json_set(binding,'$.deferred.state','expired','$.deferred.summary','表单已过期，无法继续提交。',
+        '$.deferred.feedback',json('false'))
+      WHERE message_id IN (SELECT message_id FROM card_bindings WHERE expires_ms<=?
+        AND json_extract(binding,'$.deferred.state')='pending' ORDER BY expires_ms,message_id LIMIT 50)`).run(now).changes
+  }
+
+  deferredFeedback() {
+    return this.db.prepare(`SELECT binding FROM card_bindings
+      WHERE json_extract(binding,'$.deferred.state') <> 'pending'
+        AND COALESCE(json_extract(binding,'$.deferred.feedback'),0)=0
+        AND COALESCE(json_extract(binding,'$.deferred.nextFeedbackAt'),0)<=?
+      ORDER BY expires_ms,message_id LIMIT 20`).all(Date.now()).map(row => JSON.parse(row.binding))
+  }
+
+  deferredFeedbackAttempt(id) {
+    this.db.prepare(`UPDATE card_bindings SET binding=json_set(binding,'$.deferred.nextFeedbackAt',?)
+      WHERE message_id=? AND json_extract(binding,'$.deferred.state') <> 'pending'`).run(Date.now() + 60000, id)
+  }
+
+  deferredFeedbackSent(id) {
+    this.db.prepare(`UPDATE card_bindings SET binding=json_set(binding,'$.deferred.feedback',json('true'))
+      WHERE message_id=? AND json_extract(binding,'$.deferred.state') <> 'pending'`).run(id)
   }
 
   hasEvent(id) {
@@ -204,6 +333,11 @@ export class Store {
 
   hasOpenCard() {
     return !!this.db.prepare('SELECT 1 FROM card_bindings WHERE expires_ms>? AND claimed=0 LIMIT 1').get(Date.now())
+  }
+
+  hasDeferredCards() {
+    return !!this.db.prepare(`SELECT 1 FROM card_bindings WHERE expires_ms>?
+      AND json_extract(binding,'$.deferred') IS NOT NULL LIMIT 1`).get(Date.now() - 30 * 86_400_000)
   }
 
   unfinishedQuestionCards() {
@@ -289,6 +423,13 @@ export class Store {
       this.db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  boundSession(conversation, sessionId) {
+    const row = this.db.prepare(`SELECT session_id FROM conversations WHERE sender=? AND session_id=? AND created=1
+      UNION ALL SELECT session_id FROM conversation_history WHERE sender=? AND session_id=? LIMIT 1`)
+      .get(conversation, sessionId, conversation, sessionId)
+    return row ? { session_id: row.session_id, created: 1 } : null
   }
 
   sessionCreated(sender) { this.db.prepare('UPDATE conversations SET created=1 WHERE sender=?').run(sender) }

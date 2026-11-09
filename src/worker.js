@@ -14,6 +14,7 @@ import { apiErrorCode } from './api-errors.js'
 import { spec as displayCardSpec, sendDisplayCard } from './display-card.js'
 import { voiceTool } from './voice-tool.js'
 import { formToolSpec } from './form-tool.js'
+import { deferredFormSpecs, publishDeferredForm, manageDeferredForm, deferredMessage, flushDeferredFeedback } from './deferred-forms.js'
 import { InboxRecovery } from './inbox.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
@@ -88,12 +89,15 @@ const textCommands = {
 
 
 const hostIssues = new Set(['session_busy', 'session_timeout', 'session_preset_conflict',
+  'deferred_session_unavailable', 'deferred_configuration_changed',
   'delivery_access_changed',
   'missing_host_model', 'shared_turn_not_forwarded', 'prompt_discarded', 'no_confirmed_final_text',
   'session_missing', 'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context',
   'missing_scoped_tool_controls', 'missing_host_permission', 'session_requires_owned_writer', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
 
 const failureDetails = {
+  deferred_session_unavailable: '这张表单对应的原会话已不可用，未另开会话执行。请重新发起任务。',
+  deferred_configuration_changed: '这张表单发布后的工作区、模型或工具权限已变更，未按新配置执行旧表单。请重新发起。',
   delivery_access_changed: '账号设置或频道权限已变更，剩余交付已停止。请在 DSH 查看已执行的结果。',
   session_busy: '此 DSH 会话正由另一个回合使用，请待当前回合结束后继续。',
   session_timeout: '本次处理超时。可能已有工具执行，请先在 DSH 核对进度再决定是否继续。',
@@ -141,7 +145,8 @@ export class Worker {
 
   async liveToolAccess(job, signal) {
     const config = this.config
-    if (!this.liveToolAllowed(job, config) || !await this.api.allowsMessage(config, job, signal)
+    const admission = job.deferredForm ? { ...config, senderPolicy: 'octo' } : config
+    if (!this.liveToolAllowed(job, config) || !await this.api.allowsMessage(admission, job, signal)
       || !this.liveToolAllowed(job, config)) throw new Error('octo_access_denied')
     return config
   }
@@ -162,8 +167,8 @@ export class Worker {
     // Retain the configured admission model. For Octo-managed access, verify
     // the live friendship/membership again after preparation, not just intake.
     try {
-      if ((current.botKind === 'app' || job.ambient || current.senderPolicy === 'octo' || job.channel_type !== 1 && current.channelPolicy === 'joined')
-        && !await this.api.allowsMessage(current, job, signal)) throw new Error('delivery_access_changed')
+      if ((job.deferredForm || current.botKind === 'app' || job.ambient || current.senderPolicy === 'octo' || job.channel_type !== 1 && current.channelPolicy === 'joined')
+        && !await this.api.allowsMessage(job.deferredForm ? { ...current, senderPolicy: 'octo' } : current, job, signal)) throw new Error('delivery_access_changed')
     } catch (error) {
       if (error instanceof OctoError && ['api_authentication_failed', 'api_permission_denied', 'api_not_found', 'api_disabled']
         .includes(apiErrorCode(error))) throw new Error('delivery_access_changed')
@@ -255,6 +260,57 @@ export class Worker {
     for (const id of this.store.pendingCardAcks()) await this.ackCardEvent(id, signal)
   }
 
+  async deferredAccess(binding, signal, resume = false) {
+    const config = this.config
+    const job = { sender: binding.operatorUid, ...binding.route, message_id: binding.messageId, deferredForm: true }
+    if (resume && (deliveryProfile(config, job) !== binding.deferred.profile
+      || !binding.deferred.model?.policy || this.host.modelProfile?.() !== binding.deferred.model.policy)) throw new Error('deferred_configuration_changed')
+    await this.liveToolAccess(job, signal)
+    if (config !== this.config) throw new Error('deferred_configuration_changed')
+    if (resume && (!this.store.boundSession(binding.deferred.conversation, binding.deferred.sessionId)
+      || this.isArchived?.(binding.deferred.sessionId)
+      || await this.host.exists?.(binding.deferred.sessionId, signal) === false)) throw new Error('deferred_session_unavailable')
+    if (config !== this.config) throw new Error('deferred_configuration_changed')
+  }
+
+  async acceptDeferred(binding, selection, signal) {
+    const empty = { messageId: 'card_action:' + selection.eventId, sender: selection.operatorUid,
+      channelId: selection.route.channel_id, channelType: selection.route.channel_type, text: '' }
+    let issue = selection.invalidInputs ? 'invalid' : undefined
+    if (!issue) {
+      try { await this.deferredAccess(binding, signal, true) }
+      catch (error) {
+        signal.throwIfAborted()
+        // Known loss retires this submission. Transient API failures leave the
+        // durable card open and the event unACKed for a later check.
+        if (error instanceof OctoError && ![401, 403, 404].includes(error.status)) throw error
+        if (error?.code && !['api_permission_denied', 'api_authentication_failed', 'api_not_found',
+          'message_unavailable', 'message_outside_channel', 'account_configuration_changed'].includes(error.code)) throw error
+        if (!(error instanceof OctoError) && !error?.code && !['octo_access_denied',
+          'deferred_configuration_changed', 'deferred_session_unavailable'].includes(error?.message)) throw error
+        issue = 'unavailable'
+      }
+    }
+    const recorded = issue ? this.store.rejectDeferredCard(selection, empty, issue, issue === 'invalid'
+      ? '本次表单答案格式无效，未触发任务。请重新请求一张表单。'
+      : '表单的原会话、账号配置或访问权限已不可用，答案未触发任务。请重新发起。')
+      : this.store.claimDeferredCard(selection, deferredMessage(binding, selection))
+    if (!recorded) {
+      // Cancellation/expiry may win while a live authorization query is in
+      // flight. Persist a terminal receipt rather than losing its ACK obligation.
+      this.store.expireDeferredCards(Date.now())
+      this.store.acknowledgeDeferredEvent(selection, empty)
+    }
+    await this.ackCardEvent(selection.eventId, signal)
+  }
+
+  async deferredFeedback(signal) {
+    if (!this.store.deferredFeedback || Date.now() < (this.deferredFeedbackAt ?? 0)) return
+    this.deferredFeedbackAt = Date.now() + 30000
+    await flushDeferredFeedback({ api: this.api, store: this.store, signal, log: this.log,
+      authorize: binding => this.deferredAccess(binding, signal) })
+  }
+
   async ingest(signal, cardsOnly = false) {
     await this.flushCardAcks(signal)
     const events = await this.api.events(signal, this.cursor)
@@ -269,9 +325,24 @@ export class Worker {
       if (BigInt(id) <= BigInt(this.cursor)) continue
       const action = parseCardAction(event)
       if (action) {
-        const binding = this.store.cardBinding(action.messageId)
-        const selection = resolveCardAction(event, binding, this.config, Date.now(), { reportInvalidInputs: !!binding?.questionKey })
-        if (selection && permitsRoute(this.config, selection.operatorUid, selection.route.channel_type, selection.route.channel_id)) {
+        const binding = this.store.cardBinding(action.messageId) ?? this.store.deferredCard?.(action.messageId)
+        const terminalForm = binding?.deferred && (binding.deferred.state !== 'pending' || binding.expiresAt <= Date.now())
+        // Terminal forms still recognize their own callbacks for durable ACK,
+        // but never dispatch them. Expiry relaxation is ONLY for that receipt.
+        const selection = resolveCardAction(event, binding, this.config,
+          terminalForm ? Math.min(Date.now(), binding.expiresAt - 1) : Date.now(),
+          { reportInvalidInputs: !!binding?.questionKey || !!binding?.deferred })
+        if (selection && terminalForm) {
+          this.store.expireDeferredCards(Date.now())
+          this.store.acknowledgeDeferredEvent(selection, {
+            messageId: 'card_action:' + selection.eventId, sender: selection.operatorUid,
+            channelId: selection.route.channel_id, channelType: selection.route.channel_type, text: '',
+          })
+          await this.ackCardEvent(id, signal)
+        } else if (selection && binding.deferred) {
+          await this.acceptDeferred(binding, selection, signal)
+          this.deferredFeedbackAt = 0
+        } else if (selection && permitsRoute(this.config, selection.operatorUid, selection.route.channel_type, selection.route.channel_id)) {
           const message = {
             messageId: 'card_action:' + id, sender: selection.operatorUid, channelId: selection.route.channel_id,
             channelType: selection.route.channel_type, text: '', cardAction: { selection: selection.selection,
@@ -385,6 +456,7 @@ export class Worker {
     }
     const route = { channel_id: recipient, channel_type: channelType }
     let meta = job.metadata ? JSON.parse(job.metadata) : {}
+    if (meta.deferredForm) job = { ...job, deferredForm: true }
     if (job.state !== 'queued' && (!/^[a-f0-9]{64}$/.test(meta.deliveryProfile ?? '')
       || meta.deliverables?.length && !/^[a-f0-9]{64}$/.test(meta.deliveryMediaProfile ?? ''))) {
       this.store.review(job.seq, 'delivery_profile_unavailable')
@@ -451,15 +523,26 @@ export class Worker {
           ])
           const { attachments, order } = material
           const voice = config.allowFiles && config.botKind !== 'app' ? voiceTool(this.api, attachments) : undefined
-          let session = this.store.session(conversation, config.idleMinutes)
+          if (meta.deferredForm && (meta.deferredForm.profile !== profile || meta.deferredForm.conversation !== conversation
+            || !toolsAllowed || !meta.deferredForm.model?.policy
+            || host.modelProfile?.() !== meta.deferredForm.model.policy)) throw new Error('deferred_configuration_changed')
+          if (meta.deferredForm) await this.liveToolAccess(job, signal)
+          let session = meta.deferredForm
+            ? this.store.boundSession(conversation, meta.deferredForm.sessionId)
+            : this.store.session(conversation, config.idleMinutes)
+          if (!session) throw new Error('deferred_session_unavailable')
           if (session.created && await host.exists?.(session.session_id, signal) === false) {
+            if (meta.deferredForm) throw new Error('deferred_session_unavailable')
             this.store.forgetSession(session.session_id)
             session = this.store.session(conversation)
           }
-          if (this.isArchived?.(session.session_id)) session = this.store.session(conversation, config.idleMinutes, Date.now(), true)
+          if (this.isArchived?.(session.session_id)) {
+            if (meta.deferredForm) throw new Error('deferred_session_unavailable')
+            session = this.store.session(conversation, config.idleMinutes, Date.now(), true)
+          }
           this.store.running(job.seq, session.session_id)
           const isFileOnly = attachments.length > 0 && !job.input.trim()
-          const canMerge = () => config.transport === 'websocket' && !this.paused && this.config.sendMode === 'steer'
+          const canMerge = () => !meta.deferredForm && config.transport === 'websocket' && !this.paused && this.config.sendMode === 'steer'
             && this.config.sessionProfile === config.sessionProfile && authorizedTools(this.config, job)
           // A file sent without a caption is often followed by its instructions
           // in a separate message. Give that text a short chance to join.
@@ -484,7 +567,7 @@ export class Worker {
           const authorCard = safeCommand(config, job) && !attachments.length
             && /卡片|\bcard\b/iu.test(input)
           const run = () => host.run(session, input, async () => {
-            this.store.sessionCreated(conversation)
+            if (!meta.deferredForm) this.store.sessionCreated(conversation)
             await this.attach?.(session.session_id, config.cwd)
           }, signal, rules,
             phase => {
@@ -504,9 +587,24 @@ export class Worker {
                         || ['space.members.search', 'groups.create'].includes(spec.name)))).map(spec => ({
                   name: 'octo_' + spec.name.replaceAll('.', '_'), description: spec.description, parameters: spec.parameters,
                 })),
-                  displayCardSpec, ...(voice ? [voice.spec] : []), ...(toolsAllowed ? [formToolSpec] : [])],
+                  displayCardSpec, ...(voice ? [voice.spec] : []), ...(toolsAllowed ? [formToolSpec, ...deferredFormSpecs] : [])],
                 waitNames: toolsAllowed ? [formToolSpec.name] : [],
-                execute: (name, args, toolSignal) => {
+                execute: (name, args, toolSignal, model) => {
+                  if (name === 'octo_form_publish') {
+                    const detached = structuredClone(args)
+                    const publish = () => publishDeferredForm({ config: sourceConfig, store: this.store, job,
+                      session, conversation, profile, model, args: detached, signal: toolSignal,
+                      authorize: async () => {
+                        await this.liveToolAccess(job, toolSignal)
+                        await authorizeDelivery({ tool: true }, toolSignal)
+                        if (host.modelProfile?.() !== model?.policy) throw new Error('deferred_configuration_changed')
+                      } })
+                    const result = (this.deferredPublishing ?? Promise.resolve()).then(publish, publish)
+                    this.deferredPublishing = result.catch(() => {})
+                    return result
+                  }
+                  if (name === 'octo_form_manage') return manageDeferredForm({ store: this.store, job,
+                    args: structuredClone(args), authorize: () => this.liveToolAccess(job, toolSignal) })
                   if (name === formToolSpec.name) return (async () => {
                     const current = await this.liveToolAccess(job, toolSignal)
                     const answer = await this.questions.form(args, { ...job, session_id: session.session_id }, current, toolSignal,
@@ -595,14 +693,16 @@ export class Worker {
                 await this.liveToolAccess(job, askSignal)
                 return answer
               } }),
+              ...(meta.deferredForm && { expectedModel: meta.deferredForm.model }),
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
-              ...(toolsAllowed && config.transport === 'websocket'
+              ...(toolsAllowed && !meta.deferredForm && config.transport === 'websocket'
                 && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })
           try { reply = await run() }
           catch (error) {
             // The native session can be deleted between stat and resume. Only
             // this explicit pre-run failure permits creating a new session.
             if (error?.message !== 'session_missing') throw error
+            if (meta.deferredForm) throw new Error('deferred_session_unavailable')
             this.store.forgetSession(session.session_id)
             session = this.store.session(conversation)
             for (const seq of [job.seq, ...merged]) this.store.running(seq, session.session_id)
@@ -636,6 +736,7 @@ export class Worker {
         const bounded = boundedMarkdown(reply)
         if (!bounded) throw new Error('empty_reply')
         meta = meta.command || meta.cardAction ? meta : {
+          ...(meta.deferredForm && { deferredForm: meta.deferredForm }),
           ...(deliverables?.length && { deliverables }), ...(merged.length && { merged }), ...(card && { displayCard: card.form }),
         }
         meta.deliveryProfile = profile
@@ -787,6 +888,7 @@ export class Worker {
     let failures = 0
     while (!signal.aborted) {
       try {
+        await this.deferredFeedback(signal)
         await this.ingest(signal)
         if (failures || !this.pollReady) this.log('octo_poll_ok')
         this.pollReady = true
@@ -805,7 +907,12 @@ export class Worker {
     let failures = 0
     while (!signal.aborted) {
       try {
-        if (this.store.hasOpenCard()) await this.ingest(signal, true)
+        await this.deferredFeedback(signal)
+        const late = Date.now() >= (this.lateCardPollAt ?? 0) && this.store.hasDeferredCards?.()
+        if (this.store.hasOpenCard() || late) {
+          this.lateCardPollAt = Date.now() + 30000
+          await this.ingest(signal, true)
+        }
         else {
           // The last claim closes its form before ACK. Retry by exact receipt ID
           // even with no forms left, after expiry, or in a newly started worker.

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { ruleContext } from './rules.js'
 import { prepareInput } from './dsh-media.js'
 import { sessionExists } from './session-state.js'
@@ -9,7 +9,11 @@ import { mountApprovalAdapter } from './approval.js'
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
   'missing_scoped_tool_controls', 'missing_scoped_rule_context', 'missing_host_permission', 'session_requires_owned_writer',
-  'shared_turn_not_forwarded', 'no_confirmed_final_text', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
+  'shared_turn_not_forwarded', 'no_confirmed_final_text', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable',
+  'deferred_configuration_changed'])
+const modelIdentity = selected => createHash('sha256').update(JSON.stringify([
+  selected?.provider ?? null, selected?.model ?? null, selected?.reasoningEffort ?? null,
+])).digest('hex')
 
 function wait(promise, signal) {
   return new Promise((resolve, reject) => {
@@ -27,15 +31,22 @@ export class DshHost {
   }
   exists(sessionId, signal) { return sessionExists(this.ctx, sessionId, signal) }
 
+  modelSelection() {
+    const selected = this.profile.provider ? this.profile : this.ctx.agentDefaultModel.currentSelection()
+    if (!selected?.provider || !selected?.model) throw new Error('missing_host_model')
+    return { provider: selected.provider, model: selected.model,
+      ...(this.profile.provider && selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) }
+  }
+  modelProfile() { return modelIdentity(this.modelSelection()) }
+
   async run(session, text, onCreated, lifetime, rules, onStage = () => {}, timeoutMs = this.timeoutMs, toolsAllowed = false, extras = {}) {
     lifetime.throwIfAborted()
     const ctx = this.ctx
-    const selected = this.profile.provider ? this.profile : ctx.agentDefaultModel.currentSelection()
-    if (!selected?.provider || !selected?.model) throw new Error('missing_host_model')
+    const agentOptions = this.modelSelection()
+    const policy = modelIdentity(agentOptions)
+    if (extras.expectedModel && policy !== extras.expectedModel.policy) throw new Error('deferred_configuration_changed')
     const deadline = new RunClock(timeoutMs)
     const signal = AbortSignal.any([lifetime, deadline.signal])
-    const agentOptions = { provider: selected.provider, model: selected.model,
-      ...(this.profile.provider && selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) }
     const permission = toolsAllowed && this.profile.permission !== 'text-only' ? this.profile.permission : null
     const authority = { active: false, mixed: false }
     const chosen = this.profile.agentPreset ?? 'octo-text'
@@ -53,7 +64,8 @@ export class DshHost {
           execute: async (name, args, toolSignal) => {
             const waiting = extras.channelTools.waitNames?.includes(name)
             if (waiting) deadline.pause()
-            try { return await extras.channelTools.execute(name, args, toolSignal) }
+            try { return await extras.channelTools.execute(name, args, toolSignal,
+              { policy, effective: modelIdentity(agent.model?.current?.() ?? agentOptions) }) }
             finally { if (waiting) deadline.resume() }
           },
           isActive: () => authority.active && !authority.mixed && !signal.aborted })
@@ -194,6 +206,10 @@ export class DshHost {
         await onCreated()
       }
       signal.throwIfAborted()
+      if (extras.expectedModel && (this.modelProfile() !== extras.expectedModel.policy
+        || modelIdentity(agent.model?.current?.() ?? agentOptions) !== extras.expectedModel.effective)) {
+        throw new Error('deferred_configuration_changed')
+      }
       failure = 'session_turn_failed'
       const content = await prepareInput(ctx, agent, text, extras.attachments, signal, extras.order)
       const reply = await this.#turn(agent, content, signal, onStage, authority,

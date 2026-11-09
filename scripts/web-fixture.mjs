@@ -6,7 +6,10 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
 
 // AppBot is a separate fixture, not a relaxation of any USER-mode assertion.
-if (process.env.DSH_OCTO_FIXTURE_APP_BOT === '1') await appBotFixture()
+if (process.env.DSH_OCTO_FIXTURE_DEFERRED === '1') {
+  const { installDeferredFixture } = await import('./deferred-fixture.mjs')
+  await installDeferredFixture()
+} else if (process.env.DSH_OCTO_FIXTURE_APP_BOT === '1') await appBotFixture()
 else {
 let received = 0
 let sent = 0
@@ -1134,7 +1137,7 @@ async function appBotFixture() {
         return stream(body, ordinary)
       }
       if (!isDeepStrictEqual(names.filter(name => name.startsWith('octo_')).sort(),
-        [...channelTools, 'octo_display_card', 'octo_form'].sort())) return fail('CHANNEL_TOOL_MENU')
+        [...channelTools, 'octo_display_card', 'octo_form', 'octo_form_publish', 'octo_form_manage'].sort())) return fail('CHANNEL_TOOL_MENU')
       if (step === 0) console.log('FIXTURE_APP_CHANNEL_TOOLS_OK=' + channelTools.length)
       if (sent !== 1 || history.includes('appbot fixture prompt 1') || history.includes(ordinary)
         || operations.some(([name]) => !names.includes(name))) return fail('OWNER_PERMISSIONS_OR_HISTORY')
