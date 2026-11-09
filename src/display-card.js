@@ -13,6 +13,7 @@ import { isIP } from 'node:net'
 import { validUid } from './config.js'
 import { decimalId, OctoError } from './octo.js'
 import { ruleScope } from './rules.js'
+import { apiErrorCode } from './api-errors.js'
 
 const version = '1.5'
 const maxPayloadBytes = 24 * 1024
@@ -448,7 +449,12 @@ export async function sendDisplayCard({ api, route, args, signal } = {}) {
   let messageId
   try { messageId = await api.progressCard(target, frame, active) } catch (error) {
     // No exception message, response body, stack, cancellation reason or credential leaves this helper.
-    if (error instanceof OctoError && error.status >= 400 && error.status < 500) fail('display_card_refused')
+    // The official legacy facade can wrap a post-dispatch send_failed (500)
+    // as HTTP 400. Its authenticated classification must override the wire
+    // status; an uncertain card may already exist and must not be resent.
+    if (error instanceof OctoError && ['api_invalid_request', 'api_authentication_failed', 'api_permission_denied',
+      'api_not_found', 'api_method_not_allowed', 'api_conflict', 'api_rate_limited', 'api_disabled', 'api_unsupported']
+      .includes(apiErrorCode(error))) fail('display_card_refused')
     fail('display_card_delivery_unconfirmed')
   }
   const confirmed = decimalId(messageId)

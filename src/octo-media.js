@@ -335,7 +335,7 @@ function imageDimensions(bytes, mime) {
   return width > 0 && height > 0 ? { width, height } : {}
 }
 
-async function uploadMedia(ctx, file) {
+async function uploadMedia(ctx, file, authorize) {
   const { bytes } = file ?? {}
   const name = safeName(file?.name)
   const mime = mimeType(file?.mime)
@@ -343,6 +343,7 @@ async function uploadMedia(ctx, file) {
   const size = bytes.length
   if (size > ctx.limit) throw error('media_too_large')
 
+  await authorize?.()
   const { upload, download, contentType, contentDisposition } = await atStage(ctx, 'presign', async () => {
     const query = new URLSearchParams({ filename: name, fileSize: String(size), contentType: mime })
     const response = await request(ctx, ctx.base + '/v1/bot/upload/presigned?' + query, { method: 'GET', headers: ctx.auth })
@@ -363,6 +364,7 @@ async function uploadMedia(ctx, file) {
     return { upload, download, contentType, contentDisposition }
   })
 
+  await authorize?.()
   await atStage(ctx, 'put', async () => {
     const response = await request(ctx, upload.href, {
       method: 'PUT', body: bytes,
@@ -382,8 +384,9 @@ async function uploadMedia(ctx, file) {
     ...(isImage && imageDimensions(bytes, storedMime)) }
 }
 
-export function prepareAttachment(config, file, signal) {
-  return uploadMedia(context(config, signal), file)
+export function prepareAttachment(config, file, signal, { authorize } = {}) {
+  if (authorize !== undefined && typeof authorize !== 'function') throw error('media_invalid_config')
+  return uploadMedia(context(config, signal), file, authorize)
 }
 
 /** Upload caller-authorized bytes and send as a native image/file message. */

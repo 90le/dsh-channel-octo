@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { downloadAttachment, normalizeAttachment, uploadAttachment } from '../src/octo-media.js'
+import { downloadAttachment, normalizeAttachment, uploadAttachment, prepareAttachment } from '../src/octo-media.js'
 
 const api = 'https://api.example.invalid/gateway'
 const cdn = 'https://cdn.example.invalid'
@@ -32,6 +32,26 @@ function mocked(responses, overrides) {
   }
   return { calls, config: { ...config, ...overrides, fetchImpl } }
 }
+
+test('upload preparation rechecks caller authorization before presigning and before object storage', async () => {
+  for (const stopAt of [1, 2, 3]) {
+    const mock = mocked([Response.json(signed), putOK()])
+    let gates = 0
+    const run = prepareAttachment(mock.config, file, new AbortController().signal, { authorize: async () => {
+      if (++gates === stopAt) throw new Error('access_revoked')
+    } })
+    if (stopAt <= 2) {
+      await assert.rejects(run, /access_revoked/)
+      assert.equal(mock.calls.length, stopAt - 1)
+    } else {
+      const result = await run
+      assert.equal(result.type, 8)
+      assert.equal(mock.calls.length, 2)
+      assert.equal(gates, 2)
+      assert.equal(mock.calls[1].headers.Authorization, undefined)
+    }
+  }
+})
 
 test('normalizes Octo file, image, GIF, voice and video wire payloads', () => {
   for (const [payload, kind, name, mime, size] of [

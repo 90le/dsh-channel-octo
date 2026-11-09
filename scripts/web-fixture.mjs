@@ -11,6 +11,7 @@ const groupToolsSmoke = process.env.DSH_OCTO_FIXTURE_GROUP_TOOLS === '1'
 const delegatedSmoke = process.env.DSH_OCTO_FIXTURE_DELEGATED_SEARCH === '1'
 let delegatedStep = 0
 const ownerCaption = 'fixture response 1\n\n文件：<fixture_summary.md>\n\n**摘要结构**\n\n- 第一项：文件已生成。\n- 第二项：说明随文件完整交付。\n\n可继续修改 ✅'
+const targetCaption = 'EXPLICIT-TARGET-CAPTION\n\n' + ownerCaption
 const deleteSmoke = process.env.DSH_OCTO_FIXTURE_DELETE === '1'
 let ownerStep = 0, uploaded = false, questionAnswered = false
 let questionIndex = 0
@@ -304,6 +305,24 @@ globalThis.fetch = async (input, init) => {
     })
     if (url.pathname.endsWith('/sendMessage')) {
       const body = JSON.parse(init.body)
+      if (delegatedSmoke && received === 2 && body.payload.type === 8) {
+        if (!uploaded || body.channel_type !== 2 || body.channel_id !== group || body.on_behalf_of || body.payload.reply
+          || body.payload.name !== 'octo-tool-fixture.txt' || body.payload.url !== 'https://files-fixture.invalid/fixture.txt') return new Response(null, { status: 400 })
+        console.log('FIXTURE_TARGET_FILE_SENT')
+        return json({ message_id: '780' })
+      }
+      if (delegatedSmoke && body.payload.content === targetCaption) {
+        if (received !== 2 || body.channel_type !== 2 || body.channel_id !== group || body.payload.type !== 1
+          || body.on_behalf_of || body.payload.reply) return new Response(null, { status: 400 })
+        console.log('FIXTURE_TARGET_CAPTION_SENT')
+        return json({ message_id: '781' })
+      }
+      if (delegatedSmoke && body.payload.plain === 'TARGET-CARD\n完成文件交付。') {
+        if (received !== 2 || body.channel_type !== 5 || body.channel_id !== group + '____' + thread
+          || body.payload.type !== 17 || body.payload.card.actions?.length || body.on_behalf_of || body.payload.reply) return new Response(null, { status: 400 })
+        console.log('FIXTURE_TARGET_CARD_SENT')
+        return json({ message_id: '782' })
+      }
       if (delegatedSmoke && body.payload.content?.startsWith('EXPLICIT-TARGET-FIXTURE')) {
         const topicSend = body.channel_type === 5
         if (received !== 2 || body.channel_id !== (topicSend ? group + '____' + thread : group)
@@ -469,7 +488,7 @@ globalThis.fetch = async (input, init) => {
       }
       const names = (body.tools ?? []).map(tool => tool.name)
       const operations = ['octo_messages_search_authorized', 'octo_messages_search_authorized', 'octo_messages_search_authorized_files', 'octo_messages_search_authorized_groups',
-        'octo_messages_resolve_targets', 'octo_messages_send_target', 'octo_messages_send_target']
+        'octo_messages_resolve_targets', 'octo_messages_send_target', 'octo_messages_send_target', 'octo_messages_send_target_file', 'octo_messages_send_target_card']
       if (operations.some(name => !names.includes(name)) || history.includes('NEVER_RETURN_WIRE_')) return new Response(null, { status: 400 })
       let prior
       if (delegatedStep) {
@@ -478,14 +497,19 @@ globalThis.fetch = async (input, init) => {
         const text = typeof result?.content === 'string' ? result.content : (result?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
         try { prior = JSON.parse(text) } catch {}
         const expected = ['AUTHORIZED-SEARCH-EXCERPT', 'AUTHORIZED-PAGE-TWO', 'AUTHORIZED-FILE-EXCERPT', 'Authorized group',
-          'Fixture Group', 'EXPLICIT-TARGET-FIXTURE', 'Fixture Topic'][delegatedStep - 1]
+          'Fixture Group', 'EXPLICIT-TARGET-FIXTURE', 'Fixture Topic', 'EXPLICIT-TARGET-CAPTION', 'display_card'][delegatedStep - 1]
         if (!prior || result.is_error || !text.includes(expected) || delegatedStep === 1 && !/^ocs_[a-f0-9]{32}$/.test(prior.continuation)
-          || delegatedStep === 4 && ('match_count' in prior.groups[0] || 'total_groups' in prior)) return new Response(null, { status: 400 })
+          || delegatedStep === 4 && ('match_count' in prior.groups[0] || 'total_groups' in prior)
+          || delegatedStep === 8 && (!prior.ok || prior.message_id !== '780' || prior.caption_message_id !== '781' || prior.caption !== targetCaption)
+          || delegatedStep === 9 && (!prior.ok || prior.message_id !== '782' || !prior.requiresFinalSummary)) return new Response(null, { status: 400 })
         console.log('FIXTURE_DELEGATED_TOOL_OK=' + delegatedStep)
       }
       if (delegatedStep < operations.length) {
         const step = delegatedStep++, name = operations[step]
-        const args = step === 4 ? { name: 'Fixture' } : step >= 5 ? {
+        const args = step === 7 ? { target: { channel_id: group, channel_type: 2 }, path: 'octo-tool-fixture.txt', caption: targetCaption, confirm_send: true }
+          : step === 8 ? { target: { channel_id: group + '____' + thread, channel_type: 5 }, confirm_send: true,
+            title: 'TARGET-CARD', blocks: [{ type: 'text', text: '完成文件交付。' }] }
+          : step === 4 ? { name: 'Fixture' } : step >= 5 ? {
           target: { channel_id: step === 5 ? group : group + '____' + thread, channel_type: step === 5 ? 2 : 5 },
           text: 'EXPLICIT-TARGET-FIXTURE', uids: ['fixture-user'], confirm_send: true,
         } : { targets: [{ channel_id: group, channel_type: 2 }], keyword: 'fixture',

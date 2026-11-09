@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.13.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.14.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -61,7 +61,13 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
 
-## 0.13.0
+## 0.14.0
+
+新增 `messages.send_target_file` 和 `messages.send_target_card`，频道操作共 51 项。在获准使用 DSH 工具的私聊中，可按用户明确要求向指定群或子区交付工作区文件、图片或结构化展示卡。文件仅接受当前工作区相对路径，仍核对附件开关、权限与文件边界；名称目标须先解析，有歧义时请用户选择。发送前后不改变会话归属。
+
+文件说明作为完整文字/Markdown独立发送。文件成功而说明未确认时，返回文件回执和部分投递状态，不重发整个文件；图片使用原生图片消息。展示卡按服务端能力配置保留内容并降级不支持的元素，不包含回调按钮。获取上传地址、上传字节和发布消息分别核对当前权限。修复官方旧版 HTTP 400 包装内部发送失败的判断，展示卡和图文不再把未知投递当成确定拒绝后重复发送。
+
+0.14.0 发布前 941 项完整回归通过、无跳过；Windows 和 Debian 同版本隔离 DSH 均验证指定群文件、完整说明、子区展示卡及原生回执/最终回复，并回归既有群工具、审批、问答和表单。正式 Octo 多客户端渲染、真实授权检索及其他未完成能力仍见能力矩阵。
 
 账号管理参照 IM Connect 1.0.30。两个插件可共存，各自保留账号、会话与凭据。默认的文字模式可复用已经在 DSH Web 打开的空闲 Octo 会话。同回合混入其他来源的输入时不会向 Octo 转发。
 

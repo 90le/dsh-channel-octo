@@ -145,7 +145,15 @@ test('specs are immutable ordinary JSON schemas with no model-supplied route, UR
     assert.equal(entry.parameters.type, 'object')
     assert.equal(entry.parameters.additionalProperties, false)
     assert.ok(Object.isFrozen(entry.parameters))
-    assert.ok(!['url', 'host', 'path', 'group_no', 'channel_id', 'sender', 'on_behalf_of'].some(k => k in entry.parameters.properties))
+    assert.ok(!['url', 'host', 'group_no', 'channel_id', 'sender', 'on_behalf_of'].some(k => k in entry.parameters.properties))
+    if ('path' in entry.parameters.properties) {
+      // The sole path input selects a protected workspace file, never an HTTP
+      // endpoint. It is host-mediated and absent without private file access.
+      assert.equal(entry.name, 'messages.send_target_file')
+      assert.equal(entry.privateOnly, true)
+      assert.equal(entry.requiresFiles, true)
+      assert.equal(entry.mutating, true)
+    }
     assert.equal(entry.available, !entry.unavailableReason)
   }
   assert.deepEqual(JSON.parse(JSON.stringify(CHANNEL_API_OPERATIONS)), CHANNEL_API_OPERATIONS)

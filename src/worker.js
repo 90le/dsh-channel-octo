@@ -344,7 +344,7 @@ export class Worker {
         ? JSON.stringify([channelType, recipient, inheritance[0] ?? null, config.sessionProfile, ...capability])
         : channelType === 1 ? job.sender : JSON.stringify([channelType, recipient, ...inheritance, ...capability])
       this.store.running(job.seq)
-      let deliverables, card
+      let deliverables, card, targetFileAttempted = false
       try {
         let reply
         if (meta.command === 'card' || meta.command === 'choose') {
@@ -407,6 +407,7 @@ export class Worker {
             { attachments, order: inputOrder, authorCard, channelContext, taskContext: true, onTrace: trace => progress.trace(trace),
               ...((channelType !== 1 || toolsAllowed) && config.toolPermission !== 'text-only' && this.api.channel && { channelTools: {
                 specs: [...operationSpecs.filter(spec => spec.available && (config.toolPermission !== 'read-only' || !spec.mutating)
+                  && (!spec.requiresFiles || toolsAllowed && config.allowFiles)
                   && (!spec.privateOnly || channelType === 1)
                   && (channelType !== 1 ? !spec.name.startsWith('voice.context.')
                     : spec.name === 'inspect' || spec.name.startsWith('messages.')
@@ -435,12 +436,14 @@ export class Worker {
                   })()
                   const operation = operationSpecs.find(spec => 'octo_' + spec.name.replaceAll('.', '_') === name)
                   if (!operation?.available || config.toolPermission === 'read-only' && operation.mutating
+                    || operation.requiresFiles && (!toolsAllowed || !config.allowFiles)
                     || operation.privateOnly && channelType !== 1) throw new Error('octo_operation_unavailable')
                   return (async () => {
                     const allowed = () => this.config === sourceConfig && this.api.channel === sourceChannel
                       && this.config.toolPermission !== 'text-only'
                       && (this.config.toolPermission !== 'read-only' || !operation.mutating)
                       && (!operation.privateOnly || this.liveToolAllowed(job, sourceConfig))
+                      && (!operation.requiresFiles || this.config.allowFiles && this.liveToolAllowed(job, sourceConfig))
                       && permitsRoute(this.config, job.sender, channelType, recipient)
                     const check = async () => {
                       toolSignal?.throwIfAborted()
@@ -449,10 +452,43 @@ export class Worker {
                       }
                     }
                     await check()
-                    const result = await sourceChannel.dispatch(route, job.sender, operation.name, args, toolSignal)
+                    const runtime = operation.requiresFiles ? { prepareFile: async (path, authorize, mediaSignal) => {
+                      await check()
+                      const file = await readDeliverable(config.cwd, path, mediaSignal)
+                      return prepareAttachment(config, file, mediaSignal, { authorize: async () => {
+                        await check()
+                        await authorize()
+                        mediaSignal.throwIfAborted()
+                        if (!allowed()) throw new Error('octo_access_denied')
+                      } })
+                    } } : undefined
+                    // A failed/uncertain target tool already supplies a specific
+                    // result to DSH. Do not replace its final explanation with
+                    // the unrelated "present was not called" heuristic.
+                    if (operation.requiresFiles) targetFileAttempted = true
+                    const result = await sourceChannel.dispatch(route, job.sender, operation.name, args, toolSignal, runtime)
+                    const acknowledgedTarget = operation.name.startsWith('messages.send_target') && decimalId(result?.message_id)
+                    if (acknowledgedTarget) {
+                      // Preserve mutation evidence before a later admission
+                      // check can throw. A completed send cannot be undone by
+                      // withholding the result of a subsequent read.
+                      this.store.recordDelivery(job.seq, acknowledgedTarget)
+                      if (operation.requiresFiles) progress.trace({ kind: 'file-sent' })
+                    }
                     // Do not leak in-flight reads from an account configuration
                     // that changed while the server was answering the request.
-                    await check()
+                    try { await check() } catch (error) {
+                      if (!acknowledgedTarget) throw error
+                      // Only return evidence of this mutation, with no stale
+                      // channel names, caption text, URLs or member metadata.
+                      // Scope disposal/config changes can still revoke the
+                      // host adapter; the durable receipt remains available.
+                      return { ok: false, message_id: acknowledgedTarget, delivery_confirmed: true, access_changed: true,
+                        partial: result.partial === true, retry_whole_delivery: false, requiresFinalSummary: true,
+                        ...(operation.requiresFiles && { caption_status: result.caption_message_id ? 'confirmed'
+                          : result.caption_status === 'unconfirmed' ? 'unconfirmed'
+                            : result.caption_status === 'not_sent' ? 'not_sent' : 'not_requested' }) }
+                    }
                     return result
                   })()
                 }, guidance: mentionGuidance,
@@ -480,7 +516,7 @@ export class Worker {
             for (const seq of [job.seq, ...merged]) this.store.running(seq, session.session_id)
             reply = await run()
           }
-          if (asksForFile(input) && !deliverables?.length) {
+          if (asksForFile(input) && !deliverables?.length && !targetFileAttempted) {
             const issue = !config.allowFiles ? 'files_disabled' : !toolsAllowed || config.toolPermission === 'text-only'
               ? 'file_tools_unavailable' : 'file_not_presented'
             this.store.review(job.seq, issue)
@@ -581,7 +617,8 @@ export class Worker {
             } catch (error) {
               // A definitive unsupported/invalid response can downgrade to native
               // images without re-uploading. An ambiguous response is never replayed.
-              if (!(error instanceof OctoError) || ![400, 415, 422].includes(error.status)) throw error
+              if (!(error instanceof OctoError) || !(error.status === 400
+                ? apiErrorCode(error) === 'api_invalid_request' : [415, 422].includes(error.status))) throw error
             }
           }
         }

@@ -247,6 +247,8 @@ test('sanitizes probe/send errors, never retries ambiguous writes, and does not 
     [() => Response.json({ error: 'bf_private' }, { status: 403 }), 'display_card_refused'],
     [() => Response.json({}, { status: 429 }), 'display_card_refused'],
     [() => Response.json({}, { status: 500 }), 'display_card_delivery_unconfirmed'],
+    [() => Response.json({ status: 400, error: { code: 'err.server.bot_api.send_failed', http_status: 500 } }, { status: 400 }), 'display_card_delivery_unconfirmed'],
+    [() => Response.json({}, { status: 408 }), 'display_card_delivery_unconfirmed'],
     [() => Response.json({ message_id: 'not-confirmed' }), 'display_card_delivery_unconfirmed'],
     [() => { throw new Error('bf_private connection lost') }, 'display_card_delivery_unconfirmed'],
   ]) {

@@ -116,7 +116,7 @@ test('native DSH mixed input keeps order and continues past a rejected image', a
     { type: 'text', text: 'next' }, { type: 'text', text: '【此图片未能进入 DSH】' }, { type: 'text', text: 'end' }])
 })
 
-for (const mode of ['native', 'unsupported', 'unknown']) test('rich-image sending without empty DM quotations: ' + mode, async t => {
+for (const mode of ['native', 'unsupported', 'unknown', 'legacy-send-failed']) test('rich-image sending without empty DM quotations: ' + mode, async t => {
   const { cwd, store } = fixture(t)
   writeFileSync(join(cwd, 'pixel.png'), png)
   writeFileSync(join(cwd, 'report.txt'), 'document')
@@ -147,6 +147,8 @@ for (const mode of ['native', 'unsupported', 'unknown']) test('rich-image sendin
       payloads.push(payload)
       if (payload.type === 14 && mode === 'unsupported') return new Response(null, { status: 422 })
       if (payload.type === 14 && mode === 'unknown') throw new Error('lost acknowledgement')
+      if (payload.type === 14 && mode === 'legacy-send-failed') return Response.json({ status: 400,
+        error: { code: 'err.server.bot_api.send_failed', http_status: 500 } }, { status: 400 })
       return Response.json({ message_id: String(100 + payloads.length) })
     }
     assert.fail('unexpected request')
@@ -175,7 +177,7 @@ for (const mode of ['native', 'unsupported', 'unknown']) test('rich-image sendin
     { type: 'text', text: 'Final answer with image and file' }, { type: 'image', url: cdn + '/pixel.png', width: 1, height: 1 },
   ])
   const job = store.db.prepare('select state, issue from jobs').get()
-  assert.equal(job.state, mode === 'unknown' ? 'review' : 'sent')
+  assert.equal(job.state, ['unknown', 'legacy-send-failed'].includes(mode) ? 'review' : 'sent')
   assert.equal(store.next(Date.now()), undefined)
 })
 

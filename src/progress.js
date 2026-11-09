@@ -62,6 +62,7 @@ const toolLabels = new Map([
   ['octo_messages_search_authorized', '检索已授权频道消息'], ['octo_messages_search_authorized_files', '检索已授权频道文件'],
   ['octo_messages_search_authorized_groups', '整理已授权群摘要'],
   ['octo_messages_resolve_targets', '确认目标群与子区'], ['octo_messages_send_target', '向指定频道发送消息'],
+  ['octo_messages_send_target_file', '向指定频道交付文件'], ['octo_messages_send_target_card', '向指定频道发送展示卡'],
   ['octo_messages_user_info', '查询会话成员身份'], ['octo_messages_users_batch', '查询会话成员名称'],
   ['octo_webhooks_list', '查询频道 Webhook'], ['octo_webhooks_deliveries', '核对 Webhook 投递'],
   ['octo_webhooks_update', '更新频道 Webhook'], ['octo_webhooks_delete', '移除频道 Webhook'],
