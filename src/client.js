@@ -70,6 +70,8 @@ window.__ModuleLoader__.load({
       session_preset_conflict: ['会话配置不一致', 'Session settings do not match'],
       agent_run_not_confirmed: ['DSH 未确认回复', 'DSH did not confirm the reply'],
       delivery_not_confirmed: ['Octo 未确认送达', 'Octo did not confirm delivery'],
+      delivery_access_changed: ['设置或权限已变更，剩余交付已停止', 'Settings or access changed; remaining delivery stopped'],
+      delivery_profile_unavailable: ['旧回复缺少配置记录，请在 DSH 核对后继续', 'Prepared reply lacks its original settings; review it in DSH'],
       file_not_presented: ['未交付可发送的文件', 'No file was prepared for delivery'],
       file_tools_unavailable: ['本次私聊没有工作区工具权限', 'Workspace tools are unavailable in this DM'],
       files_disabled: ['账号未开启附件', 'Attachments are disabled'],

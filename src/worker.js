@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { isAbsolute, relative } from 'node:path'
+import { createHash } from 'node:crypto'
 import { admit, channelSequence, decimalId, OctoError, permitsRoute } from './octo.js'
 import { receiveRealtime } from './realtime.js'
 import { Progress } from './progress.js'
@@ -29,6 +30,17 @@ export function authorizedTools(config, job) {
 function asksForFile(input) {
   return /(?:发送|发给|发我|回传|传给|交付|附上).{0,14}(?:文件|附件)|(?:文件|附件).{0,14}(?:发送|发给|发我|回传|传给|交付)|\b(?:send|attach|deliver)\b.{0,24}\b(?:file|attachment)\b/iu.test(input)
 }
+// Persist no credentials. Bind prepared output to the context that produced it;
+// presentation/queue settings such as label and sendMode are deliberately absent.
+const deliveryProfile = (config, job) => createHash('sha256').update(JSON.stringify([
+  1, config.apiBase, config.botUid, config.spaceId, config.cwd, config.sessionProfile,
+  config.ownerUid, config.toolPermission, config.toolScope, authorizedTools(config, job),
+  job.channel_type === 5 ? config.threadRuleMode : null,
+])).digest('hex')
+const deliveryMediaProfile = config => createHash('sha256').update(JSON.stringify([
+  1, [...new Set(config.mediaDownloadOrigins ?? [])].sort(), [...new Set(config.mediaUploadOrigins ?? [])].sort(),
+  config.mediaMaxBytes ?? 16 * 1024 * 1024,
+])).digest('hex')
 async function materializeInput(config, meta, signal) {
   const descriptors = meta.attachments ?? (meta.attachment ? [meta.attachment] : [])
   if (!descriptors.length) return { attachments: [], order: meta.parts }
@@ -75,11 +87,13 @@ const textCommands = {
 
 
 const hostIssues = new Set(['session_busy', 'session_timeout', 'session_preset_conflict',
+  'delivery_access_changed',
   'missing_host_model', 'shared_turn_not_forwarded', 'prompt_discarded', 'no_confirmed_final_text',
   'session_missing', 'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context',
   'missing_scoped_tool_controls', 'missing_host_permission', 'session_requires_owned_writer', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
 
 const failureDetails = {
+  delivery_access_changed: '账号设置或频道权限已变更，剩余交付已停止。请在 DSH 查看已执行的结果。',
   session_busy: '此 DSH 会话正由另一个回合使用，请待当前回合结束后继续。',
   session_timeout: '本次处理超时。可能已有工具执行，请先在 DSH 核对进度再决定是否继续。',
   session_preset_conflict: '当前会话的 Agent 预设与账号设置不一致，请新建会话后继续。',
@@ -129,6 +143,34 @@ export class Worker {
     if (!this.liveToolAllowed(job, config) || !await this.api.allowsMessage(config, job, signal)
       || !this.liveToolAllowed(job, config)) throw new Error('octo_access_denied')
     return config
+  }
+
+  async deliveryAccess(job, profile, signal, { files = false, command = false, tool = false, mediaProfile } = {}) {
+    const current = this.config
+    const allowed = () => {
+      const live = this.config
+      return !this.stopIntake && deliveryProfile(live, job) === profile
+        && permitsRoute(live, job.sender, job.channel_type, job.channel_id ?? job.sender)
+        && (!files || live.allowFiles && live.toolPermission !== 'text-only' && authorizedTools(live, job))
+        && (!files || deliveryMediaProfile(live) === mediaProfile)
+        && (!command || safeCommand(live, job))
+        && (!tool || live.toolPermission !== 'text-only')
+    }
+    signal.throwIfAborted()
+    if (!allowed()) throw new Error('delivery_access_changed')
+    // Retain the configured admission model. For Octo-managed access, verify
+    // the live friendship/membership again after preparation, not just intake.
+    try {
+      if ((job.ambient || current.senderPolicy === 'octo' || job.channel_type !== 1 && current.channelPolicy === 'joined')
+        && !await this.api.allowsMessage(current, job, signal)) throw new Error('delivery_access_changed')
+    } catch (error) {
+      if (error instanceof OctoError && ['api_authentication_failed', 'api_permission_denied', 'api_not_found', 'api_disabled']
+        .includes(apiErrorCode(error))) throw new Error('delivery_access_changed')
+      throw error
+    }
+    signal.throwIfAborted()
+    if (!allowed()) throw new Error('delivery_access_changed')
+    return true
   }
 
   pause(stopIntake = false) {
@@ -307,6 +349,16 @@ export class Worker {
     }
     const route = { channel_id: recipient, channel_type: channelType }
     let meta = job.metadata ? JSON.parse(job.metadata) : {}
+    if (job.state !== 'queued' && (!/^[a-f0-9]{64}$/.test(meta.deliveryProfile ?? '')
+      || meta.deliverables?.length && !/^[a-f0-9]{64}$/.test(meta.deliveryMediaProfile ?? ''))) {
+      this.store.review(job.seq, 'delivery_profile_unavailable')
+      for (const seq of meta.merged ?? []) this.store.review(seq, 'delivery_profile_unavailable')
+      this.log('delivery_profile_unavailable')
+      return
+    }
+    const profile = meta.deliveryProfile ?? deliveryProfile(sourceConfig, job)
+    const mediaProfile = meta.deliveryMediaProfile ?? deliveryMediaProfile(sourceConfig)
+    const authorizeDelivery = (options, active = signal) => this.deliveryAccess(job, profile, active, { ...options, mediaProfile })
     if ((meta.command || meta.cardAction) && !safeCommand(config, job)) {
       this.store.discard(job.seq, 'command_not_allowed')
       return
@@ -356,7 +408,7 @@ export class Worker {
           reply = meta.cardAction.selection === 'A' || meta.cardAction.selection === 'B'
             ? '已确认：选项 ' + meta.cardAction.selection + '。' : '已确认。'
         } else {
-          progress = this.progress.start(job, config.progress, signal)
+          progress = this.progress.start(job, config.progress, signal, active => authorizeDelivery({}, active))
           const [material, channelContext] = await Promise.all([
             materializeInput(config, meta, signal),
             this.channelContext(config, route, job, meta, signal),
@@ -429,8 +481,8 @@ export class Worker {
                     return voice.execute(args, toolSignal)
                   })()
                   if (name === displayCardSpec.name) return (async () => {
-                    if (!await this.api.allowsMessage(this.config, job, toolSignal)) throw new Error('octo_access_denied')
-                    const receipt = await sendDisplayCard({ api: this.api, route, args, signal: toolSignal })
+                    const receipt = await sendDisplayCard({ api: this.api, route, args, signal: toolSignal,
+                      authorize: active => authorizeDelivery({ tool: true }, active) })
                     this.store.recordDelivery(job.seq, receipt.messageId)
                     return receipt
                   })()
@@ -516,6 +568,7 @@ export class Worker {
             for (const seq of [job.seq, ...merged]) this.store.running(seq, session.session_id)
             reply = await run()
           }
+          await authorizeDelivery()
           if (asksForFile(input) && !deliverables?.length && !targetFileAttempted) {
             const issue = !config.allowFiles ? 'files_disabled' : !toolsAllowed || config.toolPermission === 'text-only'
               ? 'file_tools_unavailable' : 'file_not_presented'
@@ -527,7 +580,10 @@ export class Worker {
                 : 'DSH 没有交付可发送的文件。'
             const notified = await progress.finish('error', { detail: explanation })
             if (!notified && !signal.aborted) {
-              try { await this.api.send(recipient, '文件未发送：' + explanation, signal, channelType) }
+              try {
+                await authorizeDelivery()
+                await this.api.send(recipient, '文件未发送：' + explanation, signal, channelType)
+              }
               catch { if (!signal.aborted) this.log('failure_notice_not_confirmed') }
             }
             return
@@ -542,6 +598,8 @@ export class Worker {
         meta = meta.command || meta.cardAction ? meta : {
           ...(deliverables?.length && { deliverables }), ...(merged.length && { merged }), ...(card && { displayCard: card.form }),
         }
+        meta.deliveryProfile = profile
+        if (meta.deliverables?.length) meta.deliveryMediaProfile = mediaProfile
         this.store.ready(job.seq, bounded, meta)
         job = { ...job, reply: bounded }
       } catch (error) {
@@ -553,7 +611,10 @@ export class Worker {
         const detail = failureDetails[code] ?? unknownFailure
         const notified = await progress?.finish('error', { detail })
         if (!signal.aborted && !notified && !job.ambient && config.progress !== undefined) {
-          try { await this.api.send(recipient, 'DSH 已收到消息。' + detail, signal, channelType) }
+          try {
+            await authorizeDelivery()
+            await this.api.send(recipient, 'DSH 已收到消息。' + detail, signal, channelType)
+          }
           catch { if (!signal.aborted) this.log('failure_notice_not_confirmed') }
         }
         return
@@ -578,26 +639,33 @@ export class Worker {
       for (let i = 0; i < count; i++) progress?.trace({ kind: 'file-sent' })
     }
     try {
+      await authorizeDelivery({ files: !!meta.deliverables?.length, command: !!meta.command || !!meta.cardAction })
       const images = []
       if (meta.deliverables?.length) {
         if (!config.allowFiles || !authorizedTools(config, job) || config.toolPermission === 'text-only') throw new Error('files_not_authorized')
         for (const path of meta.deliverables) {
+          await authorizeDelivery({ files: true })
           const file = await readDeliverable(config.cwd, isAbsolute(path) ? relative(config.cwd, path) : path, signal)
           if (typeof this.api.sendPayload !== 'function') {
-            markMedia(await uploadAttachment(config, route, file, signal))
+            markMedia(await uploadAttachment(config, route, file, signal, { authorize: () => authorizeDelivery({ files: true }) }))
             continue
           }
-          const payload = await prepareAttachment(config, file, signal)
+          const payload = await prepareAttachment(config, file, signal, { authorize: () => authorizeDelivery({ files: true }) })
           if (!meta.displayCard && payload.type === 2 && payload.width > 0 && payload.height > 0) images.push(payload)
-          else markMedia(await this.api.sendPayload(route, payload, signal, replyTo))
+          else {
+            await authorizeDelivery({ files: true })
+            markMedia(await this.api.sendPayload(route, payload, signal, replyTo))
+          }
         }
       }
       let resultId
       if (meta.command === 'card' || meta.command === 'choose' || (meta.displayCard && safeCommand(config, job))) {
         try {
-          const result = await sendCard(config, { ...route, operatorUid: job.sender }, meta.displayCard ?? cardForm(meta.command), signal)
+          const result = await sendCard(config, { ...route, operatorUid: job.sender }, meta.displayCard ?? cardForm(meta.command), signal,
+            () => !this.stopIntake && safeCommand(this.config, job), () => authorizeDelivery({ command: true, files: !!meta.deliverables?.length }))
           resultId = result.messageId
           confirmed = true
+          this.store.recordDelivery(job.seq, resultId)
           if (result.binding) this.store.bindCard(result.binding)
         } catch (error) {
           if (!(error instanceof OctoError) || error.code !== 'card_profile_unavailable') throw error
@@ -610,6 +678,7 @@ export class Worker {
             ...images.map(({ url, width, height }) => ({ type: 'image', url, width, height }))] }
           if (Buffer.byteLength(JSON.stringify(payload)) <= 48 * 1024) {
             try {
+              await authorizeDelivery({ files: true })
               resultId = await this.api.sendPayload(route, payload, signal, replyTo)
               chunks.shift()
               markMedia(resultId, images.length)
@@ -622,9 +691,13 @@ export class Worker {
             }
           }
         }
-        for (const image of images) markMedia(await this.api.sendPayload(route, image, signal, replyTo))
+        for (const image of images) {
+          await authorizeDelivery({ files: true })
+          markMedia(await this.api.sendPayload(route, image, signal, replyTo))
+        }
         for (const chunk of chunks) {
           const outbound = finalMentions(chunk, members)
+          await authorizeDelivery({ files: !!meta.deliverables?.length, command: !!meta.command || !!meta.cardAction })
           const delivered = await this.api.send(recipient, outbound.text, signal, channelType, replyTo, outbound.mention)
           confirmed = true
           resultId ??= delivered
@@ -638,12 +711,15 @@ export class Worker {
       if (!confirmed && !meta.deliverables?.length && !merged.length && error instanceof OctoError && error.status === 429 && job.attempts < 3) {
         this.store.retry(job.seq, Date.now() + Math.max(error.retryAfterMs, 3000 * (2 ** job.attempts)))
       } else {
-        const issue = meta.deliverables?.length ? 'file_delivery_not_confirmed' : confirmed ? 'partial_delivery' : 'delivery_not_confirmed'
+        const issue = error?.message === 'delivery_access_changed' ? 'delivery_access_changed'
+          : meta.deliverables?.length ? 'file_delivery_not_confirmed' : confirmed ? 'partial_delivery' : 'delivery_not_confirmed'
         this.store.review(job.seq, issue)
         for (const seq of merged) this.store.review(seq, issue)
         this.log(issue)
       }
-      await progress?.finish('stopped', meta.deliverables?.length ? { detail: '文件或正文尚未确认全部送达' } : undefined)
+      await progress?.finish('stopped', error?.message === 'delivery_access_changed'
+        ? { detail: '账号设置或频道权限已变更，剩余交付已停止' }
+        : meta.deliverables?.length ? { detail: '文件或正文尚未确认全部送达' } : undefined)
     }
   }
 

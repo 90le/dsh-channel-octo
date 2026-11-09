@@ -159,7 +159,7 @@ function supports(profile, payload, choice) {
  * operator for interaction. Returns {messageId, binding}; save only a confirmed
  * binding in trusted local state. A display card returns binding: null.
  */
-export async function sendCard(config, route, form, signal = new AbortController().signal, authorize = () => true) {
+export async function sendCard(config, route, form, signal = new AbortController().signal, authorize = () => true, beforeSend) {
   if (authorize() !== true) throw new OctoError('octo_access_denied')
   form = structuredClone(form)
   const payload = createCard(form)
@@ -205,6 +205,8 @@ export async function sendCard(config, route, form, signal = new AbortController
   if (!supports(profile, payload, choice)) throw new OctoError('card_profile_unavailable')
   signal.throwIfAborted()
   // This existing client method is the raw type-17 send path used by progress too.
+  if (beforeSend && await beforeSend() !== true) throw new OctoError('octo_access_denied')
+  signal.throwIfAborted()
   if (authorize() !== true) throw new OctoError('octo_access_denied')
   const { type: _type, ...frame } = payload
   const messageId = await api.progressCard(target, frame, signal)

@@ -426,18 +426,21 @@ export function normalizeRichtextBlocks(blocks) {
  * Returns only {messageId, format, fallbackBlocks, requiresFinalSummary} after a
  * confirmed send. Never retries an uncertain write or substitutes a second send.
  */
-export async function sendDisplayCard({ api, route, args, signal } = {}) {
+export async function sendDisplayCard({ api, route, args, signal, authorize } = {}) {
   if (!shape(route, ['channel_id', 'channel_type']) || !(route.channel_type === 1
     ? validUid(route.channel_id) && !route.channel_id.includes('@') : ruleScope(route.channel_type, route.channel_id))) {
     fail('invalid_display_card_route')
   }
   if (typeof api?.cardProfile !== 'function' || typeof api.progressCard !== 'function'
-    || (signal !== undefined && !(signal instanceof AbortSignal))) fail('invalid_display_card_context')
+    || (signal !== undefined && !(signal instanceof AbortSignal))
+    || (authorize !== undefined && typeof authorize !== 'function')) fail('invalid_display_card_context')
   // Detach both route and structured input before any await; concurrent caller edits cannot redirect a send.
   const target = { channel_id: route.channel_id, channel_type: route.channel_type }
   const normalized = normalize(args)
   const budget = AbortSignal.timeout(15_000)
   const active = signal ? AbortSignal.any([signal, budget]) : budget
+  if (active.aborted) fail('display_card_aborted')
+  if (authorize && await authorize(active) !== true) fail('octo_access_denied')
   if (active.aborted) fail('display_card_aborted')
   let profile
   try { profile = await api.cardProfile(active) } catch {
@@ -445,6 +448,7 @@ export async function sendDisplayCard({ api, route, args, signal } = {}) {
   }
   if (active.aborted) fail('display_card_aborted')
   const { frame, fallbacks } = renderDisplayCard(normalized, profile)
+  if (authorize && await authorize(active) !== true) fail('octo_access_denied')
   if (active.aborted) fail('display_card_aborted')
   let messageId
   try { messageId = await api.progressCard(target, frame, active) } catch (error) {

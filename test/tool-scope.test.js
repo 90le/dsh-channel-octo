@@ -237,9 +237,11 @@ test('target delivery uncertainty and confirmed receipts survive final-answer an
     await worker.process(store.next(Date.now()), new AbortController().signal)
     assert.equal(hostFailure, undefined)
     assert.equal(operations, 1)
-    assert.deepEqual(sent, [reply])
+    assert.deepEqual(sent, mode === 'uncertain' ? [reply] : [])
     assert.deepEqual(recorded, mode === 'uncertain' ? [] : ['901'])
-    assert.equal(store.db.prepare('SELECT state FROM jobs').get().state, 'sent')
+    const job = store.db.prepare('SELECT state,result_id FROM jobs').get()
+    assert.equal(job.state, mode === 'uncertain' ? 'sent' : 'review')
+    if (mode !== 'uncertain') assert.equal(job.result_id, '901')
     if (mode !== 'uncertain') {
       assert.equal(outcome.delivery_confirmed, true)
       assert.equal(outcome.access_changed, true)

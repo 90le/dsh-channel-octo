@@ -390,11 +390,13 @@ export function prepareAttachment(config, file, signal, { authorize } = {}) {
 }
 
 /** Upload caller-authorized bytes and send as a native image/file message. */
-export async function uploadAttachment(config, route, file, signal) {
+export async function uploadAttachment(config, route, file, signal, { authorize } = {}) {
+  if (authorize !== undefined && typeof authorize !== 'function') throw error('media_invalid_config')
   const ctx = context(config, signal)
   const { channel_id, channel_type } = route ?? {}
   if (channel_type === 1 ? !validUid(channel_id) : !ruleScope(channel_type, channel_id)) throw error('media_invalid_route')
-  const payload = await uploadMedia(ctx, file)
+  const payload = await uploadMedia(ctx, file, authorize)
+  await authorize?.()
   return atStage(ctx, 'send', async () => {
     const response = await request(ctx, ctx.base + '/v1/bot/sendMessage', {
       method: 'POST', headers: { ...ctx.auth, 'Content-Type': 'application/json' },

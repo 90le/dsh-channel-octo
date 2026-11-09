@@ -149,22 +149,35 @@ export class Progress {
     }
   }
 
-  start(job, mode, signal) {
+  start(job, mode, signal, authorize) {
     if (!mode || mode === 'off') return { stage() {}, trace() {}, async finish() { return false } }
     const route = { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }
     const reasoningId = 'dsh-octo-' + (decimalId(job.message_id) ?? randomUUID())
     const started = Date.now()
     let revision = 0
     const stats = { steps: 0, calls: 0, files: 0, active: 0, failed: 0, waiting: false, recent: new Map(), pending: new Set() }
-    let phase = 'queued', shown, closed = false, timer, flight, finishing, id, format, seq = 1
+    let phase = 'queued', shown, closed = false, blocked = false, timer, flight, finishing, id, format, seq = 1
     let tryCard = mode === 'auto', probeAt = started, dueAt = started + initialDelay
     let editAt, refreshAt, scheduledAt
-    const active = () => !closed && !signal.aborted
+    const active = () => !closed && !blocked && !signal.aborted
     const render = (state, detail) => frame(format, reasoningId, state, Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail)
     const clearTimer = () => {
       clearTimeout(timer)
       timer = scheduledAt = undefined
     }
+    const request = (fn, terminal = false) => this.#request(async () => {
+      if (authorize) {
+        try {
+          if (await authorize(signal) !== true) throw new Error('progress_access_denied')
+        } catch (error) {
+          blocked = true
+          clearTimer()
+          throw error
+        }
+      }
+      if (blocked || signal.aborted || (!terminal && closed)) throw new Error('progress_closed')
+      return fn()
+    }, signal)
     const schedule = () => {
       if (!active() || flight) return
       const when = Math.max(dueAt, this.#retryAt)
@@ -180,7 +193,7 @@ export class Progress {
       if (!active()) return
       if (id) {
         const snapshot = revision
-        const result = await this.#request(() => this.api.editProgress(route, id, render(phase), ++seq, true, signal), signal)
+        const result = await request(() => this.api.editProgress(route, id, render(phase), ++seq, true, signal))
         if (result.ok) shown = snapshot
         refreshAt = mayRetry(result.status) ? Date.now() + refreshInterval : Infinity
         editAt = result.ok || result.status === 429 ? Date.now() + editInterval : refreshAt
@@ -189,14 +202,14 @@ export class Progress {
         return
       }
       if (tryCard && !format && Date.now() >= probeAt) {
-        const result = await this.#request(() => this.api.cardProfile(signal), signal)
+        const result = await request(() => this.api.cardProfile(signal))
         if (result.ok) format = cardMode(result.value)
         if ((result.ok && !format) || !mayRetry(result.status)) tryCard = false
         if (!result.ok && result.status !== 429) probeAt = Date.now() + 10_000
       }
       if (active() && tryCard && format) {
         const snapshot = revision
-        const result = await this.#request(() => this.api.progressCard(route, render(phase), signal), signal)
+        const result = await request(() => this.api.progressCard(route, render(phase), signal))
         if (result.ok && result.value) {
           id = result.value
           shown = snapshot
@@ -208,7 +221,7 @@ export class Progress {
         // A rejected 429 can be retried. An uncertain create may already have posted a card.
         if (result.status !== 429) tryCard = false
       }
-      if (active()) await this.#request(() => this.api.typing(route, signal), signal)
+      if (active()) await request(() => this.api.typing(route, signal))
       dueAt = Date.now() + (this.#retryAt > Date.now() ? 0 : typingInterval)
     }
     const tick = () => {
@@ -225,7 +238,7 @@ export class Progress {
       clearTimer()
       signal.removeEventListener('abort', clearTimer)
       await flight
-      if (!id || signal.aborted || !outcomes.includes(outcome)) return false
+      if (!id || blocked || signal.aborted || !outcomes.includes(outcome)) return false
       const deadline = Date.now() + terminalWaitBudget
       const payload = render(outcome, detail)
       const terminalSeq = ++seq
@@ -238,8 +251,9 @@ export class Progress {
         }
         if (signal.aborted) return false
         // Identical payload and sequence make a retry safe if the previous edit landed.
-        const result = await this.#request(() => this.api.editProgress(route, id, payload, terminalSeq, false, signal), signal)
+        const result = await request(() => this.api.editProgress(route, id, payload, terminalSeq, false, signal), true)
         if (result.ok) return true
+        if (blocked) return false
         if (!mayRetry(result.status)) return false
       }
       return false
