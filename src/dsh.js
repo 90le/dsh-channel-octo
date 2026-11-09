@@ -3,6 +3,7 @@ import { ruleContext } from './rules.js'
 import { prepareInput } from './dsh-media.js'
 import { sessionExists } from './session-state.js'
 import { RunClock } from './run-clock.js'
+import { mountChannelTools } from './channel-tools.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
@@ -45,16 +46,27 @@ export class DshHost {
       service.set(agent.session, permission)
     }
     const controls = (scoped, cleanup) => {
+      let channelNames = new Set()
+      if (extras.channelTools?.specs?.length) {
+        const mounted = mountChannelTools(scoped, { ...extras.channelTools, signal,
+          isActive: () => authority.active && !authority.mixed && !signal.aborted })
+        cleanup.push(mounted)
+        channelNames = new Set(mounted.names)
+      }
       if (!permission) {
         const tools = scoped.get('tools')
         if (!tools?.restrict || !tools?.guard) throw new Error('missing_scoped_tool_controls')
         cleanup.push(tools.restrict({ allow: [] }))
-        cleanup.push(tools.guard(() => denial))
+        cleanup.push(tools.guard(exec => !authority.active || authority.mixed || signal.aborted || !channelNames.has(exec.name) ? denial : undefined))
+        if (channelNames.size) cleanup.push(tools.presentAs('native'))
         // The tool restriction masks inherited definitions; a host plugin may
         // still mount scope-local definitions. Strip the assembled model schema
         // in this scope as well, without changing any other Web/IM agent.
         if (typeof scoped.on === 'function') cleanup.push(scoped.on('system-prompt/assemble',
-          async (_assembly, _context, next) => ({ ...await next(), tools: [] })))
+          async (_assembly, _context, next) => {
+            const assembled = await next()
+            return { ...assembled, tools: (assembled.tools ?? []).filter(tool => channelNames.has(tool.name)) }
+          }, { prepend: true }))
       }
       if (permission) {
         const tools = scoped.get('tools')
@@ -78,7 +90,7 @@ export class DshHost {
           } finally { await claim?.return?.(); deadline.resume() }
         }, { prepend: true }))
       }
-      if (rules || extras.authorCard || extras.taskContext || extras.channelContext) {
+      if (rules || extras.authorCard || extras.taskContext || extras.channelContext || extras.channelTools) {
         const prompt = scoped.get('systemPrompt')
         if (typeof prompt?.context !== 'function') throw new Error('missing_scoped_rule_context')
         // DSH projects runtime facts into a user-role snapshot, not the system role.
@@ -95,11 +107,18 @@ export class DshHost {
           name: 'dsh-channel-octo.task-delivery', order: 49, interpolate: false, required: true,
           text: permission
             ? 'For an Octo action request, perform the work using the available tools before returning a final answer. A plan is not a result. If asked to send a generated file, use the DSH present tool to declare the actual workspace file before ending; keep the file in place until delivery. Explicitly report work that was blocked.'
-            : 'This Octo turn is in text-only mode. No tools or workspace actions are available. Do not claim that you checked, created, edited, or sent a file. Explain the limitation when asked to perform an action.',
+            : channelNames.size ? 'This turn can use ONLY its listed Octo current-channel tools. Use those tools for real group/member/thread/message operations, not DSH Agent Team operations. You cannot use workspace, terminal or file-generation tools. Complete the requested actions with the actual tools before the final answer; a plan is not a result. Report every denial or unsupported action honestly, without saying you will execute unavailable tools.'
+              : 'This Octo turn is in text-only mode. No tools or workspace actions are available. Do not claim that you checked, created, edited, or sent a file. Explain the limitation when asked to perform an action.',
+        }))
+        if (extras.channelTools) cleanup.push(prompt.context({
+          name: 'dsh-channel-octo.channel-tools', order: 53, interpolate: false, required: true,
+          text: extras.channelTools.guidance,
         }))
         if (extras.authorCard) cleanup.push(prompt.context({
           name: 'dsh-channel-octo.card-format', order: 51, interpolate: false,
-          text: 'The Octo user requested a card. For a display card, respond with only a fenced octo-card JSON block. Use the keys title and text (title <= 160 UTF-8 bytes, text <= 2048 UTF-8 bytes). Use literal text only. Do not include commands, URLs or actions.',
+          text: channelNames.has('octo_display_card')
+            ? 'The Octo user requested a card. Use octo_display_card for structured display output in this conversation, then provide a brief final summary. For questions that need an answer, use ask_user_question when available. A display card has no callbacks and is not an approval.'
+            : 'The Octo user requested a card. For a display card, respond with only a fenced octo-card JSON block. Use the keys title and text (title <= 160 UTF-8 bytes, text <= 2048 UTF-8 bytes). Use literal text only. Do not include commands, URLs or actions.',
         }))
       }
     }

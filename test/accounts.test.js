@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -7,6 +8,8 @@ import { Accounts } from '../src/accounts.js'
 import { registerWeb } from '../src/web.js'
 import { createServer } from 'node:http'
 import { Store } from '../src/store.js'
+import { resolveConfig } from '../src/config.js'
+import { accountFields, createAccountEditor } from '../src/account-editor.js'
 
 test('Bot credentials stay out of account JSON, rotation keeps identity and account queues are separate', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dsh-octo-accounts-'))
@@ -52,12 +55,31 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     const firstId = first.accountId
     assert.equal(first.accounts[0].reasoningEffort, 'high')
     assert.equal(first.accounts[0].idleMinutes, 15)
+    assert.equal(first.accounts[0].toolScope, 'private')
     await assert.rejects(save(null, { token: 'bf_first_fixture' }), /duplicate_bot/)
     await assert.rejects(save(firstId, { token: 'bf_other_fixture' }), /bot_identity_mismatch/)
     config.hostPermissions = ['workspace-write']
     await save(firstId, { label: 'Renamed', token: 'bf_rotated_fixture', permission: 'workspace-write' })
     assert.equal(accounts.overview().accounts.find(row => row.id === firstId).senderPolicy, 'octo')
+    const prior = accounts.record(firstId)
+    for (const toolScope of ['private', 'owner', 'admitted']) {
+      const updated = await accounts.save(firstId, { revision: accounts.overview().accountRevision, account: { toolScope } })
+      assert.equal(updated.accounts.find(row => row.id === firstId).toolScope, toolScope)
+      assert.equal(accounts.runtimes.get(firstId).settings.config.toolScope, toolScope)
+      assert.deepEqual(accounts.record(firstId), { ...prior, toolScope })
+      const saved = JSON.parse(readFileSync(join(root, 'accounts.json'), 'utf8'))
+      assert.equal(saved.accounts.find(row => row.id === firstId).toolScope, toolScope)
+    }
+    const savedBeforeInvalid = readFileSync(join(root, 'accounts.json'), 'utf8')
+    const revisionBeforeInvalid = accounts.overview().accountRevision
+    for (const toolScope of [null, '', 'all', 'Owner', true, 1, [], {}]) {
+      await assert.rejects(accounts.save(firstId, { revision: revisionBeforeInvalid, account: { toolScope } }), /invalid_account/)
+      await assert.rejects(save(null, { token: 'bf_other_fixture', toolScope }), /invalid_account/)
+    }
+    assert.equal(readFileSync(join(root, 'accounts.json'), 'utf8'), savedBeforeInvalid)
+    assert.equal(accounts.overview().accountRevision, revisionBeforeInvalid)
     const secondId = (await save(null, { label: 'Second', token: 'bf_other_fixture' })).accountId
+    assert.equal(accounts.record(secondId).toolScope, 'private')
     assert.notEqual(firstId, secondId)
     assert.equal(secrets.size, 2)
     const publicAndDisk = JSON.stringify(accounts.overview()) + readFileSync(join(root, 'accounts.json'), 'utf8')
@@ -72,6 +94,8 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(restored.label, 'Renamed')
     assert.equal(restored.permission, 'workspace-write')
     assert.equal(restored.senderPolicy, 'octo')
+    assert.equal(restored.toolScope, 'admitted')
+    assert.equal(accounts.overview().accounts.find(row => row.id === secondId).toolScope, 'private')
     assert.deepEqual(await accounts.diagnose(firstId), { botUid: 'bot-fixture', spaceId: 'fixture-space' })
     await accounts.remove(secondId, { revision: accounts.overview().accountRevision })
     assert.equal(accounts.overview().accounts.length, 1)
@@ -158,14 +182,26 @@ test('an in-flight legacy account accepts a partial hot edit without reconnectin
     await accounts.initialize()
     const runtime = accounts.runtimes.get('legacy')
     const worker = runtime.worker
+    const originalProfile = worker.config.sessionProfile
+    assert.equal(worker.config.toolScope, 'private')
     const active = worker.inFlight = Promise.withResolvers().promise
     worker.store.add('1', { messageId: '1', sender: 'owner', text: 'in flight' })
     worker.store.running(1)
     const updated = await accounts.save('legacy', { revision: accounts.overview().accountRevision,
-      account: { label: 'Renamed immediately', sendMode: 'steer' } })
+      account: { label: 'Renamed immediately', sendMode: 'steer', toolScope: 'owner' } })
     assert.equal(updated.accounts[0].label, 'Renamed immediately')
+    assert.equal(updated.accounts[0].toolScope, 'owner')
     assert.equal(runtime.worker, worker)
     assert.equal(worker.config.sendMode, 'steer')
+    assert.equal(worker.config.toolScope, 'owner')
+    assert.notEqual(worker.config.sessionProfile, originalProfile)
+    const ownerProfile = worker.config.sessionProfile
+    await accounts.save('legacy', { revision: accounts.overview().accountRevision, account: { toolScope: 'admitted' } })
+    assert.equal(runtime.worker, worker)
+    assert.equal(worker.config.toolScope, 'admitted')
+    assert.notEqual(worker.config.sessionProfile, ownerProfile)
+    await accounts.saveRules('legacy', { revision: runtime.settings.revision(), settings: { progress: 'off' } })
+    assert.equal(runtime.settings.config.toolScope, 'admitted')
     assert.equal(worker.inFlight, active)
     assert.equal(identified, 1)
     worker.inFlight = undefined
@@ -179,5 +215,150 @@ test('an in-flight legacy account accepts a partial hot edit without reconnectin
   } finally {
     await accounts.dispose().catch(() => {})
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('old account records and fresh legacy imports keep private tool scope until explicitly edited', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-octo-scope-migration-'))
+  const managedId = '12345678-1234-1234-1234-123456789abc'
+  const records = [
+    { id: 'legacy', botUid: 'legacy-bot', spaceId: 'fixture-space' },
+    { id: managedId, botUid: 'managed-bot', spaceId: 'fixture-space', secretRef: 'DSH_OCTO_ACCOUNT_' + 'A'.repeat(32) },
+  ].map(record => ({ ...record, label: 'Old account', cwd: root, transport: 'events', enabled: false }))
+  const file = join(root, 'accounts.json')
+  const endpoint = 'https://octo.invalid/api'
+  const original = JSON.stringify({ version: 1, endpoint, accounts: records })
+  writeFileSync(file, original, { mode: 0o600 })
+  const deployment = { apiBase: endpoint, stateDir: root, cwd: root, senderPolicy: 'octo', toolScope: 'admitted' }
+  const make = () => new Accounts({
+    logger: () => ({ info() {}, error() {} }),
+    get: name => name === 'credentials' ? { resolve: async () => ({ value: 'bf_fixture' }) } : undefined,
+  }, deployment, { env: { DSH_OCTO_BOT_TOKEN: 'bf_fixture' }, fetchImpl: async () => { throw new Error('unexpected_request') } })
+  let accounts = make()
+  try {
+    await accounts.initialize()
+    assert.equal(accounts.ready, true)
+    for (const account of accounts.overview().accounts) {
+      assert.equal(account.toolScope, 'private')
+      assert.equal(accounts.runtimes.get(account.id).settings.config.toolScope, 'private')
+      assert.equal(accountFields(account).toolScope, 'private')
+    }
+    assert.equal(readFileSync(file, 'utf8'), original)
+    await accounts.save(managedId, { revision: accounts.overview().accountRevision, account: { label: 'Renamed old account' } })
+    const saved = JSON.parse(readFileSync(file, 'utf8'))
+    assert.ok(saved.accounts.every(record => record.toolScope === 'private'))
+    await accounts.dispose()
+    accounts = make()
+    await accounts.initialize()
+    assert.ok(accounts.overview().accounts.every(record => record.toolScope === 'private'))
+    await accounts.dispose()
+
+    for (const toolScope of [null, 'all', true]) {
+      writeFileSync(file, JSON.stringify({ version: 1, endpoint, accounts: [{ ...records[0], toolScope }] }))
+      accounts = make()
+      await accounts.initialize()
+      assert.equal(accounts.ready, false)
+      assert.equal(accounts.status, 'configuration_or_state_error')
+      assert.equal(accounts.runtimes.size, 0)
+      await accounts.dispose()
+    }
+
+    writeFileSync(file, JSON.stringify({ version: 1, endpoint, accounts: [] }))
+    Object.assign(deployment, { enabled: true, botUid: 'legacy-bot', spaceId: 'fixture-space', senderPolicy: 'octo' })
+    accounts = make()
+    accounts.start = () => {}
+    await accounts.initialize()
+    assert.equal(accounts.record('legacy').toolScope, 'private')
+    assert.equal(accounts.runtimes.get('legacy').settings.config.toolScope, 'private')
+  } finally {
+    await accounts.dispose().catch(() => {})
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('tool scope config validates enums and scopes produce distinct stable session fingerprints', () => {
+  const cwd = process.cwd()
+  const config = { apiBase: 'https://octo.invalid/api', cwd, botUid: 'fixture-bot', spaceId: 'fixture-space',
+    senderPolicy: 'octo' }
+  const env = { DSH_OCTO_BOT_TOKEN: 'bf_fixture' }
+  const original = resolveConfig(config, env)
+  assert.equal(original.toolScope, 'private')
+  for (const toolScope of ['private', 'owner', 'admitted']) {
+    assert.deepEqual(resolveConfig({ ...config, toolScope }, env), { ...original, toolScope })
+  }
+  for (const toolScope of [null, '', 'all', 'Owner', true, 1, [], {}]) {
+    assert.throws(() => resolveConfig({ ...config, toolScope }, env), /invalid_tool_scope/)
+  }
+
+  const accounts = new Accounts({ logger: () => ({}) }, { cwd })
+  const profile = record => accounts.runtimeConfig(record, {}).sessionProfile
+  for (const id of ['legacy', '12345678-1234-1234-1234-123456789abc']) {
+    const record = { id, cwd, permission: 'workspace-write', agentPreset: 'standard' }
+    const scopes = ['private', 'owner', 'admitted'].map(toolScope => profile({ ...record, toolScope }))
+    assert.equal(new Set(scopes).size, 3)
+    assert.ok(scopes.every(value => /^[a-f0-9]{24}$/.test(value)))
+    assert.equal(profile(record), scopes[0])
+    assert.equal(scopes[0], createHash('sha256').update(JSON.stringify([
+      cwd, undefined, undefined, undefined, record.permission, record.agentPreset,
+    ])).digest('hex').slice(0, 24), 'default private scope preserves the pre-0.7 session fingerprint')
+    assert.equal(profile({ ...record, toolScope: 'owner', label: 'Renamed' }), scopes[1])
+    assert.equal(profile({ ...record, toolScope: 'admitted', dmCommands: 'safe' }), scopes[2])
+    assert.equal(profile({ ...record, toolScope: 'private' }), scopes[0])
+  }
+  const legacy = { id: 'legacy', cwd, permission: 'text-only', agentPreset: 'octo-text' }
+  const legacyConfig = accounts.runtimeConfig(legacy, {})
+  assert.equal(legacyConfig.sessionProfile, undefined)
+  accounts.runtimeConfig({ ...legacy, toolScope: 'owner' }, legacyConfig)
+  const ownerProfile = legacyConfig.sessionProfile
+  assert.match(ownerProfile, /^[a-f0-9]{24}$/)
+  accounts.runtimeConfig({ ...legacy, toolScope: 'admitted' }, legacyConfig)
+  assert.notEqual(legacyConfig.sessionProfile, ownerProfile)
+  accounts.runtimeConfig({ ...legacy, toolScope: 'private' }, legacyConfig)
+  assert.equal(legacyConfig.sessionProfile, undefined)
+})
+
+test('account editor explains independent tool access, localizes efforts and immediately saves scope edits', async () => {
+  // Inspect the rendered controls and their callbacks without adding a browser or React dependency.
+  const React = {
+    Fragment: 'fragment', useEffect() {}, useId: () => 'fixture',
+    useState: initial => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useRef: current => ({ current }),
+    createElement: (type, props, ...children) => typeof type === 'function'
+      ? type({ ...props, children }) : { type, props: props ?? {}, children: children.flat(Infinity) },
+  }
+  const Editor = createAccountEditor(React, { Button: 'button', Input: 'input' })
+  const nodes = node => node && typeof node === 'object' ? [node, ...node.children.flatMap(nodes)] : [node]
+  const account = { id: 'fixture', cwd: process.cwd(), provider: 'fixture', model: 'model', allowFiles: true }
+  const options = {
+    workspaces: [{ path: account.cwd }], policies: [{ id: 'text-only' }],
+    models: [{ provider: 'fixture', model: 'model', reasoningEfforts: ['max', 'high', 'medium', 'low', 'default', 'custom'] }],
+  }
+  assert.equal(accountFields().toolScope, 'private')
+  const choices = [['private', '获准的私聊用户'], ['owner', 'Bot 所有者的全部会话'], ['admitted', '所有已准入用户']]
+  for (const [index, [toolScope]] of choices.entries()) {
+    const saved = []
+    const elements = nodes(Editor({ account: { ...account, toolScope }, options, lang: 'zh',
+      onSave: async fields => { saved.push(fields) } }))
+    const text = elements.filter(value => typeof value === 'string').join('\n')
+    const select = elements.find(node => node?.type === 'select' && node.props.id === 'fixture-tool-scope')
+    assert.equal(select.props.value, toolScope)
+    assert.deepEqual(select.children.filter(node => node?.type === 'option').map(node => [node.props.value, node.children[0]]), choices)
+    assert.match(text, /工具使用范围/)
+    assert.match(text, /所选 Agent 预设中可用的全部 DSH 工具、插件和技能/)
+    assert.match(text, /账号权限策略/)
+    assert.match(text, /仍须通过现有聊天准入规则/)
+    assert.match(text, /私聊快捷命令/)
+    assert.match(text, /群聊快捷命令/)
+    assert.match(text, /不转发其他插件命令/)
+    assert.match(text, /选择包含群聊、子区的工具范围时/)
+    assert.doesNotMatch(text, /仅允许插件命令|只有获准使用工具的私聊用户可以接收/)
+    if (toolScope !== 'private') assert.doesNotMatch(text, /群聊和子区不开放工具/)
+    const effort = elements.find(node => node?.type === 'select' && node.props.id === 'fixture-effort')
+    assert.deepEqual(effort.children.filter(node => node?.props?.value).map(node => node.children[0]),
+      ['最高', '高', '中等', '低', '模型默认', 'custom'])
+    const next = choices[(index + 1) % choices.length][0]
+    select.props.onChange({ target: { value: next } })
+    await Promise.resolve()
+    assert.deepEqual(saved, [{ toolScope: next }])
   }
 })

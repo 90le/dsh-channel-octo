@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, isAbsolute, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { apiEndpoint, privateStateDir, validToken, validUid } from './config.js'
+import { apiEndpoint, privateStateDir, validToken, validToolScope, validUid } from './config.js'
 import { DshHost } from './dsh.js'
 import { OctoClient, OctoError } from './octo.js'
 import { Store } from './store.js'
@@ -16,7 +16,7 @@ const textOnly = 'text-only'
 const idPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 const refPattern = /^DSH_OCTO_ACCOUNT_[0-9A-F]{32}$/
 const inputKeys = new Set(['label', 'token', 'cwd', 'provider', 'model', 'reasoningEffort',
-  'permission', 'agentPreset', 'enabled', 'senderPolicy', 'allowedUids', 'idleMinutes', 'sendMode', 'dmCommands', 'groupCommands', 'allowFiles'])
+  'permission', 'agentPreset', 'toolScope', 'enabled', 'senderPolicy', 'allowedUids', 'idleMinutes', 'sendMode', 'dmCommands', 'groupCommands', 'allowFiles'])
 const idleOptions = [0, 15, 30, 60, 120]
 const fail = code => { throw new Error(code) }
 const str = (v, max = 200) => typeof v === 'string' && v.length <= max && !/[\x00-\x1f\x7f]/.test(v)
@@ -48,7 +48,9 @@ function savedRecords(path, endpoint) {
         || ids.has(item.id) || bots.has(bot) || (item.secretRef != null && !refPattern.test(item.secretRef))
         || (item.id !== legacy && !item.secretRef && !item.removed)
         || !str(item.label, 80) || !str(item.cwd, 1024) || !isAbsolute(item.cwd)
-        || !['events', 'websocket'].includes(item.transport) || typeof item.enabled !== 'boolean') fail('accounts_unavailable')
+        || !['events', 'websocket'].includes(item.transport) || typeof item.enabled !== 'boolean'
+        || (item.toolScope !== undefined && !validToolScope(item.toolScope))) fail('accounts_unavailable')
+      item.toolScope ??= 'private'
       ids.add(item.id); bots.add(bot)
     }
     return saved.accounts
@@ -93,7 +95,7 @@ export class Accounts {
         const existing = this.records.get(legacy)
         if (existing && !sameBot(existing, { botUid, spaceId })) fail('bot_identity_mismatch')
         if (!existing) this.records.set(legacy, {
-          id: legacy, botUid, spaceId, cwd, label: 'Octo Bot', enabled: true, permission: textOnly,
+          id: legacy, botUid, spaceId, cwd, label: 'Octo Bot', enabled: true, permission: textOnly, toolScope: 'private',
           transport: this.deployment.transport ?? (mentionPolicy === 'octo' ? 'websocket' : 'events'),
         })
       }
@@ -157,6 +159,7 @@ export class Accounts {
         mediaMaxBytes: this.deployment.mediaMaxBytes, mediaTimeoutMs: this.deployment.mediaTimeoutMs,
       }),
       apiBase: this.endpoint, stateDir, cwd: record.cwd, botUid: record.botUid, spaceId: record.spaceId, transport: record.transport,
+      toolScope: record.toolScope ?? 'private',
     }
     const admission = record.senderPolicy ? { senderPolicy: record.senderPolicy, allowedUids: record.allowedUids ?? [] } : {}
     return loadSettings(base, stateDir, token, () => this.privatePolicy(record), admission)
@@ -171,15 +174,19 @@ export class Accounts {
   }
 
   runtimeConfig(record, config) {
+    const toolScope = record.toolScope ?? 'private'
     if (record.id !== legacy || record.cwd !== this.deployment.cwd || record.provider || record.reasoningEffort
-      || (record.permission && record.permission !== textOnly) || (record.agentPreset && record.agentPreset !== 'octo-text')) {
+      || (record.permission && record.permission !== textOnly) || (record.agentPreset && record.agentPreset !== 'octo-text')
+      || toolScope !== 'private') {
       config.sessionProfile = createHash('sha256').update(JSON.stringify([
         record.cwd, record.provider, record.model, record.reasoningEffort, record.permission, record.agentPreset,
+        ...(toolScope === 'private' ? [] : [toolScope]),
       ])).digest('hex').slice(0, 24)
     }
     else delete config.sessionProfile
     config.idleMinutes = record.idleMinutes ?? 0
     config.toolPermission = record.permission ?? textOnly
+    config.toolScope = toolScope
     Object.assign(config, normalizeImControls({ ...this.deployment, ...record }), { fetchImpl: this.fetchImpl })
     return config
   }
@@ -292,6 +299,7 @@ export class Accounts {
       botUid: record.botUid, spaceId: record.spaceId, cwd: record.cwd, transport: record.transport,
       provider: record.provider ?? '', model: record.model ?? '', reasoningEffort: record.reasoningEffort ?? '',
       permission: record.permission ?? textOnly, agentPreset: record.agentPreset ?? 'octo-text', idleMinutes: record.idleMinutes ?? 0,
+      toolScope: record.toolScope ?? 'private',
       senderPolicy: config?.senderPolicy ?? record.senderPolicy ?? 'octo', allowedUids: config?.allowedUids ?? record.allowedUids ?? [],
       status: runtime?.status ?? (record.enabled ? 'invalid_configuration' : 'disabled'),
       ...normalizeImControls({ ...this.deployment, ...record }),
@@ -430,12 +438,13 @@ export class Accounts {
     const prior = old && this.publicAccount(old)
     const fields = { ...prior, ...data }
     const { label, cwd, provider = '', model = '', reasoningEffort = '', permission = textOnly,
-      agentPreset: requestedPreset = 'octo-text', enabled = true, idleMinutes = 0 } = fields
+      agentPreset: requestedPreset = 'octo-text', toolScope = 'private', enabled = true, idleMinutes = 0 } = fields
     const agentPreset = requestedPreset || 'octo-text'
     const im = normalizeImControls({ ...this.deployment, ...old, ...data })
     for (const key of Object.keys(im)) if (Object.hasOwn(data, key) && im[key] !== data[key]) fail('invalid_account')
     if (!str(label, 80) || !str(cwd, 1024) || !str(provider, 128) || !str(model) || !str(reasoningEffort, 64)
       || !str(permission, 128) || !str(agentPreset, 128) || typeof enabled !== 'boolean' || !idleOptions.includes(idleMinutes)
+      || !validToolScope(toolScope)
       || (!!provider !== !!model) || (reasoningEffort && !model)) fail('invalid_account')
     if (!this.workspaces().some(row => row.path === cwd)) fail('workspace_unavailable')
     if (provider && (!old || provider !== prior.provider || model !== prior.model || reasoningEffort !== prior.reasoningEffort)) {
@@ -455,7 +464,7 @@ export class Accounts {
       || rawUids.some(uid => !validUid(uid)) || (senderPolicy === 'allowlist' && !rawUids.length)) fail('invalid_account')
     const allowedUids = senderPolicy === 'allowlist' ? [...new Set(rawUids)] : []
     return { label: label.trim() || 'Octo Bot', cwd, provider, model, reasoningEffort,
-      permission, agentPreset, enabled, senderPolicy, allowedUids, idleMinutes, ...im }
+      permission, agentPreset, toolScope, enabled, senderPolicy, allowedUids, idleMinutes, ...im }
   }
 
   save(accountId, input) {

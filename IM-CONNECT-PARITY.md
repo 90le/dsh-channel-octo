@@ -1,5 +1,9 @@
 # IM Connect parity audit — Octo on DSH (source baseline)
 
+## Current release note — 0.7.0
+
+The audit below is a dated baseline, not a current feature list. Account editing/removal, HTTP management, Chinese selectors, native session menus, steering, files, questions and progress have since been implemented. This release adds independent DSH tool scope for DMs/groups/topics, current-channel Octo tools, member names/native mentions and complete reply references. See [README](README.md) and [capability matrix](OCTO-COVERAGE.md) for current behavior and verification. Host permission approvals, App Bot verification and arbitrary Octo platform/document features remain distinct from the supported User Bot channel. Earlier exclusions in this historical audit do not override the current documented implementation or the user's explicit deployment authorization.
+
 **Decision: partial parity.** The Octo working tree has the core of a native DSH account and conversation experience and a narrow Octo text bridge. It does not establish IM Connect parity. The first hard compatibility gap is App Bot identity verification: the plugin accepts App Bot token syntax, but its required verify call only queries the User Bot table in the pinned server. The first release gates are route and Space isolation, credential handling, and ownership of DSH turns that can use tools or send output. Files, interactive cards, native streaming and broader sends each have distinct server and client contracts; passing a text round trip would establish none of them.
 
 ## 0.6.0 integration update

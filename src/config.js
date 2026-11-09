@@ -5,6 +5,7 @@ import { ruleScope } from './rules.js'
 
 export const validUid = (s) => typeof s === 'string' && /^[A-Za-z0-9_.:@-]{1,128}$/.test(s)
 export const validToken = (s) => typeof s === 'string' && /^(app|bf)_[A-Za-z0-9_-]{1,512}$/.test(s)
+export const validToolScope = (scope) => ['private', 'owner', 'admitted'].includes(scope)
 
 function scopeList(value, type) {
   if (value === undefined) return new Set()
@@ -36,6 +37,8 @@ export function resolveConfig(config, env = process.env) {
   const channelPolicy = config.channelPolicy ?? 'allowlist'
   const mentionPolicy = config.mentionPolicy ?? 'required'
   const transport = config.transport ?? (mentionPolicy === 'octo' ? 'websocket' : 'events')
+  const toolScope = config.toolScope === undefined ? 'private' : config.toolScope
+  if (!validToolScope(toolScope)) throw new Error('invalid_tool_scope')
   if (!['allowlist', 'octo'].includes(senderPolicy) || !['allowlist', 'joined'].includes(channelPolicy)
     || !['required', 'octo'].includes(mentionPolicy) || !['events', 'websocket'].includes(transport)) {
     throw new Error('invalid_access_policy')
@@ -65,7 +68,7 @@ export function resolveConfig(config, env = process.env) {
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
     botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
-    senderPolicy, channelPolicy, mentionPolicy, transport, progress,
+    senderPolicy, channelPolicy, mentionPolicy, transport, progress, toolScope,
     mediaDownloadOrigins: config.mediaDownloadOrigins, mediaUploadOrigins: config.mediaUploadOrigins,
     mediaMaxBytes: config.mediaMaxBytes, mediaTimeoutMs: config.mediaTimeoutMs,
   }

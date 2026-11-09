@@ -21,6 +21,8 @@ const wire = process.argv[3] !== 'events'
 const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
 const ownerSmoke = process.env.DSH_OCTO_SMOKE_OWNER === '1'
+const groupToolsSmoke = process.env.DSH_OCTO_SMOKE_GROUP_TOOLS === '1'
+if (groupToolsSmoke && !ownerSmoke) throw new Error('Group tools smoke requires owner mode')
 const deleteSmoke = process.env.DSH_OCTO_SMOKE_DELETE === '1'
 const includeImConnect = !ownerSmoke && process.env.DSH_OCTO_SMOKE_CORE_ONLY !== '1'
 if (deleteSmoke && (ownerSmoke || browserModule)) throw new Error('Deletion smoke uses an isolated headless profile')
@@ -40,14 +42,15 @@ Object.assign(env, {
   DSH_HOME: home, DSH_OCTO_BOT_TOKEN: 'bf_fixture', DEEPSEEK_API_KEY: 'sk-fixture-for-local-smoke',
   DSH_TELEMETRY_DISABLED: '1',
   DSH_OCTO_FIXTURE_OWNER: ownerSmoke ? '1' : '0',
+  DSH_OCTO_FIXTURE_GROUP_TOOLS: groupToolsSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_DELETE: deleteSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_STATE: state,
   DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
   ...(browserModule && { DSH_OCTO_BROWSER_READY: browserReady }),
 })
 const common = { cwd: project, env, windowsHide: true, encoding: 'utf8', timeout: 50_000 }
-function node(args) {
-  const result = spawnSync(process.execPath, args, common)
+function node(args, timeout = 50_000) {
+  const result = spawnSync(process.execPath, args, { ...common, timeout })
   if (result.status !== 0) throw new Error('command failed: ' + (result.error?.message ?? result.stderr.slice(-2500)))
   return result.stdout
 }
@@ -68,7 +71,7 @@ try {
   for (const spec of [join(home, filename), ...(includeImConnect ? ['@michengai/dsh-im-connect@1.0.30'] : []),
     ...(codexUi ? ['@michengai/dsh-codex-ui@' + codexUi] : []),
     ...(automation ? ['@michengai/dsh-automation@' + automation] : [])]) {
-    node([cli, 'plugin', '--profile', 'web', 'add', spec, '--registry=https://registry.npmjs.org/'])
+    node([cli, 'plugin', '--profile', 'web', 'add', spec, '--registry=https://registry.npmjs.org/'], 180_000)
   }
   const q = JSON.stringify
   writeFileSync(observer, `
@@ -121,6 +124,7 @@ export function apply(ctx) {
         id: 'legacy', botUid: 'fixture-bot', spaceId: 'fixture-space', cwd: home,
         label: 'Octo Bot', enabled: true, permission: 'workspace-write', agentPreset: 'standard',
         senderPolicy: 'octo', transport: 'websocket', allowFiles: true, sendMode: 'steer',
+        toolScope: groupToolsSmoke ? 'owner' : 'private',
       }],
     }), { mode: 0o600 })
   }
@@ -303,24 +307,97 @@ export function apply(ctx) {
     await config.getByRole('button', { name: '设置 · Fixture spare', exact: true }).click()
     const edit = page.locator('.dsho-account-modal[open]')
     const policy = edit.getByLabel('权限策略', { exact: true })
-    await policy.selectOption({ label: '工作区写入' })
-    await edit.getByText('已保存', { exact: true }).waitFor({ timeout: 9000 })
+    const toolScope = edit.getByLabel('工具使用范围', { exact: true })
+    await toolScope.waitFor({ state: 'visible', timeout: 9000 })
+    const scopeChoices = await toolScope.locator('option').evaluateAll(options => options.map(option =>
+      ({ value: option.value, label: option.textContent, disabled: option.disabled })))
+    const expectedScopes = [
+      { value: 'private', label: '获准的私聊用户', disabled: false },
+      { value: 'owner', label: 'Bot 所有者的全部会话', disabled: false },
+      { value: 'admitted', label: '所有已准入用户', disabled: false },
+    ]
+    if (JSON.stringify(scopeChoices) !== JSON.stringify(expectedScopes) || await toolScope.inputValue() !== 'private') {
+      throw new Error('Tool scope choices or legacy default are incorrect: ' + JSON.stringify(scopeChoices))
+    }
+    console.log('FIXTURE_TOOL_SCOPE_CHOICES_ZH_OK')
     const sendMode = edit.getByLabel('发送方式', { exact: true })
-    await sendMode.selectOption('steer')
-    await edit.getByText('已保存', { exact: true }).waitFor({ timeout: 9000 })
-    await edit.getByLabel('账号名称', { exact: true }).fill('Fixture spare renamed')
-    await edit.getByLabel('账号名称', { exact: true }).press('Enter')
-    await edit.getByRole('heading', { name: 'Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
+    const accountName = edit.getByLabel('账号名称', { exact: true })
+    const overviewUrl = new URL('/api/dsh-channel-octo', launch).href
+    const beforeEdits = await (await page.request.get(overviewUrl)).json()
+    const spareId = beforeEdits.accounts.find(row => row.label === 'Fixture spare')?.id
+    if (!spareId) throw new Error('The spare account is missing before rapid edits')
+    const accountUrl = new URL('/api/dsh-channel-octo/accounts/' + spareId, launch).href
+    const firstSave = Promise.withResolvers(), editsQueued = Promise.withResolvers()
+    let delayedPuts = 0, overview, spare
+    const pendingRoutes = new Set()
+    const delayAccountPut = async route => {
+      if (route.request().method() !== 'PUT') return route.continue()
+      const first = ++delayedPuts === 1
+      const forwarding = (async () => {
+        if (first) firstSave.resolve()
+        await delay(250)
+        // Guarantee overlap even when browser actions take longer on a busy host.
+        if (first) await editsQueued.promise
+        await route.continue()
+      })()
+      pendingRoutes.add(forwarding)
+      try { await forwarding } finally { pendingRoutes.delete(forwarding) }
+    }
+    await page.route(accountUrl, delayAccountPut)
+    try {
+      await Promise.all([
+        policy.selectOption({ label: '工作区写入' }, { timeout: 9000 }),
+        Promise.race([firstSave.promise, delay(9000, undefined, { ref: false }).then(() => {
+          throw new Error('The first account PUT was not intercepted')
+        })]),
+      ])
+      await sendMode.selectOption('steer', { timeout: 9000 })
+      await toolScope.selectOption('admitted', { timeout: 9000 })
+      await accountName.fill('Fixture spare renamed', { timeout: 9000 })
+      await accountName.press('Enter', { timeout: 9000 })
+      editsQueued.resolve()
+      await edit.getByText('已保存', { exact: true }).waitFor({ timeout: 9000 })
+      const matchesFinal = row => row?.label === 'Fixture spare renamed' && row.enabled === false
+        && row.permission === 'workspace-write' && row.senderPolicy === 'octo'
+        && row.sendMode === 'steer' && row.toolScope === 'admitted'
+      const savedDeadline = Date.now() + 9000
+      do {
+        const response = await page.request.get(overviewUrl)
+        if (!response.ok()) throw new Error('Rapid edit readback failed: ' + response.status())
+        overview = await response.json()
+        spare = overview.accounts.find(row => row.id === spareId)
+        if (matchesFinal(spare)) break
+        await delay(100)
+      } while (Date.now() < savedDeadline)
+      if (delayedPuts < 2 || !matchesFinal(spare)) throw new Error('Queued account edits lost their final values')
+      await edit.getByRole('heading', { name: 'Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
+      if (await policy.inputValue() !== 'workspace-write' || await sendMode.inputValue() !== 'steer'
+        || await toolScope.inputValue() !== 'admitted' || await accountName.inputValue() !== 'Fixture spare renamed') {
+        throw new Error('Account editor reverted after queued saves')
+      }
+      console.log('FIXTURE_RAPID_ACCOUNT_EDITS_OK')
+    } finally {
+      editsQueued.resolve()
+      await page.unroute(accountUrl, delayAccountPut)
+      await Promise.allSettled([...pendingRoutes])
+    }
     await edit.getByRole('button', { name: '关闭', exact: true }).click()
     await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
-    const overview = await (await page.request.get(new URL('/api/dsh-channel-octo', launch).href)).json()
-    if (!overview.accounts.some(row => row.label === 'Fixture spare renamed' && row.enabled === false && row.permission === 'workspace-write' && row.senderPolicy === 'octo' && row.sendMode === 'steer')) {
-      throw new Error('The second Bot did not stay separately configured')
-    }
     const stored = readFileSync(join(state, 'accounts.json'), 'utf8')
+    if (JSON.parse(stored).accounts.find(row => row.id === spare.id)?.toolScope !== 'admitted') {
+      throw new Error('Tool scope did not persist in the account store')
+    }
+    console.log('FIXTURE_TOOL_SCOPE_PERSISTED=admitted')
     if ((JSON.stringify(overview) + stored).includes('bf_fixture_second')) throw new Error('Bot credential escaped its vault')
     await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).click()
     const rotated = page.locator('.dsho-account-modal[open]')
+    if (await rotated.getByLabel('工具使用范围', { exact: true }).inputValue() !== 'admitted'
+      || await rotated.getByLabel('权限策略', { exact: true }).inputValue() !== 'workspace-write'
+      || await rotated.getByLabel('发送方式', { exact: true }).inputValue() !== 'steer'
+      || await rotated.getByLabel('账号名称', { exact: true }).inputValue() !== 'Fixture spare renamed') {
+      throw new Error('Reopening the account changed saved settings')
+    }
+    console.log('FIXTURE_TOOL_SCOPE_REOPENED=admitted')
     const preset = rotated.getByLabel('Agent 预设', { exact: true })
     await preset.locator('option', { hasText: '标准模式' }).waitFor({ state: 'attached' })
     const full = rotated.getByLabel('权限策略', { exact: true }).locator('option[value="danger-full-access"]')
@@ -334,7 +411,7 @@ export function apply(ctx) {
     await page.getByRole('dialog', { name: '移除账号', exact: true }).getByRole('button', { name: '移除账号', exact: true }).click()
     await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ state: 'detached', timeout: 9000 })
     if (readFileSync(join(state, 'accounts.json'), 'utf8').includes('bf_fixture_second_rotated')) throw new Error('Rotated credential escaped its vault')
-    console.log('PASS: HTTP account add, partial edits, credential rotation and confirmed removal; credentials not exposed.')
+    console.log('PASS: delayed account PUT preserves rapid permission/send-mode/tool-scope/name edits; Chinese scopes, persisted and reopened settings, credential rotation and confirmed removal; credentials not exposed.')
   }
   // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
   const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
@@ -349,29 +426,68 @@ export function apply(ctx) {
     throw new Error('expected five delivered replies; fixture jobs: ' + JSON.stringify(jobs) + '\n'
       + output.replace(/https?:\/\/\S+/g, '[url]'))
   }
+  const expectedCards = [
+    { id: '200', type: '1', address: 'fixture-user', answering: true },
+    // Group completion may beat the edit throttle after its question is answered.
+    // Its initial reasoning state and final completed edit are still mandatory.
+    ...(groupToolsSmoke ? [{ id: '201', type: '2', address: '00112233445566778899aabbccddeeff', answering: false }] : []),
+  ]
   const cardDeadline = Date.now() + 5000
-  while (Date.now() < cardDeadline && !/FIXTURE_CARD=completed:\d+/.test(output)) await delay(100)
-  const edits = [...output.matchAll(/FIXTURE_CARD=(\w+):(\d+)/g)]
-  if (!/FIXTURE_CARD_OPEN/.test(output) || !edits.some(row => row[1] === 'answering')
-    || edits.at(-1)?.[1] !== 'completed' || edits.some((row, i) => i && Number(row[2]) <= Number(edits[i - 1][2]))
-    || /FIXTURE_CARD_.*MISMATCH/.test(output)) {
-    throw new Error('expected one progress card and ordered interim + terminal edits: '
+  while (Date.now() < cardDeadline && expectedCards.some(card => !output.includes('FIXTURE_CARD=' + card.id + ':completed:'))) await delay(100)
+  const opened = [...output.matchAll(/FIXTURE_CARD_OPEN=(\d+):(\d+):([^:\r\n]+):(\w+):(\d+)/g)]
+  const edits = [...output.matchAll(/FIXTURE_CARD=(\d+):(\w+):(\d+)/g)]
+  if (opened.length !== expectedCards.length || edits.some(row => !expectedCards.some(card => card.id === row[1]))
+    || expectedCards.some(card => {
+      const starts = opened.filter(row => row[1] === card.id)
+      const updates = edits.filter(row => row[1] === card.id)
+      return starts.length !== 1 || starts[0][2] !== card.type || starts[0][3] !== card.address
+        || !['reasoning', 'answering'].includes(starts[0][4]) || Number(starts[0][5]) !== 1
+        || card.id === '201' && starts[0][4] !== 'reasoning'
+        || card.answering && !updates.some(row => row[2] === 'answering')
+        || updates.at(-1)?.[2] !== 'completed'
+        || updates.some((row, i) => Number(row[3]) <= (i ? Number(updates[i - 1][3]) : 1)
+          || (i === updates.length - 1 ? row[2] !== 'completed' : !['reasoning', 'answering'].includes(row[2])))
+    }) || /FIXTURE_CARD_.*MISMATCH/.test(output)) {
+    throw new Error('expected route-bound progress cards with ordered states and final completed edits: '
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   }
+  if (groupToolsSmoke) console.log('FIXTURE_GROUP_PROGRESS_OK=201')
   if (browserModule && !/dsh_session_reused/.test(output)) throw new Error('Web did not hold the fixture session open during the second turn')
   if (ownerSmoke && (readFileSync(join(home, 'octo-tool-fixture.txt'), 'utf8') !== 'written by native DSH'
-    || !output.includes('FIXTURE_FILE_OK') || !output.includes('FIXTURE_QUESTION_ANSWERED')
+    || !output.includes('FIXTURE_FILE_OK') || !output.includes('FIXTURE_FILE_CAPTION_OK') || !output.includes('FIXTURE_QUESTION_ANSWERED')
+    || !output.includes('FIXTURE_GROUP_MEMBERS_OK')
     || [501, 502, 503].some(id => !output.includes('FIXTURE_ANSWER_FEEDBACK=' + id)))) throw new Error('Native write/present/delivery failed: '
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   if (!output.includes('FIXTURE_RICH_IMAGE_DOWNLOADED') || output.includes('FIXTURE_SYNC_SCOPE_WRONG')) throw new Error('Missing scoped rich media/history')
   if (ownerSmoke) {
+    if (groupToolsSmoke && (readFileSync(join(home, 'group-tool-fixture.txt'), 'utf8') !== 'group native tools executed'
+      || ['FIXTURE_GROUP_QUESTION_SENT', 'FIXTURE_GROUP_INVALID_CALLBACKS_IGNORED', 'FIXTURE_GROUP_QUESTION_ANSWERED',
+        'FIXTURE_ANSWER_FEEDBACK=504', 'FIXTURE_GROUP_WRITE_OK', 'FIXTURE_GROUP_DISPLAY_CARD_OK=700',
+        'FIXTURE_GROUP_DISPLAY_RECEIPT_OK', 'FIXTURE_GROUP_FINAL_OK'].some(marker => !output.includes(marker))
+      || /FIXTURE_GROUP_INVALID_CALLBACK_ACCEPTED|FIXTURE_QUESTION_FEEDBACK_MISMATCH|FIXTURE_GROUP_DISPLAY_(?:CARD_MISMATCH|RECEIPT_WRONG)/.test(output))) {
+      throw new Error('Group native question/write/display-card/final roundtrip failed: '
+        + output.replace(/https?:\/\/\S+/g, '[url]').slice(-2000))
+    }
     const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
     try {
       const rows = db.prepare("SELECT message_id,result_id,session_id FROM jobs WHERE state='sent' AND message_id IN ('1','902')").all()
       if (rows.length !== 2 || !rows[0].result_id || rows[0].result_id !== rows[1].result_id
         || !rows[0].session_id || rows[0].session_id !== rows[1].session_id) throw new Error('File and follow-up did not share one confirmed reply')
+      if (groupToolsSmoke) {
+        const final = db.prepare("SELECT session_id FROM jobs WHERE message_id='3' AND state='sent'").get()
+        const answers = db.prepare("SELECT message_id,sender,channel_type,channel_id,session_id,state FROM jobs WHERE message_id IN ('card_action:904','card_action:905','card_action:906')").all()
+        const card = db.prepare("SELECT claimed,binding FROM card_bindings WHERE message_id='504'").get()
+        if (!final?.session_id || answers.length !== 1 || answers[0].message_id !== 'card_action:906'
+          || answers[0].sender !== 'fixture-user' || answers[0].channel_type !== 2
+          || answers[0].channel_id !== '00112233445566778899aabbccddeeff'
+          || answers[0].state !== 'ignored' || answers[0].session_id !== final.session_id
+          || card?.claimed !== 1 || JSON.parse(card.binding).questionFeedback !== 1) {
+          throw new Error('Group card callback accepted a wrong sender/channel or lost its original session/feedback')
+        }
+      }
     } finally { db.close() }
-    console.log('PASS: three native questions answered by Octo card callbacks with visible feedback; DSH resumed and delivered identical file bytes.')
+    console.log('PASS: three DM card answers, file plus full description, group member tool, and '
+      + (groupToolsSmoke ? 'native group question/card answer, wrong callback rejection, workspace write, structured display receipt and final.' : 'Octo-only group tool isolation.'))
   }
   if (deleteSmoke) {
     const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })

@@ -12,6 +12,13 @@ const builtinPreset = {
   ptc: ['PTC 模式', 'PTC mode'],
   cordis: ['创造模式', 'Creator mode'],
 }
+const builtinEffort = {
+  max: ['最高', 'Maximum'],
+  high: ['高', 'High'],
+  medium: ['中等', 'Medium'],
+  low: ['低', 'Low'],
+  default: ['模型默认', 'Model default'],
+}
 const copy = {
   unnamed: ['Octo 账号', 'Octo account'],
   legacy: ['此账号来自服务器原有配置。', 'This account comes from the server configuration.'],
@@ -47,7 +54,14 @@ const copy = {
   pickPolicy: ['请选择权限策略', 'Select a permission'],
   noPolicies: ['暂无可选权限策略', 'No permissions available'],
   policyDisabled: ['灰色选项需要管理员在服务器上开放。', 'A server administrator must enable the unavailable options.'],
-  policyScope: ['跟随 Octo 准入时，工具仅对已验证的 Bot 所有者私聊开放；其他好友、群聊和子区可正常对话。', 'When following Octo access, only the verified bot owner can use tools in DMs. Other friends and group or topic members can still chat.'],
+  toolScope: ['工具使用范围', 'Tool access scope'],
+  toolPrivate: ['获准的私聊用户', 'Authorized DM users'],
+  toolOwner: ['Bot 所有者的全部会话', 'All bot owner conversations'],
+  toolAdmitted: ['所有已准入用户', 'All admitted users'],
+  toolScopeHint: ['控制谁能使用所选 Agent 预设中可用的全部 DSH 工具、插件和技能（Skills），实际操作仍受账号权限策略约束；“仅文字”不开放工具。所有用户和私聊、群聊、子区（话题）仍须通过现有聊天准入规则。', 'Controls who can use all DSH tools, plugins and skills available in the selected Agent preset, subject to this account’s permission policy. Text-only permission grants no tools. Every user and DM, group or topic must still pass existing chat admission rules.'],
+  toolPrivateHint: ['DSH 工具仅对获准的私聊用户开放：名单准入时为名单内用户，跟随 Octo 准入时为 Bot 所有者。群聊和子区仍可使用已开放的 Octo 频道工具，不能访问工作区。', 'DSH tools are limited to allowlisted DM users or the verified bot owner in DMs. Groups and topics can still use enabled Octo channel tools, without workspace access.'],
+  toolOwnerHint: ['仅已验证的 Bot 所有者可用，适用于其已准入的私聊、群聊和子区（话题）。', 'Only the verified bot owner can use tools, in admitted DMs, groups and topics.'],
+  toolAdmittedHint: ['所有已通过聊天准入的用户均可用，包括私聊、群聊和子区（话题）。', 'All users who passed chat admission can use tools, including in DMs, groups and topics.'],
   senderPolicy: ['私聊准入', 'Private chat access'],
   senderAllowlist: ['仅允许名单中的用户', 'Allowlisted users only'],
   senderOcto: ['跟随 Octo 好友和群成员权限', 'Follow Octo friend and group access'],
@@ -63,13 +77,14 @@ const copy = {
   sendMode: ['发送方式', 'Send mode'],
   sendQueue: ['排队发送', 'Queue'],
   sendSteer: ['插话发送', 'Steer'],
-  sendSteerNote: ['实时连接下，同一获准使用工具的私聊用户可补充文字指令，附件准备中的补充会与附件一起处理。其他消息仍按队列发送。', 'Over WebSocket, the same DM user authorized for tools can add instructions, including while attachments are being prepared. Other messages are queued.'],
-  dmCommands: ['私聊命令', 'DM commands'],
-  groupCommands: ['群聊命令', 'Group commands'],
+  sendSteerNote: ['实时连接下，同一频道内、同一获准使用 DSH 工具的用户可补充文字指令。附件准备中的补充会与附件一起处理；执行中由 DSH 在下一可插话步骤接收。其他消息仍按队列发送。', 'Over WebSocket, the same user authorized for DSH tools can add instructions in the same channel. Attachment preparation merges the supplement; running work receives it at the next DSH steering step. Other messages are queued.'],
+  dmCommands: ['私聊快捷命令', 'DM shortcuts'],
+  groupCommands: ['群聊快捷命令', 'Group shortcuts'],
   commandsOff: ['仅正常对话', 'Conversation only'],
-  commandsSafe: ['仅允许插件命令', 'Plugin commands only'],
+  commandsSafe: ['允许频道快捷命令', 'Allow channel shortcuts'],
+  commandsHint: ['仅控制 /help、/status、/new、/card、/choose 等频道快捷命令，仍遵循原有命令授权规则；不控制 DSH 工具、插件或技能访问，也不转发其他插件命令。工具访问请设置“工具使用范围”和“权限策略”。', 'Only controls channel shortcuts such as /help, /status, /new, /card and /choose, under existing command authorization rules. It does not control DSH tools, plugins or skills, or forward other plugin commands. Configure tool scope and permission for tool access.'],
   allowFiles: ['允许处理文件附件', 'Allow file attachments'],
-  filesNote: ['允许处理符合聊天准入规则的附件。只有获准使用工具的私聊用户可以接收工作区交付文件。', 'Process attachments from eligible chats. Only DMs authorized for tools can receive files produced in the workspace.'],
+  filesNote: ['允许处理符合聊天准入规则的附件。工作区文件交付还须符合“工具使用范围”和账号权限策略；选择包含群聊、子区的工具范围时，可在相应已准入会话交付文件。', 'Process attachments from admitted chats. Workspace file delivery also requires tool access under the selected scope and account permission. Scopes that include groups and topics allow delivery in those admitted conversations.'],
   current: ['当前设置', 'Current setting'],
   enabled: ['启用此账号', 'Enable this account'],
   save: ['保存账号', 'Save account'],
@@ -101,6 +116,7 @@ export function accountFields(account) {
     reasoningEffort: account?.reasoningEffort ?? '',
     permission: account?.permission ?? 'text-only',
     agentPreset: account?.agentPreset ?? 'octo-text',
+    toolScope: account?.toolScope ?? 'private',
     senderPolicy: account?.senderPolicy ?? 'octo',
     allowedUids: account?.allowedUids ?? [],
     idleMinutes: account?.idleMinutes ?? 0,
@@ -225,7 +241,8 @@ export function createAccountEditor(React, { Button, Input }) {
       presetOptions.unshift({ value: 'octo-text', label: tr('defaultPreset') })
     }
     const presetItems = choices(presetOptions, initial.agentPreset)
-    const effortItems = choices(efforts.map(value => ({ value, label: value })), originalEffort)
+    const effortLabel = value => Object.hasOwn(builtinEffort, value) ? builtinEffort[value][lang === 'zh' ? 0 : 1] : value
+    const effortItems = choices(efforts.map(value => ({ value, label: effortLabel(value) })), originalEffort, effortLabel(originalEffort))
     const validChoice = (items, value, original) => (editing && value === original)
       || items.some(item => item.value === value && !item.disabled)
     const validate = fields => {
@@ -324,6 +341,8 @@ export function createAccountEditor(React, { Button, Input }) {
       ...items.map(item => h('option', { key: item.value, value: item.value, disabled: item.disabled }, item.label))))
     const enums = values => values.map(([value, label]) => ({ value, label: tr(label) }))
     const senderItems = enums([['allowlist', 'senderAllowlist'], ['octo', 'senderOcto']])
+    const toolItems = enums([['private', 'toolPrivate'], ['owner', 'toolOwner'], ['admitted', 'toolAdmitted']])
+    const toolHint = draft.toolScope === 'owner' ? 'toolOwnerHint' : draft.toolScope === 'admitted' ? 'toolAdmittedHint' : 'toolPrivateHint'
     const idleItems = choices(idleChoices.map(minutes => ({
       value: String(minutes), label: tr(minutes === 0 ? 'idleOff' : 'idle' + minutes),
     })), String(initial.idleMinutes))
@@ -362,9 +381,11 @@ export function createAccountEditor(React, { Button, Input }) {
             h('option', null, tr('effortUnavailable'))))),
       select('policy', 'permission', policyItems, draft.permission, permission => update({ permission }),
         policyItems.length ? 'pickPolicy' : 'noPolicies'),
-      select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),
+      select('tool-scope', 'toolScope', toolItems, draft.toolScope, toolScope => update({ toolScope })),
       policies.some(item => item.disabled) && hint('policyDisabled', { className: 'dsho-account-note dsho-account-wide' }),
-      draft.senderPolicy === 'octo' && hint('policyScope', { className: 'dsho-account-note dsho-account-wide' }),
+      hint('toolScopeHint', { className: 'dsho-account-note dsho-account-wide' }),
+      hint(toolHint, { className: 'dsho-account-note dsho-account-wide' }),
+      select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),
       draft.senderPolicy === 'allowlist' && field('uids', 'allowedUids', h(React.Fragment, null,
         h('textarea', { id: id + '-uids', rows: 3, value: uidText, disabled: locked, 'aria-required': true,
           'aria-describedby': id + '-uids-hint', onChange: event => setUidText(event.target.value),
@@ -377,6 +398,7 @@ export function createAccountEditor(React, { Button, Input }) {
       draft.sendMode === 'steer' && hint('sendSteerNote', { className: 'dsho-account-note dsho-account-wide' }),
       select('dm-commands', 'dmCommands', commandItems, draft.dmCommands, dmCommands => update({ dmCommands })),
       select('group-commands', 'groupCommands', commandItems, draft.groupCommands, groupCommands => update({ groupCommands })),
+      hint('commandsHint', { className: 'dsho-account-note dsho-account-wide' }),
       checkbox('allowFiles', 'allowFiles', draft.allowFiles ? id + '-files-note' : undefined),
       draft.allowFiles && hint('filesNote', { id: id + '-files-note', className: 'dsho-account-note dsho-account-wide' }),
       !editing && checkbox('enabled', 'enabled'))

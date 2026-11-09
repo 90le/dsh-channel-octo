@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { wirePeer } from '../scripts/wukong-fixture.mjs'
 import { Worker } from '../src/worker.js'
 import { Store } from '../src/store.js'
+import { receiveRealtime } from '../src/realtime.js'
 
 async function until(fn, timeout = 6000) {
   const deadline = Date.now() + timeout
@@ -60,4 +61,28 @@ test('real WuKong wire reconnects and ACKs durable work; replay does not rerun i
     store.close()
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('REST heartbeat follows acknowledged socket lifetime without reconnecting on heartbeat failure', async () => {
+  const stop = new AbortController(), logs = []
+  let connect, disconnect, beats = 0, registrations = 0, closed = 0, heartbeatSignal
+  const connected = new Promise(resolve => { connect = resolve })
+  const run = receiveRealtime({ signal: stop.signal, botUid: 'fixture', accept() {}, log: line => logs.push(line),
+    api: { async register() { registrations++; return {} }, async heartbeat(signal) {
+      beats++; heartbeatSignal = signal; throw new Error('fixture offline heartbeat')
+    } },
+    makeConnection(_accept, end) { disconnect = end; return { async connect() { await connected }, async close() { closed++ } } },
+    pause: async () => { stop.abort() },
+  })
+  await delay(10)
+  assert.equal(beats, 0)
+  connect()
+  await until(() => beats === 1 && logs.includes('octo_heartbeat_unavailable'))
+  assert.equal(registrations, 1)
+  assert.equal(closed, 0)
+  disconnect(new Error('fixture disconnected'))
+  await run
+  assert.equal(heartbeatSignal.aborted, true)
+  assert.equal(beats, 1)
+  assert.equal(closed, 1)
 })

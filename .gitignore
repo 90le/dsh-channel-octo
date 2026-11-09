@@ -8,3 +8,4 @@ state/
 *.sqlite*
 *.log
 coverage/
+graphify-out/

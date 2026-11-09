@@ -76,7 +76,7 @@ test('native DSH mixed input keeps order and continues past a rejected image', a
     { type: 'text', text: 'next' }, { type: 'text', text: '【此图片未能进入 DSH】' }, { type: 'text', text: 'end' }])
 })
 
-for (const mode of ['native', 'unsupported', 'unknown']) test('rich-image sending and quote receipts: ' + mode, async t => {
+for (const mode of ['native', 'unsupported', 'unknown']) test('rich-image sending without empty DM quotations: ' + mode, async t => {
   const { cwd, store } = fixture(t)
   writeFileSync(join(cwd, 'pixel.png'), png)
   writeFileSync(join(cwd, 'report.txt'), 'document')
@@ -103,7 +103,7 @@ for (const mode of ['native', 'unsupported', 'unknown']) test('rich-image sendin
       const { channel_id, channel_type, payload } = JSON.parse(init.body)
       assert.equal(channel_id, 'alice')
       assert.equal(channel_type, 1)
-      assert.deepEqual(payload.reply, { message_id: '9223372036854775807' })
+      assert.equal(payload.reply, undefined)
       payloads.push(payload)
       if (payload.type === 14 && mode === 'unsupported') return new Response(null, { status: 422 })
       if (payload.type === 14 && mode === 'unknown') throw new Error('lost acknowledgement')

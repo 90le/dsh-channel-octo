@@ -1,3 +1,7 @@
 # Third-party code
 
 `src/wukong.js` adapts the WuKong wire client from [Mininglamp-OSS/octo-channel-gateway](https://github.com/Mininglamp-OSS/octo-channel-gateway/blob/ec4ac3ed01a3385cf8077c6b3d02c8c7b9b17ad1/packages/gateway/src/transport/wukong.ts), under the [Apache License, Version 2.0](LICENSE-OCTO-APACHE-2.0). Changes include the JavaScript port, separate HTTP registration, and removal of the original app-specific message-position and rules hooks. The client calls this plugin's synchronous queue handler before acknowledging receipt.
+
+`src/outbound-text.js` adapts final-prose mention extraction and UTF-16 entity offsets from the same Gateway revision's `transport/mentions.ts`, under Apache-2.0. It uses this plugin's current-channel member data and excludes links from notification parsing. Markdown block segmentation is local code. `mdast-util-from-markdown` is used under its MIT license.
+
+`src/display-card.js` adapts controlled display blocks, capability negotiation and card limits from [Mininglamp-OSS/openclaw-channel-octo](https://github.com/Mininglamp-OSS/openclaw-channel-octo/tree/3cdb7e794ba40ae617fb0215177d1493dd26460a), files `src/card-display-tool.ts`, `card-blocks.ts`, `card-caps.ts`, `card-limits.ts` and `card-render.ts`, under the included Apache-2.0 license. Changes include a bounded JavaScript implementation, strict schemas, HTTPS navigation links, current-conversation transport and receipt handling, with no callback actions or raw reasoning. The pinned upstream has no separate NOTICE file.

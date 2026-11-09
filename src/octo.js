@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
 import { normalizeOctoContent } from './octo-content.js'
 import { parseSafeCommand } from './im-controls.js'
+import { ChannelApi } from './channel-api.js'
 
 const maxBody = 1024 * 1024
 const flag = (value) => value === 1 || value === true
@@ -61,17 +62,25 @@ async function boundedJson(response) {
 
 export class OctoClient {
   #token
-  constructor({ apiBase, token, waitSeconds, fetchImpl = fetch }) {
+  constructor(config) {
+    const { apiBase, token, waitSeconds, fetchImpl = fetch } = config
     this.base = apiBase
     this.#token = token
     this.wait = waitSeconds
     this.fetch = fetchImpl
+    this.configureChannel(config)
   }
 
-  async #request(path, body, signal, { timeout = 15_000, auth = true } = {}) {
+  configureChannel(config) {
+    this.channel = validUid(config.botUid) && validUid(config.spaceId)
+      ? new ChannelApi({ config, request: (path, body, signal, options) => this.#request(path, body, signal, options) })
+      : undefined
+  }
+
+  async #request(path, body, signal, { timeout = 15_000, auth = true, method } = {}) {
     try {
       const response = await this.fetch(this.base + path, {
-        method: body === undefined ? 'GET' : 'POST', redirect: 'manual',
+        method: method ?? (body === undefined ? 'GET' : 'POST'), redirect: 'manual',
         headers: { ...(body !== undefined && { 'Content-Type': 'application/json' }), ...(auth && { Authorization: 'Bearer ' + this.#token }) },
         body, signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
       })
@@ -215,16 +224,23 @@ export class OctoClient {
     if (result?.status !== 200) throw new OctoError('invalid_ack_response')
   }
 
-  async send(recipient, text, signal, channelType = 1, replyTo) {
-    return this.sendPayload({ channel_id: recipient, channel_type: channelType }, { type: 1, content: text }, signal, replyTo)
+  async send(recipient, text, signal, channelType = 1, replyTo, mention) {
+    return this.sendPayload({ channel_id: recipient, channel_type: channelType },
+      { type: 1, content: text, ...(mention && { mention }) }, signal, replyTo)
   }
 
   async sendPayload(route, payload, signal, replyTo) {
     if (![1, 2, 5].includes(route.channel_type)) throw new OctoError('invalid_channel_type')
-    const id = decimalId(replyTo)
+    // Web/Electron renders any reply object as a quotation. An ID alone leaves
+    // an empty bar and an undefined navigation target. Only send a usable quote.
+    const reply = replyTo && typeof replyTo === 'object' && decimalId(replyTo.message_id)
+      && channelSequence(replyTo.message_seq) && validUid(replyTo.from_uid)
+      && typeof replyTo.from_name === 'string' && replyTo.from_name.trim()
+      && replyTo.payload?.type === 1 && typeof replyTo.payload.content === 'string' && replyTo.payload.content.trim()
+      ? replyTo : undefined
     const result = await this.#request('/v1/bot/sendMessage', JSON.stringify({
       channel_id: route.channel_id, channel_type: route.channel_type,
-      payload: id ? { ...payload, reply: { message_id: id } } : payload,
+      payload: reply ? { ...payload, reply } : payload,
     }), signal)
     const sent = decimalId(result?.message_id)
     if (!sent) throw new OctoError('send_result_unconfirmed')
@@ -237,6 +253,15 @@ export class OctoClient {
 
   async typing(route, signal) {
     await this.#request('/v1/bot/typing', JSON.stringify(route), signal, { timeout: 2000 })
+  }
+
+  async heartbeat(signal) {
+    await this.#request('/v1/bot/heartbeat', '{}', signal, { timeout: 5000 })
+  }
+
+  async readReceipt(route, messageId, signal) {
+    if (!decimalId(messageId)) return
+    await this.#request('/v1/bot/readReceipt', JSON.stringify({ ...route, message_ids: [messageId] }), signal, { timeout: 2000 })
   }
 
   async progressCard(route, frame, signal) {

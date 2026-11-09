@@ -7,12 +7,17 @@ import { QuestionBridge } from './questions.js'
 import { downloadAttachment, prepareAttachment, uploadAttachment } from './octo-media.js'
 import { readDeliverable } from './dsh-media.js'
 import { createCard, parseCardAction, resolveCardAction, sendCard } from './octo-cards.js'
+import { finalMentions, textSegments, hasMarkdown, boundedMarkdown, mentionGuidance } from './outbound-text.js'
+import { CHANNEL_API_OPERATIONS as operationSpecs } from './channel-api.js'
+import { spec as displayCardSpec, sendDisplayCard } from './display-card.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
   : config.groupCommands === 'safe' && job.sender === config.ownerUid && !job.ambient)
 // Chat admission is separate from tools. Owner identity comes only from verify-bot.
-function authorizedToolDm(config, job) {
+export function authorizedTools(config, job) {
+  if (config.toolScope === 'admitted') return true // Caller must still pass channel admission.
+  if (config.toolScope === 'owner') return !!config.ownerUid && job.sender === config.ownerUid
   return job.channel_type === 1 && (config.senderPolicy === 'allowlist'
     ? config.allowed.has(job.sender)
     : config.senderPolicy === 'octo' && !!config.ownerUid && job.sender === config.ownerUid)
@@ -58,13 +63,6 @@ function authoredCard(reply) {
   } catch {}
 }
 
-function segments(text) {
-  const units = Array.from(text)
-  const out = []
-  for (let offset = 0; offset < units.length; offset += 1800) out.push(units.slice(offset, offset + 1800).join(''))
-  return out
-}
-
 const textCommands = {
   help: '可用命令：/help 帮助、/status 当前会话状态、/new 新会话、/card 展示卡片、/choose 交互卡片。',
   status: 'DSH 已收到这条消息，当前会话可以正常处理消息。',
@@ -88,6 +86,7 @@ export class Worker {
 
   reconfigure(config, host) {
     config.ownerUid = this.config.ownerUid
+    this.api.configureChannel?.(config)
     this.config = config
     this.host = host
   }
@@ -100,7 +99,7 @@ export class Worker {
 
   acceptInbound(eventId, message) {
     const question = !message.attachment && !message.attachments?.length && !message.command && message.text.trim() && this.questions.match(message)
-    if (question && authorizedToolDm(this.config, { sender: message.sender, channel_type: message.channelType })) {
+    if (question && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
       if (this.store.rememberAnswer(eventId, message, question.sessionId)) this.questions.text(question, message.text)
       return
     }
@@ -108,7 +107,8 @@ export class Worker {
     const inserted = this.store.add(eventId, message)
     const active = this.steerActive?.job ?? this.currentJob
     if (inserted.changes && !this.paused && active && this.config.sendMode === 'steer'
-      && message.channelType === 1 && message.sender === active.sender && message.channelId === active.sender
+      && message.channelType === active.channel_type && message.sender === active.sender
+      && message.channelId === (active.channel_id ?? active.sender)
       && !message.command && !message.parts && !message.attachment && !message.attachments?.length
       && message.text.trim() && this.steering.size < 32) {
       this.steering.add(message.messageId)
@@ -153,7 +153,7 @@ export class Worker {
           }
           if (binding.questionKey) {
             const pending = this.questions.match(message)
-            if (pending?.key === binding.questionKey && authorizedToolDm(this.config, { sender: message.sender, channel_type: message.channelType })) {
+            if (pending?.key === binding.questionKey && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
               if (this.store.claimCard(selection, message, pending.sessionId ?? null)) this.questions.card(pending, binding.questionKey, selection.selection)
             } else if (this.store.claimCard(selection, message, null)) {
               // A restart or completed wait must visibly retire the old form.
@@ -177,7 +177,7 @@ export class Worker {
     const active = this.steerActive
     if (!active || this.config.sendMode !== 'steer' || this.questions.current
       || this.config.sessionProfile !== active.profile
-      || !authorizedToolDm(this.config, active.job)) return
+      || !authorizedTools(this.config, active.job)) return
     const next = this.store.steerCandidate(active.job)
     if (!next || !this.steering.has(next.message_id) || next.sender !== active.job.sender || next.metadata || !next.input) return
     active.offer(next.input, () => {
@@ -191,11 +191,16 @@ export class Worker {
     const group = route.channel_type === 2 || route.channel_type === 5
     const before = channelSequence(job.message_seq)
     const source = group ? (route.channel_type === 2 ? '当前群主区' : '当前子区') : '当前私聊'
-    if ((!group && !meta.quoteId) || typeof this.api.recentMessages !== 'function') return
+    if (!group && !meta.quoteId) return
+    let members = []
+    if (group && this.api.channel?.members) {
+      try { members = await this.api.channel.members(route, signal) }
+      catch { signal.throwIfAborted(); this.log('channel_members_unavailable') }
+    }
     // Only the originating route is ever queried. Never resolve group history
     // from a DM or substitute the parent channel for a topic.
     let result
-    if (before || meta.quoteId) {
+    if ((before || meta.quoteId) && typeof this.api.recentMessages === 'function') {
       try { result = await this.api.recentMessages(config, route, before, signal) }
       catch { signal.throwIfAborted(); this.log('channel_history_unavailable') }
     }
@@ -206,8 +211,12 @@ export class Worker {
     return {
       source, status: !group ? 'quote-only' : !before ? 'position-unavailable' : !result ? 'unavailable'
         : rows.length ? 'recent-only' : 'empty',
-      ...(quote && { quote: { sender: quote.sender, text: quote.text } }),
-      ...(group && { history: rows.map(({ seq, sender, text }) => ({ seq, sender, text })) }),
+      ...(quote && { quote: { sender: quote.sender, text: quote.text,
+        ...(members.find(m => m.uid === quote.sender)?.name && { name: members.find(m => m.uid === quote.sender).name }) } }),
+      ...(group && { history: rows.map(({ seq, sender, text }) => ({ seq, sender, text,
+        ...(members.find(m => m.uid === sender)?.name && { name: members.find(m => m.uid === sender).name }) })),
+        members: members.slice(0, 80).map(({ uid, name, robot, role }) => ({ uid, name, robot, role })),
+        membersTruncated: members.length > 80, requester: job.sender }),
     }
   }
 
@@ -247,6 +256,10 @@ export class Worker {
     let progress
     let merged = meta.merged ?? []
     if (job.state === 'queued') {
+      if (this.api.readReceipt && decimalId(job.message_id)) {
+        try { await this.api.readReceipt(route, job.message_id, signal) }
+        catch { if (!signal.aborted) this.log('read_receipt_unavailable') }
+      }
       let rules
       if (channelType !== 1 && !meta.command && !meta.cardAction) {
         try {
@@ -263,10 +276,11 @@ export class Worker {
       // Keep the old mappings in thread-only mode. An inherited thread may
       // retain parent rules in its history, so keep it in a separate session.
       const inheritance = channelType === 5 && config.threadRuleMode === 'inherit-group' ? ['inherit-group'] : []
-      const toolsAllowed = authorizedToolDm(config, job)
+      const toolsAllowed = authorizedTools(config, job)
+      const capability = channelType !== 1 ? ['channel-v1', toolsAllowed ? 'dsh' : 'octo'] : []
       const conversation = config.sessionProfile
-        ? JSON.stringify([channelType, recipient, inheritance[0] ?? null, config.sessionProfile])
-        : channelType === 1 ? job.sender : JSON.stringify([channelType, recipient, ...inheritance])
+        ? JSON.stringify([channelType, recipient, inheritance[0] ?? null, config.sessionProfile, ...capability])
+        : channelType === 1 ? job.sender : JSON.stringify([channelType, recipient, ...inheritance, ...capability])
       this.store.running(job.seq)
       let deliverables, card
       try {
@@ -295,7 +309,7 @@ export class Worker {
           this.store.running(job.seq, session.session_id)
           const isFileOnly = attachments.length > 0 && !job.input.trim()
           const canMerge = () => config.transport === 'websocket' && !this.paused && this.config.sendMode === 'steer'
-            && this.config.sessionProfile === config.sessionProfile && authorizedToolDm(this.config, job)
+            && this.config.sessionProfile === config.sessionProfile && authorizedTools(this.config, job)
           // A file sent without a caption is often followed by its instructions
           // in a separate message. Give that text a short chance to join.
           if (isFileOnly && canMerge() && !this.steering.size) await delay(1000, undefined, { signal })
@@ -327,7 +341,28 @@ export class Worker {
               else progress.stage(phase)
               if (phase === 'running') queueMicrotask(() => this.attemptSteering())
             }, config.timeoutMs, toolsAllowed,
-            { attachments, order: inputOrder, authorCard, channelContext, taskContext: channelType === 1, onTrace: trace => progress.trace(trace),
+            { attachments, order: inputOrder, authorCard, channelContext, taskContext: true, onTrace: trace => progress.trace(trace),
+              ...((channelType !== 1 || toolsAllowed) && config.toolPermission !== 'text-only' && this.api.channel && { channelTools: {
+                specs: [...operationSpecs.filter(spec => spec.available && (config.toolPermission !== 'read-only' || !spec.mutating)
+                  && (channelType !== 1 ? !spec.name.startsWith('voice.context.')
+                    : spec.name === 'inspect' || spec.name.startsWith('messages.')
+                      || job.sender === config.ownerUid && (spec.name.startsWith('voice.context.')
+                        || ['space.members.search', 'groups.create'].includes(spec.name)))).map(spec => ({
+                  name: 'octo_' + spec.name.replaceAll('.', '_'), description: spec.description, parameters: spec.parameters,
+                })),
+                  displayCardSpec],
+                execute: (name, args, toolSignal) => {
+                  if (name === displayCardSpec.name) return (async () => {
+                    if (!await this.api.allowsMessage(this.config, job, toolSignal)) throw new Error('octo_access_denied')
+                    const receipt = await sendDisplayCard({ api: this.api, route, args, signal: toolSignal })
+                    this.store.recordDelivery(job.seq, receipt.messageId)
+                    return receipt
+                  })()
+                  const operation = operationSpecs.find(spec => 'octo_' + spec.name.replaceAll('.', '_') === name)
+                  if (!operation?.available || config.toolPermission === 'read-only' && operation.mutating) throw new Error('octo_operation_unavailable')
+                  return this.api.channel.dispatch(route, job.sender, operation.name, args, toolSignal)
+                }, guidance: mentionGuidance,
+              } }),
               ...(toolsAllowed && { onQuestion: (questions, askSignal) => this.questions.ask(questions,
                 { ...job, session_id: session.session_id }, config, askSignal,
                 waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' })) }),
@@ -344,14 +379,14 @@ export class Worker {
             for (const seq of [job.seq, ...merged]) this.store.running(seq, session.session_id)
             reply = await run()
           }
-          if (channelType === 1 && asksForFile(input) && !deliverables?.length) {
+          if (asksForFile(input) && !deliverables?.length) {
             const issue = !config.allowFiles ? 'files_disabled' : !toolsAllowed || config.toolPermission === 'text-only'
               ? 'file_tools_unavailable' : 'file_not_presented'
             this.store.review(job.seq, issue)
             for (const seq of merged) this.store.review(seq, issue)
             this.log(issue)
             const explanation = issue === 'files_disabled' ? '此账号尚未启用附件。'
-              : issue === 'file_tools_unavailable' ? '本次私聊没有工作区工具权限。'
+              : issue === 'file_tools_unavailable' ? '本次会话没有工作区工具权限。请检查账号的工具使用范围和权限策略。'
                 : 'DSH 没有交付可发送的文件。'
             const notified = await progress.finish('error', { detail: explanation })
             if (!notified && !signal.aborted) {
@@ -365,8 +400,7 @@ export class Worker {
             if (card) reply = card.fallback
           }
         }
-        const units = Array.from(reply.trim())
-        const bounded = units.length <= 14_400 ? units.join('') : units.slice(0, 14_360).join('') + '\n（其余内容请在 DSH 会话中查看）'
+        const bounded = boundedMarkdown(reply)
         if (!bounded) throw new Error('empty_reply')
         meta = meta.command || meta.cardAction ? meta : {
           ...(deliverables?.length && { deliverables }), ...(merged.length && { merged }), ...(card && { displayCard: card.form }),
@@ -391,7 +425,15 @@ export class Worker {
     this.store.sending(job.seq)
     progress?.stage('delivering')
     let confirmed = false
-    const replyTo = decimalId(job.message_id)
+    let members = []
+    if (channelType !== 1 && this.api.channel?.members) {
+      try { members = await this.api.channel.members(route, signal) }
+      catch { signal.throwIfAborted(); this.log('channel_members_unavailable') }
+    }
+    const replyTo = channelType !== 1 && decimalId(job.message_id) && channelSequence(job.message_seq) && job.input.trim()
+      ? { message_id: job.message_id, message_seq: job.message_seq, from_uid: job.sender,
+        from_name: members.find(member => member.uid === job.sender)?.name || '群成员',
+        payload: { type: 1, content: Array.from(job.input).slice(0, 160).join('') } } : undefined
     const markMedia = (id, count = 1) => {
       confirmed = true
       this.store.recordDelivery(job.seq, id)
@@ -400,7 +442,7 @@ export class Worker {
     try {
       const images = []
       if (meta.deliverables?.length) {
-        if (!config.allowFiles || !authorizedToolDm(config, job) || config.toolPermission === 'text-only') throw new Error('files_not_authorized')
+        if (!config.allowFiles || !authorizedTools(config, job) || config.toolPermission === 'text-only') throw new Error('files_not_authorized')
         for (const path of meta.deliverables) {
           const file = await readDeliverable(config.cwd, isAbsolute(path) ? relative(config.cwd, path) : path, signal)
           if (typeof this.api.sendPayload !== 'function') {
@@ -424,8 +466,8 @@ export class Worker {
         }
       }
       if (!resultId) {
-        const chunks = segments(job.reply)
-        if (images.length && chunks.length) {
+        const chunks = textSegments(job.reply)
+        if (images.length && chunks.length && !hasMarkdown(job.reply) && !job.reply.includes('@[')) {
           const payload = { type: 14, content: [{ type: 'text', text: chunks[0] },
             ...images.map(({ url, width, height }) => ({ type: 'image', url, width, height }))] }
           if (Buffer.byteLength(JSON.stringify(payload)) <= 48 * 1024) {
@@ -440,13 +482,14 @@ export class Worker {
               if (!(error instanceof OctoError) || ![400, 415, 422].includes(error.status)) throw error
             }
           }
-          for (const image of images) markMedia(await this.api.sendPayload(route, image, signal, replyTo))
         }
+        for (const image of images) markMedia(await this.api.sendPayload(route, image, signal, replyTo))
         for (const chunk of chunks) {
-          const delivered = await this.api.send(recipient, chunk, signal, channelType, replyTo)
+          const outbound = finalMentions(chunk, members)
+          const delivered = await this.api.send(recipient, outbound.text, signal, channelType, replyTo, outbound.mention)
           confirmed = true
           resultId ??= delivered
-          if (chunks.length > 1 || meta.deliverables?.length) this.store.recordDelivery(job.seq, resultId)
+          if (chunks.length > 1 || meta.deliverables?.length) this.store.recordDelivery(job.seq, delivered)
         }
       }
       this.store.sent(job.seq, resultId, merged)
