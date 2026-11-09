@@ -32,6 +32,15 @@ export class Store {
       if (this.db.prepare('SELECT identity FROM binding WHERE id=1').get().identity !== identity) {
         throw new Error('state_bound_to_another_bot')
       }
+      this.db.exec('BEGIN IMMEDIATE')
+      const columns = new Set(this.db.prepare('PRAGMA table_info(jobs)').all().map(row => row.name))
+      if (!columns.has('channel_type')) this.db.exec('ALTER TABLE jobs ADD COLUMN channel_type INTEGER NOT NULL DEFAULT 1')
+      if (!columns.has('channel_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN channel_id TEXT')
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS jobs_by_route
+          ON jobs(channel_type, COALESCE(channel_id, sender), seq) WHERE state IN ('queued','ready','running','sending');
+        COMMIT;
+      `)
       this.db.exec("UPDATE jobs SET state='review', issue='interrupted_' || state WHERE state IN ('running','sending')")
     } catch (error) {
       this.close()
@@ -40,16 +49,19 @@ export class Store {
   }
 
   add(eventId, m) {
-    this.db.prepare('INSERT INTO jobs (message_id,event_id,sender,input) VALUES (?,?,?,?) ON CONFLICT(message_id) DO NOTHING')
-      .run(m.messageId, eventId, m.sender, m.text)
+    this.db.prepare(`
+      INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id) VALUES (?,?,?,?,?,?)
+      ON CONFLICT(message_id) DO NOTHING
+    `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender)
   }
 
   next(now) {
-    // Keep per-sender reply order when an earlier send was rate-limited.
+    // Keep per-conversation reply order when an earlier send was rate-limited.
     return this.db.prepare(`
       SELECT j.* FROM jobs j WHERE j.state IN ('queued','ready') AND j.next_ms <= ?
         AND NOT EXISTS (
-          SELECT 1 FROM jobs prior WHERE prior.sender=j.sender AND prior.seq<j.seq
+          SELECT 1 FROM jobs prior WHERE prior.channel_type=j.channel_type
+            AND COALESCE(prior.channel_id, prior.sender)=COALESCE(j.channel_id, j.sender) AND prior.seq<j.seq
             AND prior.state IN ('queued','ready','running','sending')
         )
       ORDER BY j.seq LIMIT 1

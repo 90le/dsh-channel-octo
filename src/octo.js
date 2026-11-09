@@ -99,9 +99,10 @@ export class OctoClient {
     if (result?.status !== 200) throw new OctoError('invalid_ack_response')
   }
 
-  async send(recipient, text, signal) {
+  async send(recipient, text, signal, channelType = 1) {
+    if (![1, 2, 5].includes(channelType)) throw new OctoError('invalid_channel_type')
     const result = await this.#post('/v1/bot/sendMessage', JSON.stringify({
-      channel_id: recipient, channel_type: 1, payload: { type: 1, content: text },
+      channel_id: recipient, channel_type: channelType, payload: { type: 1, content: text },
     }), signal)
     const id = decimalId(result?.message_id)
     if (!id) throw new OctoError('send_result_unconfirmed')
@@ -109,14 +110,31 @@ export class OctoClient {
   }
 }
 
+export function permitsRoute(config, sender, channelType, channelId) {
+  if (sender === config.botUid || !config.allowed.has(sender)) return false
+  if (channelType === 1) return channelId === sender
+  if (channelType === 2) return config.groups?.has(channelId) === true
+  if (channelType === 5) return config.threads?.has(channelId) === true
+  return false
+}
+
 export function admit(event, config) {
   const message = event?.message
   const sender = message?.from_uid
   const text = typeof message?.payload?.content === 'string' ? message.payload.content.trim() : ''
   const messageId = decimalId(message?.message_id)
-  if (!messageId || event.event_type || message.channel_type !== 1 || message.payload?.type !== 1
-    || sender === config.botUid || !config.allowed.has(sender)
+  const channelType = message?.channel_type
+  const channelId = channelType === 1 ? sender : message?.channel_id
+  if (!messageId || event.event_type || message.payload?.type !== 1
+    || !permitsRoute(config, sender, channelType, channelId)
+    || (message.payload.space_id != null && message.payload.space_id !== config.spaceId)
     || !text || text.startsWith('/') || Buffer.byteLength(text, 'utf8') > 8000) return
-  // Octo's raw DM channel_id is not guaranteed to be the recipient-facing id.
-  return { messageId, sender, text }
+  if (channelType !== 1) {
+    const mention = message.payload.mention
+    const broadcast = [mention?.all, mention?.ais, mention?.humans].some(flag => flag === 1 || flag === true)
+    if (broadcast || !Array.isArray(mention?.uids) || !mention.uids.includes(config.botUid)) return
+  }
+  // For a DM the raw channel ID is not necessarily the recipient's UID. Group
+  // and topic replies use the original channel address, never the sender UID.
+  return { messageId, sender, text, channelId, channelType }
 }

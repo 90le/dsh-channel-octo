@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
-import { admit, decimalId, OctoError } from './octo.js'
+import { admit, decimalId, OctoError, permitsRoute } from './octo.js'
 
 export class Worker {
   constructor({ api, store, host, config, log }) {
@@ -20,15 +20,20 @@ export class Worker {
   }
 
   async process(job, signal) {
-    if (!this.config.allowed.has(job.sender) || job.sender === this.config.botUid) {
-      this.store.review(job.seq, 'sender_not_allowed')
+    const channelType = job.channel_type
+    const recipient = job.channel_id ?? job.sender
+    if (!permitsRoute(this.config, job.sender, channelType, recipient)) {
+      this.store.review(job.seq, 'route_not_allowed')
       return
     }
     if (job.state === 'queued') {
-      const session = this.store.session(job.sender)
+      // Preserve the existing DM mapping on upgrade. Use a disjoint namespace
+      // for the entire group/topic so two participants share the intended history.
+      const conversation = channelType === 1 ? job.sender : JSON.stringify([channelType, recipient])
+      const session = this.store.session(conversation)
       this.store.running(job.seq)
       try {
-        const reply = await this.host.run(session, job.input, () => this.store.sessionCreated(job.sender), signal)
+        const reply = await this.host.run(session, job.input, () => this.store.sessionCreated(conversation), signal)
         const bounded = Array.from(reply.trim()).slice(0, 1800).join('')
         if (!bounded) throw new Error('empty_reply')
         this.store.ready(job.seq, bounded)
@@ -42,7 +47,7 @@ export class Worker {
     signal.throwIfAborted()
     this.store.sending(job.seq)
     try {
-      const resultId = await this.api.send(job.sender, job.reply, signal)
+      const resultId = await this.api.send(recipient, job.reply, signal, channelType)
       this.store.sent(job.seq, resultId)
     } catch (error) {
       if (error instanceof OctoError && error.status === 429 && job.attempts < 3) {

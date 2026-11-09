@@ -1,6 +1,6 @@
 # DSH Channel Octo
 
-在 DeepSeek Harness Web 中并列加载的 Octo 私聊插件。使用宿主模型和原生会话，只接收白名单用户的纯文本私聊。设计、运行边界和分阶段验收见 [方案](PLAN.md)。
+在 DeepSeek Harness Web 中并列加载的 Octo 私聊插件。使用宿主模型和原生会话，只接收白名单用户的纯文本，默认仅私聊；User Bot 可以单独开放指定群和话题。见[基础方案](PLAN.md)与[完整 Octo 能力及验收计划](OCTO-COVERAGE.md)。
 
 ## 本地检查
 
@@ -16,7 +16,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.1.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.2.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -29,11 +29,15 @@ dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.1.0.tgz
     botUid: TEST_BOT_UID
     spaceId: TEST_SPACE_ID
     allowedUids: [TEST_USER_UID]
+    allowedGroupIds: []
+    allowedThreadIds: []
     cwd: /absolute/test-workspace
     stateDir: /absolute/private-octo-state
     waitSeconds: 15
     timeoutMs: 120000
 ```
+
+群聊与话题只接受 User Bot（bf_），两个白名单分别配置。话题填完整通道 ID，例如 `GROUP_ID____SHORT_ID`；群 ID 不会自动放行旗下话题。两个场景都只响应白名单用户明确 @ Bot 的普通文本。升级前停止消费者并备份状态目录；旧私聊会话和排队记录兼容保留。
 
 需要为测试 profile 设置可用的 DSH 模型。使用独立 Bot，不与其他连接程序同时消费其事件；启用后会确认该 Bot 收到的事件，超出当前支持范围的事件不进入模型。暂停时将 `enabled` 改回 `false` 并按环境流程重载 Web；本地状态和会话保留。
 
@@ -41,7 +45,7 @@ dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.1.0.tgz
 
 ## 当前状态
 
-0.1.0 为开发候选，包含长轮询、白名单、原生会话续接、工具拒绝、持久队列及回复投递。已通过 5 项自动测试，以及隔离 DSH Web 0.2.1-rc.5 与 IM Connect 1.0.30 的共存检查。隔离检查用模拟 Octo 和模型完成两轮私聊并确认回复入库、续接同一原生会话、模型请求不带工具。尚未连接实际 Octo、验证已绑定的其他 IM 渠道收发或部署 Debian。
+0.2.0 为开发候选，支持私聊、群聊和话题文本路由。7 项自动测试覆盖收发、准入、去重、恢复及旧数据库迁移。隔离 DSH Web 0.2.1-rc.5 与 IM Connect 1.0.30 使用模拟 Octo 和模型跑通两轮私聊、一轮群聊和一轮话题；验证私聊续接及三种会话互不串线。正式环境已另行验证 Bot 鉴权、HTTP 长轮询和悟空 WebSocket 握手；这些探测未部署本插件。实际 Octo 插件收发、附件和卡片闭环、其他已绑定 IM 渠道收发与 Debian 部署仍待验收。
 
 复跑宿主检查（需安装指定版本的 DSH CLI；脚本使用临时 DSH home 和测试凭据）：
 

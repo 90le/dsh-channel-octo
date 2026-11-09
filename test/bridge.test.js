@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { OctoClient } from '../src/octo.js'
 import { Store } from '../src/store.js'
 import { Worker } from '../src/worker.js'
@@ -140,4 +141,70 @@ test('ambiguous send is held; an explicit 429 retries only the delivery', async 
   assert.equal(runs, 1)
   assert.equal(sends, 2)
   assert.equal(store.db.prepare('SELECT state FROM jobs').get().state, 'review')
+})
+
+test('only directed, opted-in User Bot group and topic text reaches its original route', async t => {
+  const dir = database()
+  const store = new Store(dir, 'test-bot')
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }) })
+  const accepted = { ...config, groups: new Set(['group']), threads: new Set(['group____topic']) }
+  const channel = (id, type, channelId, sender = 'alice', mention = { uids: ['bot'] }, space = 'space') => ({
+    event_id: String(id), message: {
+      message_id: String(id), channel_id: channelId, channel_type: type, from_uid: sender,
+      payload: { type: 1, content: 'hello', space_id: space, mention },
+    },
+  })
+  const source = [
+    channel(1, 2, 'group'), channel(2, 5, 'group____topic'), channel(3, 1, 'wire-dm-id'),
+    channel(4, 5, 'group____other'), channel(5, 2, 'group', 'alice', {}),
+    channel(6, 2, 'group', 'alice', { uids: ['bot'], ais: 1 }),
+    channel(7, 2, 'group', 'alice', { uids: ['bot'] }, 'other-space'),
+    channel(8, 2, 'group', 'mallory'),
+  ]
+  const sends = [], sessions = []
+  const api = {
+    async events() { return source }, async ack() {},
+    async send(address, _text, _signal, type) { sends.push([type, address]); return String(sends.length) },
+  }
+  const host = { async run(session, _text, created) { sessions.push(session.session_id); created(); return 'answer' } }
+  const worker = new Worker({ api, store, host, config: accepted, log() {} })
+  await worker.ingest(signal)
+  for (let i = 0; i < 3; i++) await worker.process(next(store), signal)
+  assert.equal(next(store), undefined)
+  assert.deepEqual(sends, [[2, 'group'], [5, 'group____topic'], [1, 'alice']])
+  assert.equal(new Set(sessions).size, 3)
+  source.splice(0, source.length, channel(9, 2, 'group'), channel(10, 5, 'group____topic'))
+  await worker.ingest(signal)
+  await worker.process(next(store), signal)
+  assert.equal(sessions[3], sessions[0])
+  accepted.threads.clear()
+  await worker.process(next(store), signal)
+  assert.equal(store.db.prepare('SELECT issue FROM jobs WHERE message_id=?').get('10').issue, 'route_not_allowed')
+  assert.equal(sends.length, 4)
+})
+
+test('existing v0.1 jobs retain their DM address and session after upgrade', async t => {
+  const dir = database()
+  const old = new DatabaseSync(join(dir, 'channel.sqlite'))
+  old.exec(`
+    CREATE TABLE jobs (
+      seq INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, event_id TEXT NOT NULL,
+      sender TEXT NOT NULL, input TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
+      reply TEXT, result_id TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL DEFAULT 0, issue TEXT
+    );
+    CREATE TABLE conversations (sender TEXT PRIMARY KEY, session_id TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO jobs (message_id,event_id,sender,input) VALUES ('1','2','alice','old input');
+    INSERT INTO conversations VALUES ('alice','session-old',1);
+  `)
+  old.close()
+  const store = new Store(dir, 'test-bot')
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }) })
+  const api = { async send(address, text, _signal, type) {
+    assert.deepEqual([address, text, type], ['alice', 'reply', 1]); return '3'
+  } }
+  const host = { async run(session, text) {
+    assert.equal(session.session_id, 'session-old'); assert.equal(session.created, 1); assert.equal(text, 'old input'); return 'reply'
+  } }
+  await new Worker({ api, store, host, config, log() {} }).process(next(store), signal)
+  assert.equal(store.db.prepare('SELECT state FROM jobs').get().state, 'sent')
 })
