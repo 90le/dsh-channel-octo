@@ -1,6 +1,8 @@
 import { validUid } from './config.js'
+import { createHash, randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
-import { apiErrorCode } from './api-errors.js'
+import { apiErrorCode, officialApiErrorCode } from './api-errors.js'
+import { authorizedSearchEndpoints, authorizedSearchSpecs, projectAuthorizedSearch, boundAuthorizedSearchResult } from './authorized-search.js'
 import { normalizeOctoContent } from './octo-content.js'
 import { displayCardParameters, normalizeDisplayCard, renderDisplayCard,
   assertEditableDisplayCard, normalizeRichtextBlocks } from './display-card.js'
@@ -101,6 +103,7 @@ const displayWork = fn => {
 
 /** Ordinary JSON schemas; callers should mount only available operations. */
 export const CHANNEL_API_OPERATIONS = freeze([
+  ...authorizedSearchSpecs({ spec, schema, uid, searchPage, searchKeyword, searchFilters }),
   spec('inspect', 'Inspect the current channel and its parent group permissions.'),
   spec('groups.list', 'Return only the current parent group, never other groups.'),
   spec('members', 'List current parent-group members with authoritative numeric roles.', schema({ limit })),
@@ -193,6 +196,11 @@ export const CHANNEL_API_OPERATIONS = freeze([
 ])
 const specs = new Map(CHANNEL_API_OPERATIONS.map(value => [value.name, value]))
 const errorHints = Object.freeze({
+  private_search_required: '跨频道检索仅在发起人自己的私聊中提供，结果不会回发到共享群聊。',
+  delegated_search_unavailable: '未能确认服务器支持按用户授权检索；没有退回 Bot 身份读取。请检查 Octo 版本及授权检索配置。',
+  delegated_search_denied: 'Octo 未允许本用户的委托检索。请检查自己对该 Bot 已有的读取授权、频道范围及当前访问权限；插件不会自动创建授权。',
+  delegated_target_not_allowed: '请选择当前账号配置空间内、Bot 已加入且渠道规则允许的群或子区。',
+  search_continuation_invalid: '此续页标识已过期，或不属于当前账号、用户及完全相同的查询。请重新搜索；不会借用其他用户的游标。',
   api_permission_denied: 'Octo denied this bot credential. Check current membership/status and the group-specific bot_admin grant for rule/group-info edits or member removal.',
   api_authentication_failed: 'Reconnect with a valid bot credential.',
   api_invalid_request: 'Octo rejected the request. Check arguments and the server API version.',
@@ -319,7 +327,8 @@ function validate(value, def) {
       || (def.minLength && !value.trim()) || (def.pattern && !new RegExp(def.pattern).test(value))
       || (def.enum && !def.enum.includes(value))) fail('invalid_arguments')
   } else if (def.type === 'integer') {
-    if (!Number.isSafeInteger(value) || value < def.minimum || value > def.maximum) fail('invalid_arguments')
+    if (!Number.isSafeInteger(value) || value < def.minimum || value > def.maximum
+      || def.enum && !def.enum.includes(value)) fail('invalid_arguments')
   } else if (def.type === 'boolean') {
     if (typeof value !== 'boolean') fail('invalid_arguments')
   } else if (def.type === 'array') {
@@ -412,12 +421,15 @@ function memberRows(raw) {
 
 /** route and sender MUST come from the admitted event, never model arguments.
  * members() is trusted metadata plumbing; it cannot authorize a requester.
- * No cached membership, retries, pagination loops, OBO, or user-token fallback.
+ * No cached membership, retries, pagination loops or user-token fallback.
+ * Delegated search is a separate private-only operation with a closure-bound
+ * human principal. Current-route reads never fall back to that authority.
  */
 export class ChannelApi {
   #request
   #config
   #ownerUid
+  #searchContinuations = new Map()
   constructor({ request, config }) {
     if (typeof request !== 'function' || !validUid(config?.botUid) || !validUid(config?.spaceId)) fail('invalid_channel_api_config')
     this.#request = request
@@ -868,6 +880,71 @@ export class ChannelApi {
       : { messages: entries.map(entry => entry.value), more: raw.pagination.has_more, next_cursor: raw.pagination.next_cursor }
   }
 
+  async #authorizedSearch(scope, sender, operation, args, signal) {
+    if (scope.group || scope.route.channel_id !== sender) fail('private_search_required')
+    if (await this.#principal(sender, signal) !== 'human' || await this.#principal(this.#config.botUid, signal) !== 'user_bot') fail('delegated_search_denied')
+    const scopes = args.targets.map(target => {
+      const selected = this.#scope(target)
+      if (!selected.group || !/^[a-fA-F0-9]{32}$/.test(selected.group)) fail('delegated_target_not_allowed')
+      return selected
+    })
+    const groups = list(await this.#call('/v1/bot/groups?' + new URLSearchParams({ space_id: this.#config.spaceId }), undefined, signal), 1000)
+    if (scopes.some(selected => {
+      const matches = groups.filter(row => row?.group_no === selected.group)
+      return matches.length !== 1 || matches[0].space_id !== this.#config.spaceId
+    })) fail('delegated_target_not_allowed')
+    const body = { ...(args.keyword !== undefined && { keyword: webhookName(args.keyword) }),
+      filters: { ...args.filters, channel_ids: args.targets, channel_types: [...new Set(args.targets.map(row => row.channel_type))] },
+      ...(operation !== 'messages.search_authorized_groups' && { page_size: args.limit ?? 10,
+        sort: args.sort ?? 'time_desc' }) }
+    // Cursor signatures on this API do not bind the identity, query or targets.
+    // Keep raw wire cursors private and expose only account-instance-scoped,
+    // short-lived handles. Reconfiguration constructs a fresh ChannelApi.
+    const canonical = value => Array.isArray(value) ? value.map(canonical).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+      : object(value) ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value
+    const query = createHash('sha256').update(JSON.stringify(canonical({ sender, route: scope.route, operation, body }))).digest('hex')
+    for (const [handle, record] of this.#searchContinuations) if (record.expires <= Date.now()) this.#searchContinuations.delete(handle)
+    if (args.continuation) {
+      const record = this.#searchContinuations.get(args.continuation)
+      if (!record || record.query !== query) fail('search_continuation_invalid')
+      body.cursor = record.cursor
+    }
+    const path = authorizedSearchEndpoints[operation]
+    // A legacy server may silently ignore an unknown on_behalf_of field. First
+    // require its exact, branded self-delegation rejection. The deliberately
+    // invalid keyword prevents a field-ignoring old handler from searching any
+    // content. This is a compatibility guard, not a proof of all server nodes'
+    // version or index visibility; no successful probe content is ever returned.
+    let recognized = false
+    try {
+      await this.#request(path, JSON.stringify({ keyword: 'x'.repeat(65), on_behalf_of: this.#config.botUid }), signal, { method: 'POST' })
+    } catch (error) {
+      recognized = error?.status === 403 && officialApiErrorCode(error) === 'err.server.bot_api.obo_not_authorized'
+    }
+    if (signal.aborted) fail('aborted')
+    if (!recognized) fail('delegated_search_unavailable')
+    let raw
+    try { raw = await this.#call(path, { ...body, on_behalf_of: sender }, signal) }
+    catch (error) {
+      if (error.code === 'api_permission_denied') fail('delegated_search_denied')
+      throw error
+    }
+    // Return only the OBO projection. An as-bot message lookup here could reveal
+    // text/files hidden by the human's self-delete or cleared-history state.
+    let result
+    try { result = projectAuthorizedSearch(operation, raw, args) }
+    catch { fail('invalid_authorized_search_response') }
+    const cursor = result.next_cursor
+    delete result.next_cursor
+    if (result.more && cursor) {
+      while (this.#searchContinuations.size >= 64) this.#searchContinuations.delete(this.#searchContinuations.keys().next().value)
+      const handle = 'ocs_' + randomUUID().replaceAll('-', '')
+      this.#searchContinuations.set(handle, { query, cursor, expires: Date.now() + 5 * 60_000 })
+      result.continuation = handle
+    }
+    return boundAuthorizedSearchResult(result)
+  }
+
   async dispatch(route, sender, operation, args = {}, signal = new AbortController().signal) {
     const definition = specs.get(operation)
     if (!definition) fail('unknown_operation')
@@ -875,7 +952,8 @@ export class ChannelApi {
     const identityRead = identityReads.has(operation)
     const scopedRead = identityRead || webhookReads.has(operation)
     const clearRevisions = operation === 'messages.clear_card_revisions'
-    if (scopedRead || webhookWrites.has(operation) || clearRevisions) args = readArguments(args, definition.parameters)
+    const delegatedSearch = Object.hasOwn(authorizedSearchEndpoints, operation)
+    if (scopedRead || webhookWrites.has(operation) || clearRevisions || delegatedSearch) args = readArguments(args, definition.parameters)
     if (operation === 'webhooks.test' && args.confirm_send !== true
       || clearRevisions && args.confirm_clear !== true) fail('explicit_confirmation_required')
     if (operation === 'webhooks.update') {
@@ -908,20 +986,28 @@ export class ChannelApi {
     // Copy admitted inputs before the first await; do not retain mutable model args.
     args = JSON.parse(JSON.stringify(args))
     const search = Object.hasOwn(searchEndpoints, operation)
-    if (search) validateSearch(operation, args)
+    if (search || delegatedSearch) validateSearch(operation, args)
+    if (delegatedSearch) {
+      if (new Set(args.targets.map(row => row.channel_type + ':' + row.channel_id)).size !== args.targets.length
+        || args.targets.some(row => !ruleScope(row.channel_type, row.channel_id))
+        || args.filters?.file_size_max > 0 && (args.filters.file_size_min ?? 0) > args.filters.file_size_max) fail('invalid_arguments')
+    }
     if (['rules.edit', 'thread.rules.edit'].includes(operation) && Buffer.byteLength(args.content, 'utf8') > 10240) fail('invalid_arguments')
     if (operation === 'group.edit' && !Object.keys(args).length) fail('invalid_arguments')
     const scope = this.#scope(route)
+    if (definition.privateOnly && scope.route.channel_type !== 1) fail('private_search_required')
     if (!definition.available) fail(definition.unavailableReason)
     const voice = operation.startsWith('voice.context.')
     if (voice) this.#requireOwnerDM(scope, sender)
     if (operation === 'groups.create') this.#requireOwner(sender)
     if (clearRevisions) this.#requireOwner(sender)
-    if (!scope.group && !voice && !search && !structuredEdit && !identityRead && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
+    if (!scope.group && !voice && !search && !delegatedSearch && !structuredEdit && !identityRead && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
       'messages.mark_read', 'messages.clear_card_revisions', 'space.members.search', 'groups.create'].includes(operation)) fail('group_required')
     const thread = operation.startsWith('thread.') ? this.#threadPath(scope, args) : undefined
-    const access = await this.#access(scope, sender, definition.mutating, signal, scopedRead)
+    const access = await this.#access(scope, sender, definition.mutating, signal, scopedRead || delegatedSearch)
     const requireAdmin = () => { if (scope.group && !admin(access.actor)) fail('requester_admin_required') }
+
+    if (delegatedSearch) return this.#authorizedSearch(scope, sender, operation, args, signal)
 
     if (identityRead) return this.#identities(scope, sender, operation, args, access, signal)
     if (webhookReads.has(operation)) return this.#webhooks(scope, sender, operation, args, access, signal)

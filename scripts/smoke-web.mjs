@@ -22,6 +22,8 @@ const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
 const ownerSmoke = process.env.DSH_OCTO_SMOKE_OWNER === '1'
 const groupToolsSmoke = process.env.DSH_OCTO_SMOKE_GROUP_TOOLS === '1'
+const delegatedSmoke = process.env.DSH_OCTO_SMOKE_DELEGATED_SEARCH === '1'
+if (delegatedSmoke && !ownerSmoke) throw new Error('Delegated search smoke requires owner fixture mode')
 if (groupToolsSmoke && !ownerSmoke) throw new Error('Group tools smoke requires owner mode')
 const deleteSmoke = process.env.DSH_OCTO_SMOKE_DELETE === '1'
 const includeImConnect = !ownerSmoke && process.env.DSH_OCTO_SMOKE_CORE_ONLY !== '1'
@@ -43,6 +45,7 @@ Object.assign(env, {
   DSH_TELEMETRY_DISABLED: '1',
   DSH_OCTO_FIXTURE_OWNER: ownerSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_GROUP_TOOLS: groupToolsSmoke ? '1' : '0',
+  DSH_OCTO_FIXTURE_DELEGATED_SEARCH: delegatedSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_DELETE: deleteSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_STATE: state,
   DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
@@ -474,6 +477,11 @@ export function apply(ctx) {
     || [501, 502, 503].some(id => !output.includes('FIXTURE_ANSWER_FEEDBACK=' + id)))) throw new Error('Native write/present/delivery failed: '
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   if (!output.includes('FIXTURE_RICH_IMAGE_DOWNLOADED') || output.includes('FIXTURE_SYNC_SCOPE_WRONG')) throw new Error('Missing scoped rich media/history')
+  if (delegatedSmoke) {
+    if ([1, 2, 3, 4].some(step => !output.includes('FIXTURE_DELEGATED_TOOL_OK=' + step))
+      || output.includes('FIXTURE_DELEGATED_SCOPE_MISMATCH')) throw new Error('Delegated search native roundtrip failed')
+    console.log('PASS: native private delegated message/file/group searches and bound continuation, without raw cursors or attachments.')
+  }
   if (ownerSmoke) {
     if (groupToolsSmoke && (readFileSync(join(home, 'group-tool-fixture.txt'), 'utf8') !== 'group native tools executed'
       || ['FIXTURE_GROUP_QUESTION_SENT', 'FIXTURE_GROUP_INVALID_CALLBACKS_IGNORED', 'FIXTURE_GROUP_QUESTION_ANSWERED',

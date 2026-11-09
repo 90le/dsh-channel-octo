@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.11.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.12.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -61,7 +61,7 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
 
-## 0.11.0
+## 0.12.0
 
 账号管理参照 IM Connect 1.0.30。两个插件可共存，各自保留账号、会话与凭据。默认的文字模式可复用已经在 DSH Web 打开的空闲 Octo 会话。同回合混入其他来源的输入时不会向 Octo 转发。
 
@@ -78,7 +78,8 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 - **命令菜单**：账号设置中可明确发布 `/help /status /new /card /choose` 或清空菜单。操作会替换此 Bot 的整个菜单，页面先显示确认；启动、保存普通设置和移除账号均不自动改 Octo 菜单。
 - **文件与说明**：启用账号的文件选项后，已通过准入的私聊、群聊和子区可以接收文件、图片、GIF、语音和视频附件。图片是否可识别取决于所选模型。当前语音附件可通过 `octo_voice_transcribe` 调用 Octo 转写服务，服务未开放或超限会返回明确错误；不接受任意本地路径、其他消息或外部音频网址。发送须符合工具范围和权限，仅交付本轮通过 DSH 正式声明的工作区文件。文件独立发送，完整最终正文另发；带 Markdown 的图片说明也保留为文字消息。默认每个文件上限 16 MiB，语音服务可有更低限制；部署需配置确切的 `mediaDownloadOrigins`、`mediaUploadOrigins` HTTPS 来源。投递无法确认时不自动重发。
 - **群聊前文、成员与引用**：触发后补充当前群或子区的近期可读消息及真实成员名称；不把群历史放进私聊。明确要求提及时，最终正文中的 `@[uid:姓名]` 核对当前成员后转为原生 @；代码和引用中的例子不触发通知。私聊普通回复不附加空引用，群回复仅在有消息序号、作者和摘要时附加完整引用。长正文按 Markdown 块分段，保留代码、链接和表格。详见[消息兼容矩阵](OCTO-COVERAGE.md)。
-- **Octo 频道工具**：可查询当前群成员、近期消息与搜索结果，读取或更新规则，管理子区、发送当前频道通知及编辑 Bot 自己的文字。管理动作每次核对请求者与 Bot 的实时权限。受限会话只挂载 Octo 工具，获准的会话保留 DSH 工具。私聊提供本会话的消息查询、搜索和编辑，不借私聊读取其他人的群消息。完整清单及官方接口缺口见能力矩阵。
+- **Octo 频道工具**：可查询当前群成员、近期消息与搜索结果，读取或更新规则，管理子区、发送当前频道通知及编辑 Bot 自己的文字。管理动作每次核对请求者与 Bot 的实时权限。受限会话只挂载 Octo 工具，获准的会话保留 DSH 工具。普通私聊查询仅限本会话；另有下面三种独立授权检索，完整清单及官方接口缺口见能力矩阵。
+- **授权跨频道检索**：获准使用 DSH 工具的用户可在私聊请求检索明确指定的 1–5 个群/子区的消息、文件或群摘要。需要 Octo 已有的旧式全局 OBO 授权；仅与 Bot 好友、同群或拥有 DSH 权限均不足以授权跨频道读取。当前官方授权创建入口通常限 Bot 创建者，新式策略授权不能代替此搜索授权。返回授权接口给出的有限摘要与文件元数据，不额外取全文、下载链接或附件。续页标识绑定账号、发起人、查询和目标，5 分钟过期，重配后失效；不提供无目标的全局发现。
 - **编辑已发内容**：可修改当前会话中 Bot 自己发送的文字、图文消息和普通展示卡；不能用编辑工具改写进度卡、提问卡或带回调的卡片。读取原消息与实际编辑内容后重新核验身份和权限，写入未确认时不自动重试。
 - **卡片与安全命令**：在账号的私聊或群聊命令选项开启后，授权操作者可使用 `/help`、`/status`、`/new`、`/card` 和 `/choose`。群聊和子区还要求 Bot 所有者直接 @ Bot。卡片按钮只接受原账号、原会话与指定用户的有效回调。授权用户可直接要求展示卡片；不支持的卡片退回文字。长正文会分段发送。
 - **权限审批**：本轮 DSH 工具发起的审批可在 Octo 中回答。展示已提交的真实工具参数，仅批准一次；拒绝、取消、超时、信息缺失或未完整展示均不执行。审批绑定原发起人、原频道和原生回合，参数含敏感内容时不在 IM 中批准；不改变宿主权限策略，不代替插件安装等其他审批流程。
@@ -99,10 +100,13 @@ npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js events
 DSH_OCTO_SMOKE_DELETE=1 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket
 DSH_OCTO_SMOKE_OWNER=1 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket
 DSH_OCTO_SMOKE_OWNER=1 DSH_OCTO_SMOKE_GROUP_TOOLS=1 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket
+DSH_OCTO_SMOKE_OWNER=1 DSH_OCTO_SMOKE_GROUP_TOOLS=1 DSH_OCTO_SMOKE_DELEGATED_SEARCH=1 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket /absolute/path/to/playwright-core/index.mjs /absolute/path/to/chrome
 ```
 
 浏览器验收默认与 IM Connect 1.0.30 共存。设置 `DSH_OCTO_SMOKE_WEBHOOK_UI=1` 加测 Webhook 独立管理窗口、确认与密钥清除，所有请求拦截到合成接口，不向正式频道发送测试。设置 `DSH_OCTO_SMOKE_CODEX_UI=2.0.19` 或 `DSH_OCTO_SMOKE_AUTOMATION` 可加测指定版本；可选的 `DSH_OCTO_SMOKE_SCREENSHOTS` 指向已存在的截图目录，截图只含测试账号和会话。
+
+0.12.0 发布前：679 项完整回归通过、无跳过；随后新增精确子区独立名单测试，授权检索接口组 30 项通过。同版本 Debian 隔离 DSH 验证三类授权检索、绑定续页及原有私聊/群聊提问、审批、文件与说明、表单、Webhook 工具和最终回复。正式三个授权检索入口仅验证自代理被拒绝，未读取真实聊天；正式人类授权和索引可见性仍待验收。
 
 0.11.0 共 628 项自动测试通过，无跳过，包含中英文管理窗口及 390px 窄屏检查。增加 Webhook 管理和当前频道操作、展示卡修订清理及明确错误反馈；修复启动时验证到的 Bot 所有者未同步给频道工具的问题。真实 DSH Web 与 IM Connect 共存的浏览器检查通过，管理窗口的桌面/窄屏截图另行目视检查；功能测试使用合成 Octo 数据，不代表正式平台写操作已经验收。
 

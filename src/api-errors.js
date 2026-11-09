@@ -68,7 +68,14 @@ export class OctoError extends Error {
 // delivery callers must continue to check OctoError.status === 429 exclusively.
 // WeakMap branding prevents arbitrary error.apiCode strings from being reflected.
 export function apiErrorCode(error) {
-  return classified.get(error) ?? statusCode(error?.status)
+  return classified.get(error)?.apiCode ?? statusCode(error?.status)
+}
+
+// For protocols that distinguish an explicit rejected delegation from a generic
+// 403. Public Error fields are editable; only the transport's branded match is
+// evidence of a recognized official error envelope.
+export function officialApiErrorCode(error) {
+  return classified.get(error)?.officialCode
 }
 
 const maxErrorBytes = 16 * 1024
@@ -145,6 +152,6 @@ export async function readApiError(response, signal) {
       error.apiCode = match.apiCode
     }
   } else cancel(response.body)
-  classified.set(error, error.apiCode)
+  classified.set(error, { apiCode: error.apiCode, officialCode: error.officialCode })
   return error
 }

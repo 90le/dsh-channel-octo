@@ -8,6 +8,8 @@ let received = 0
 let sent = 0
 const ownerSmoke = process.env.DSH_OCTO_FIXTURE_OWNER === '1'
 const groupToolsSmoke = process.env.DSH_OCTO_FIXTURE_GROUP_TOOLS === '1'
+const delegatedSmoke = process.env.DSH_OCTO_FIXTURE_DELEGATED_SEARCH === '1'
+let delegatedStep = 0
 const ownerCaption = 'fixture response 1\n\n文件：<fixture_summary.md>\n\n**摘要结构**\n\n- 第一项：文件已生成。\n- 第二项：说明随文件完整交付。\n\n可继续修改 ✅'
 const deleteSmoke = process.env.DSH_OCTO_FIXTURE_DELETE === '1'
 let ownerStep = 0, uploaded = false, questionAnswered = false
@@ -151,6 +153,32 @@ globalThis.fetch = async (input, init) => {
     }
     if (url.pathname.endsWith('/groups') && url.searchParams.get('space_id') === 'fixture-space') {
       return json([{ group_no: group, space_id: 'fixture-space' }])
+    }
+    if (delegatedSmoke && url.pathname.includes('/v1/bot/space/principals/')) {
+      const uid = url.pathname.split('/').at(-1)
+      if (!['fixture-user', 'fixture-bot'].includes(uid) || url.searchParams.get('space_id') !== 'fixture-space') return new Response(null, { status: 403 })
+      return json({ uid, principal_type: uid === 'fixture-user' ? 'human' : 'user_bot' })
+    }
+    if (delegatedSmoke && url.pathname.includes('/v1/bot/messages/_search_global_')) {
+      const body = JSON.parse(init.body)
+      if (body.on_behalf_of === 'fixture-bot' && body.keyword === 'x'.repeat(65) && Object.keys(body).length === 2) {
+        return Response.json({ status: 403, error: { code: 'err.server.bot_api.obo_not_authorized', http_status: 403 } }, { status: 403 })
+      }
+      if (received !== 2 || body.on_behalf_of !== 'fixture-user' || body.keyword !== 'fixture'
+        || JSON.stringify(body.filters.channel_ids) !== JSON.stringify([{ channel_id: group, channel_type: 2 }])) {
+        console.error('FIXTURE_DELEGATED_SCOPE_MISMATCH')
+        return new Response(null, { status: 403 })
+      }
+      const row = { message_id: '888', message_seq: 8, sender_id: 'fixture-user', sender_name: 'Fixture User',
+        channel_id: group, channel_type: 2, sent_at: '2026-11-09T01:02:03Z', message_kind: 'text', snippet: 'AUTHORIZED-SEARCH-EXCERPT' }
+      const file = { ...row, file_name: 'authorized.md', file_ext: 'md', file_size_bytes: 42, content_snippet: 'AUTHORIZED-FILE-EXCERPT', download_url: 'NEVER_RETURN_WIRE_SECRET' }
+      if (url.pathname.endsWith('_search_global_groups')) return json({ data: { sequence: 0, total_groups: 1, total_groups_approx: true,
+        groups: [{ channel_id: group, channel_type: 2, parent_group_no: group, group_name: 'Authorized group',
+          match_count: 10, match_count_approx: true, latest_at: row.sent_at, preview: [row] }] }, pagination: { has_more: false, next_cursor: '' } })
+      if (url.pathname.endsWith('_search_global_files')) return json({ data: [file], pagination: { has_more: false, next_cursor: '' } })
+      if (body.cursor !== undefined && body.cursor !== 'NEVER_RETURN_WIRE_CURSOR') return new Response(null, { status: 400 })
+      return json({ data: [{ result_type: 'message', message: { ...row, snippet: body.cursor ? 'AUTHORIZED-PAGE-TWO' : row.snippet } }],
+        pagination: { has_more: !body.cursor, next_cursor: body.cursor ? '' : 'NEVER_RETURN_WIRE_CURSOR' } })
     }
     if (url.pathname.endsWith('/groups/' + group) && init.method === 'GET') {
       return json({ group_no: group, name: 'Fixture Group', notice: '', status: 1 })
@@ -415,6 +443,35 @@ globalThis.fetch = async (input, init) => {
     const tail = JSON.stringify(body.messages.at(-1))
     const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
     const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-6])/g)).at(-1)?.[1] ?? 0)
+    if (delegatedSmoke && round === 2) {
+      const names = (body.tools ?? []).map(tool => tool.name)
+      const operations = ['octo_messages_search_authorized', 'octo_messages_search_authorized', 'octo_messages_search_authorized_files', 'octo_messages_search_authorized_groups']
+      if (operations.some(name => !names.includes(name)) || history.includes('NEVER_RETURN_WIRE_')) return new Response(null, { status: 400 })
+      let prior
+      if (delegatedStep) {
+        const result = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+          .find(part => part.type === 'tool_result' && part.tool_use_id === 'toolu_delegated_' + (delegatedStep - 1))
+        const text = typeof result?.content === 'string' ? result.content : (result?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
+        try { prior = JSON.parse(text) } catch {}
+        const expected = ['AUTHORIZED-SEARCH-EXCERPT', 'AUTHORIZED-PAGE-TWO', 'AUTHORIZED-FILE-EXCERPT', 'Authorized group'][delegatedStep - 1]
+        if (!prior || result.is_error || !text.includes(expected) || delegatedStep === 1 && !/^ocs_[a-f0-9]{32}$/.test(prior.continuation)
+          || delegatedStep === 4 && ('match_count' in prior.groups[0] || 'total_groups' in prior)) return new Response(null, { status: 400 })
+        console.log('FIXTURE_DELEGATED_TOOL_OK=' + delegatedStep)
+      }
+      if (delegatedStep < operations.length) {
+        const step = delegatedStep++, name = operations[step]
+        const args = { targets: [{ channel_id: group, channel_type: 2 }], keyword: 'fixture',
+          ...(step === 1 && { continuation: prior.continuation }), ...(step === 2 && { filters: { file_exts: ['md'] } }) }
+        const frames = [
+          { type: 'message_start', message: { id: 'delegated-' + step, model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_delegated_' + step, name, input: {} } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(args) } },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } }, { type: 'message_stop' },
+        ]
+        return new Response(frames.map(frame => 'event: ' + frame.type + '\ndata: ' + JSON.stringify(frame) + '\n\n').join(''), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+    }
     if (ownerSmoke && round === 3) {
       const names = (body.tools ?? []).map(tool => tool.name)
       if (!names.includes('octo_members') || (groupToolsSmoke

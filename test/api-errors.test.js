@@ -5,11 +5,23 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OctoClient, OctoError } from '../src/octo.js'
-import { apiErrorCode, readApiError, OctoError as ApiOctoError } from '../src/api-errors.js'
+import { apiErrorCode, officialApiErrorCode, readApiError, OctoError as ApiOctoError } from '../src/api-errors.js'
 import { Store } from '../src/store.js'
 import { Worker } from '../src/worker.js'
 
 const signal = new AbortController().signal
+
+test('exact official error evidence is immutable and cannot be forged by public error fields', async () => {
+  const code = 'err.server.bot_api.obo_not_authorized'
+  const error = await readApiError(Response.json({ status: 403, error: { code, http_status: 403 } }, { status: 403 }), signal)
+  assert.equal(officialApiErrorCode(error), code)
+  error.officialCode = 'err.shared.auth.forbidden'
+  error.apiCode = 'api_invalid_request'
+  assert.equal(officialApiErrorCode(error), code)
+  assert.equal(apiErrorCode(error), 'api_permission_denied')
+  assert.equal(officialApiErrorCode(Object.assign(new OctoError('http_403', 403), { officialCode: code })), undefined)
+  assert.equal(officialApiErrorCode({ status: 403, officialCode: code }), undefined)
+})
 const secret = 'bf_TEST_SECRET_NEVER_REFLECT'
 const secretURL = 'https://private.invalid/webhook/' + secret
 const route = { channel_id: 'alice', channel_type: 1 }

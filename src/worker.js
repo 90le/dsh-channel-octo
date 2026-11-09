@@ -282,6 +282,7 @@ export class Worker {
 
   async process(job, signal) {
     const sourceConfig = this.config
+    const sourceChannel = this.api.channel
     const config = { ...sourceConfig }
     const host = this.host
     const channelType = job.channel_type
@@ -406,6 +407,7 @@ export class Worker {
             { attachments, order: inputOrder, authorCard, channelContext, taskContext: true, onTrace: trace => progress.trace(trace),
               ...((channelType !== 1 || toolsAllowed) && config.toolPermission !== 'text-only' && this.api.channel && { channelTools: {
                 specs: [...operationSpecs.filter(spec => spec.available && (config.toolPermission !== 'read-only' || !spec.mutating)
+                  && (!spec.privateOnly || channelType === 1)
                   && (channelType !== 1 ? !spec.name.startsWith('voice.context.')
                     : spec.name === 'inspect' || spec.name.startsWith('messages.')
                       || job.sender === config.ownerUid && (spec.name.startsWith('voice.context.')
@@ -432,8 +434,27 @@ export class Worker {
                     return receipt
                   })()
                   const operation = operationSpecs.find(spec => 'octo_' + spec.name.replaceAll('.', '_') === name)
-                  if (!operation?.available || config.toolPermission === 'read-only' && operation.mutating) throw new Error('octo_operation_unavailable')
-                  return this.api.channel.dispatch(route, job.sender, operation.name, args, toolSignal)
+                  if (!operation?.available || config.toolPermission === 'read-only' && operation.mutating
+                    || operation.privateOnly && channelType !== 1) throw new Error('octo_operation_unavailable')
+                  return (async () => {
+                    const allowed = () => this.config === sourceConfig && this.api.channel === sourceChannel
+                      && this.config.toolPermission !== 'text-only'
+                      && (this.config.toolPermission !== 'read-only' || !operation.mutating)
+                      && (!operation.privateOnly || this.liveToolAllowed(job, sourceConfig))
+                      && permitsRoute(this.config, job.sender, channelType, recipient)
+                    const check = async () => {
+                      toolSignal?.throwIfAborted()
+                      if (!allowed() || !await this.api.allowsMessage(sourceConfig, job, toolSignal) || !allowed()) {
+                        throw new Error('octo_access_denied')
+                      }
+                    }
+                    await check()
+                    const result = await sourceChannel.dispatch(route, job.sender, operation.name, args, toolSignal)
+                    // Do not leak in-flight reads from an account configuration
+                    // that changed while the server was answering the request.
+                    await check()
+                    return result
+                  })()
                 }, guidance: mentionGuidance,
               } }),
               ...(toolsAllowed && { approval: { runId: String(job.seq), requester: job.sender },

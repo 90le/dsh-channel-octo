@@ -61,6 +61,7 @@ test('group scope enables native tools only after admission and separates restri
   assert.deepEqual(runs.map(r => r.toolsAllowed), [true, false])
   assert.notEqual(runs[0].session, runs[1].session)
   assert.ok(runs.every(r => r.extras.channelTools.specs.some(s => s.name === 'octo_members')))
+  assert.ok(runs.every(r => !r.extras.channelTools.specs.some(s => s.name.startsWith('octo_messages_search_authorized'))))
   assert.equal(sent.length, 2)
   assert.equal(sent[0][1], '请 @小明 查看。')
   assert.equal(sent[0][4].from_name, '小明')
@@ -87,6 +88,7 @@ test('read-only channels expose no Octo mutations and DM tools remain in the ori
         assert.throws(() => extras.channelTools.execute('octo_messages_notify', { text: 'test' }, signal), /unavailable/)
       } else {
         assert.ok(!names.includes('octo_members'))
+        assert.ok(names.includes('octo_messages_search_authorized'))
         assert.ok(names.includes('octo_voice_context_read'))
         assert.ok(names.includes('octo_groups_create'))
         await extras.channelTools.execute('octo_messages_recent', {}, signal)
@@ -103,4 +105,38 @@ test('read-only channels expose no Octo mutations and DM tools remain in the ori
   assert.equal(calls.length, 1)
   assert.deepEqual(calls[0][0], { channel_type: 1, channel_id: 'alice' })
   assert.equal(calls[0][1], 'alice')
+})
+
+test('in-flight channel results are withheld after configuration, API, or admission changes', async t => {
+  for (const change of ['configuration', 'channel instance', 'live admission']) await t.test(change, async t => {
+    const cwd = mkdtempSync(join(tmpdir(), 'octo-search-reconfigure-'))
+    const store = new Store(cwd, 'fixture')
+    t.after(() => { store.close(); rmSync(cwd, { recursive: true, force: true }) })
+    const config = { cwd, ownerUid: 'alice', botUid: 'bot', spaceId: 'space', toolScope: 'owner',
+      senderPolicy: 'octo', channelPolicy: 'joined', allowed: new Set(), toolPermission: 'read-only' }
+    let release, entered, allow = true, reached = false
+    const response = new Promise(resolve => { release = resolve })
+    const searching = new Promise(resolve => { entered = resolve })
+    const api = { async allowsMessage() { return allow }, async send() { return '900' },
+      channel: { async dispatch() { entered(); return response } } }
+    const worker = new Worker({ config, api, store, log() {}, host: {
+      async run(session, input, created, signal, rules, stage, timeout, toolsAllowed, extras) {
+        await created()
+        const result = extras.channelTools.execute('octo_messages_search_authorized', { targets: [] }, signal)
+        const denied = assert.rejects(result, /octo_access_denied/)
+        await searching
+        if (change === 'configuration') worker.reconfigure({ ...config, toolPermission: 'text-only', allowed: new Set() }, {})
+        else if (change === 'channel instance') api.channel = { async dispatch() { throw Error('must not call replacement') } }
+        else allow = false
+        release({ entries: [{ excerpt: 'MUST_NOT_RETURN' }], continuation: 'ocs_' + 'a'.repeat(32) })
+        await denied
+        await assert.rejects(extras.channelTools.execute('octo_messages_search_authorized', {}, signal), /octo_access_denied/)
+        reached = true
+        return 'done'
+      },
+    } })
+    store.add('1', { messageId: '1', sender: 'alice', channelId: 'alice', channelType: 1, text: 'search' })
+    await worker.process(store.next(Date.now()), new AbortController().signal)
+    assert.equal(reached, true)
+  })
 })
