@@ -53,7 +53,9 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(first.accounts[0].idleMinutes, 15)
     await assert.rejects(save(null, { token: 'bf_first_fixture' }), /duplicate_bot/)
     await assert.rejects(save(firstId, { token: 'bf_other_fixture' }), /bot_identity_mismatch/)
-    await save(firstId, { label: 'Renamed', token: 'bf_rotated_fixture' })
+    config.hostPermissions = ['workspace-write']
+    await save(firstId, { label: 'Renamed', token: 'bf_rotated_fixture', permission: 'workspace-write' })
+    assert.equal(accounts.overview().accounts.find(row => row.id === firstId).senderPolicy, 'octo')
     const secondId = (await save(null, { label: 'Second', token: 'bf_other_fixture' })).accountId
     assert.notEqual(firstId, secondId)
     assert.equal(secrets.size, 2)
@@ -65,7 +67,10 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     await accounts.dispose()
     accounts = make()
     await accounts.initialize()
-    assert.equal(accounts.overview().accounts.find(row => row.id === firstId).label, 'Renamed')
+    const restored = accounts.overview().accounts.find(row => row.id === firstId)
+    assert.equal(restored.label, 'Renamed')
+    assert.equal(restored.permission, 'workspace-write')
+    assert.equal(restored.senderPolicy, 'octo')
     assert.deepEqual(await accounts.diagnose(firstId), { botUid: 'bot-fixture', spaceId: 'fixture-space' })
     await accounts.remove(secondId, { revision: accounts.overview().accountRevision })
     assert.equal(accounts.overview().accounts.length, 1)
@@ -100,6 +105,13 @@ test('idle rotation retains the previous native session in channel history', () 
     const second = store.session('fixture-user', 15, 961_000)
     assert.notEqual(second.session_id, first.session_id)
     store.sessionCreated('fixture-user')
+    store.add('1', { messageId: '1', sender: 'fixture-user', text: 'first' })
+    store.running(1, first.session_id)
+    store.sent(1, '10')
+    store.add('2', { messageId: '2', sender: 'fixture-user', text: 'second' })
+    store.running(2, second.session_id)
+    assert.deepEqual(store.overview().conversations.map(row => [row.id, row.state]),
+      [[second.session_id, 'running'], [first.session_id, 'sent']])
     assert.deepEqual(store.overview().conversations.map(row => [row.id, row.historical]),
       [[second.session_id, 0], [first.session_id, 1]])
   } finally {

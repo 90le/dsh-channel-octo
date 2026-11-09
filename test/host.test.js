@@ -77,7 +77,7 @@ test('account model, reasoning and preset are applied, and group turns remain to
   assert.deepEqual(optionsSeen[0], { provider: 'chosen-provider', model: 'chosen-model', reasoningEffort: 'high' })
   assert.ok(calls.some(call => call[0] === 'mount' && call[1] === 'standard'))
   assert.ok(calls.some(call => call[0] === 'permission' && call[1] === 'workspace-write'))
-  assert.ok(!calls.some(call => call[0] === 'guard'))
+  assert.ok(!calls.some(call => call[0] === 'restrict'))
   calls.length = 0
   await run(false)
   assert.ok(calls.some(call => call[0] === 'guard'))
@@ -167,4 +167,30 @@ test('steering joins only the claimed Octo-owned turn and replaces the earlier a
   events.emit('session/event', agent.session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
   assert.equal(await response, 'new answer')
   assert.equal(offer, undefined)
+})
+
+test('a completed marker never forwards the last tool preamble without a final assistant answer', async () => {
+  const { ctx, events, agentId } = fakeHost()
+  const agent = {
+    id: agentId, session: { id: agentId },
+    followup(message) {
+      events.emit('agent/inbox/claimed', { agent, message, turn: 3 })
+      const event = (type, data = {}) => events.emit('session/event', agent.session, { type, data: { turn: 3, ...data } })
+      event('assistant/message', { message: { content: [
+        { type: 'text', text: 'I will write the file.' }, { type: 'tool-call', id: 'call-1' },
+      ] } })
+      event('tool/call', { callId: 'call-1', name: 'write' })
+      event('tool/result', { message: { toolCallId: 'call-1', isError: true } })
+      event('step/start')
+      event('assistant/message', { message: { content: [{ type: 'reasoning' }] } })
+      event('turn/end', { reason: { kind: 'completed' } })
+    },
+  }
+  ctx.agents.create = async ({ setup }) => {
+    await setup({ get: () => ({ restrict() {}, guard() {} }) }, agent)
+    return { agent, async dispose() {} }
+  }
+  await assert.rejects(new DshHost(ctx, '/fixture', 1000).run(
+    { session_id: agentId, created: 0 }, 'file', () => {}, new AbortController().signal,
+  ), /no_confirmed_final_text/)
 })

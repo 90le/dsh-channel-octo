@@ -5,6 +5,8 @@ import { setTimeout as delay } from 'node:timers/promises'
 let received = 0
 let sent = 0
 let openedCard = false
+const ownerSmoke = process.env.DSH_OCTO_FIXTURE_OWNER === '1'
+let ownerStep = 0, uploaded = false
 const browserReady = process.env.DSH_OCTO_BROWSER_READY
 const group = '00112233445566778899aabbccddeeff'
 const thread = '123456789012345678'
@@ -19,7 +21,7 @@ function nextMessage() {
   return {
     messageId: String(received), sender: 'fixture-user', channelType: type, channelId: address,
     payload: {
-      type: 1, content: 'fixture prompt ' + received,
+      type: 1, content: 'fixture prompt ' + received + (ownerSmoke && received === 1 ? ' send a file' : ''),
       ...(!peer || received === 3 ? { mention: { uids: ['fixture-bot'] } } : {}),
     },
   }
@@ -32,11 +34,15 @@ const realFetch = globalThis.fetch
 globalThis.fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : String(input))
   const json = value => Response.json(value)
+  if (ownerSmoke && url.hostname === 'storage-fixture.invalid') {
+    uploaded = init.method === 'PUT' && Buffer.from(init.body).toString() === 'written by native DSH'
+    return new Response(null, { status: uploaded ? 200 : 400 })
+  }
   if (url.hostname === 'octo-fixture.invalid') {
     if (url.pathname.endsWith('/verify-bot')) {
       const { bot_token: token } = JSON.parse(init.body)
       if (token === 'bf_fixture_second') return json({ bot_uid: 'fixture-bot-second', space_id: 'fixture-space' })
-      return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space' })
+      return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space', ...(ownerSmoke && { owner_uid: 'fixture-user' }) })
     }
     if (url.pathname.endsWith('/register') && peer) {
       return json({ robot_id: 'fixture-bot', im_token: 'fixture-im-secret', ws_url: peer.wsUrl })
@@ -83,8 +89,17 @@ globalThis.fetch = async (input, init) => {
       console.log('FIXTURE_CARD=' + body.state + ':' + body.card_seq)
       return json({})
     }
+    if (ownerSmoke && url.pathname.endsWith('/upload/presigned')) return json({
+      method: 'PUT', uploadUrl: 'https://storage-fixture.invalid/fixture.txt?signature=fixture',
+      downloadUrl: 'https://files-fixture.invalid/fixture.txt', contentType: 'text/plain',
+    })
     if (url.pathname.endsWith('/sendMessage')) {
       const body = JSON.parse(init.body)
+      if (ownerSmoke && body.payload.type === 8) {
+        if (!uploaded || body.channel_type !== 1 || body.channel_id !== 'fixture-user') return new Response(null, { status: 400 })
+        console.log('FIXTURE_FILE_OK')
+        return json({ message_id: 300 })
+      }
       if (body.payload.type === 17) {
         if (openedCard || received !== 1 || body.channel_type !== 1 || body.channel_id !== 'fixture-user'
           || body.payload.template_ref?.id !== 'ai.reasoning-process' || body.payload.data.state !== body.payload.state) {
@@ -121,7 +136,27 @@ globalThis.fetch = async (input, init) => {
     const history = JSON.stringify(body.messages)
     const tail = JSON.stringify(body.messages.at(-1))
     const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
-    const round = titleRequest ? 0 : Number(Array.from(tail.matchAll(/fixture prompt ([1-5])/g)).at(-1)?.[1] ?? 0)
+    const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-5])/g)).at(-1)?.[1] ?? 0)
+    if (ownerSmoke && round === 1 && ownerStep < 2) {
+      const names = (body.tools ?? []).map(tool => tool.name)
+      if (!names.includes('write') || !names.includes('present')) {
+        console.error('FIXTURE_OWNER_TOOLS_MISSING')
+        return new Response(null, { status: 400 })
+      }
+      const first = ownerStep++ === 0
+      const frames = [
+        { type: 'message_start', message: { id: 'fixture-tool', model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: first ? 'toolu_fixture_write' : 'toolu_fixture_present', name: first ? 'write' : 'present', input: {} } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(first
+          ? { file_path: 'octo-tool-fixture.txt', content: 'written by native DSH' }
+          : { files: [{ path: 'octo-tool-fixture.txt' }] }) } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } },
+        { type: 'message_stop' },
+      ]
+      return new Response(frames.map(frame => 'event: ' + frame.type + '\ndata: ' + JSON.stringify(frame) + '\n\n').join(''),
+        { headers: { 'Content-Type': 'text/event-stream' } })
+    }
     const snapshot = body.messages.filter(m => m.role === 'user').flatMap(m =>
       typeof m.content === 'string' ? [m.content] : m.content.map(c => c.text ?? ''),
     ).filter(text => text.includes('Octo 当前会话规则快照')).at(-1) ?? ''
@@ -129,7 +164,7 @@ globalThis.fetch = async (input, init) => {
       : round === 3 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && !snapshot.includes('THREAD-FIXTURE')
         : round === 4 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && snapshot.includes('THREAD-FIXTURE')
           : snapshot.includes('"status":"empty"') && !snapshot.includes('PARENT-FIXTURE') && !snapshot.includes('THREAD-FIXTURE')
-    if (round && ((body.tools ?? []).length !== 0
+    if (round && ((body.tools ?? []).length !== 0 && !(ownerSmoke && round <= 2)
       || !rulesOk || JSON.stringify(body.system ?? '').includes('PARENT-FIXTURE')
       || (round === 2 && !history.includes('fixture response 1'))
       || (round >= 3 && /fixture (prompt|response) [1-2]/.test(history))

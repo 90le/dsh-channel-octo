@@ -5,7 +5,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const { createElement: h, useEffect, useRef, useState, useSyncExternalStore } = React
-    const { Button, Input, SegmentedTabs } = primitives
+    const { Button, Input, SegmentedTabs, Menu, IconEllipsisOutlineRegular, IconPinFillRegular } = primitives
     const path = 'api/dsh-channel-octo'
     const words = {
       settings: ['Octo 渠道', 'Octo channel'], shortcut: ['Octo 频道', 'Octo conversations'],
@@ -57,6 +57,8 @@ window.__ModuleLoader__.load({
       reset: ['恢复当前设置', 'Reset to current settings'], resetDone: ['已恢复当前设置。', 'Current settings restored.'],
       saved: ['已保存，从下一条消息起生效。', 'Saved. Applies to the next message.'],
       all: ['全部', 'All'], dm: ['私聊', 'Direct'], group: ['群聊', 'Group'], topic: ['子区', 'Topic'],
+      sessionActions: ['会话操作', 'Conversation actions'], pinned: ['已置顶', 'Pinned'], openConversation: ['打开会话', 'Open conversation'],
+      copyConversationId: ['复制会话 ID', 'Copy session ID'],
       filter: ['会话类型', 'Conversation type'], search: ['搜索会话', 'Search conversations'],
       empty: ['还没有 Octo 会话', 'No Octo conversations yet'],
       emptyNote: ['机器人收到符合规则的消息后，会话会出现在这里。', 'Conversations appear here when the bot receives an eligible message.'],
@@ -68,6 +70,11 @@ window.__ModuleLoader__.load({
       session_preset_conflict: ['会话配置不一致', 'Session settings do not match'],
       agent_run_not_confirmed: ['DSH 未确认回复', 'DSH did not confirm the reply'],
       delivery_not_confirmed: ['Octo 未确认送达', 'Octo did not confirm delivery'],
+      file_not_presented: ['未交付可发送的文件', 'No file was prepared for delivery'],
+      file_tools_unavailable: ['本次私聊没有工作区工具权限', 'Workspace tools are unavailable in this DM'],
+      files_disabled: ['账号未开启附件', 'Attachments are disabled'],
+      session_requires_owned_writer: ['会话权限与账号配置不一致', 'The session permission does not match the account'],
+      file_delivery_not_confirmed: ['文件发送未确认', 'File delivery was not confirmed'],
       no_confirmed_final_text: ['没有可发送的正文', 'No reply text to send'],
       shared_turn_not_forwarded: ['本次包含其他来源的输入', 'This turn includes input from another source'],
       rulesIssue: ['群聊或子区规则读取失败', 'Could not read the group or topic rules'],
@@ -91,6 +98,10 @@ window.__ModuleLoader__.load({
   min-width:0; color:inherit; font:inherit;
 }
 .dsho-root { display:grid; grid-template-columns:minmax(0,1fr); gap:16px; max-width:720px; box-sizing:border-box; }
+.dsho-list > .dsho-session-line { display:flex; align-items:center; gap:2px; min-width:0; }
+.dsho-session-line > .dsho-row { flex:1; min-width:0; }
+.dsho-session-menu-trigger { display:grid; place-items:center; flex:none; width:30px; height:30px; padding:0; border:0; border-radius:8px; background:transparent; color:inherit; cursor:pointer; }
+.dsho-session-menu-trigger:hover,.dsho-session-menu-trigger[aria-expanded=true] { background:var(--dsho-row); }
 .dsho-root [hidden] { display:none!important; }
 .dsho-root [role="tabpanel"] { min-width:0; }
 .dsho-root h2,.dsho-root h3,.dsho-rail h3,.dsho-modal h2 { margin:0; font-weight:650; line-height:1.32; }
@@ -236,15 +247,67 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'dsho-actions dsho-alert', role: 'alert' },
           h('span', null, message), action && h(Button, { size: 'sm', variant: 'outline', onClick: action }, t('retry')))
       }
-      function ChannelList({ close, rail = false }) {
+      function ChannelRow({ row, kind, title, detail, issue, current, open, busy, t, renderSlot, pinned }) {
+        const menuState = useState(false)
+        const [menuOpen, setMenuOpen] = menuState
+        const point = useRef(null)
+        const more = useRef(null)
+        const showContext = event => {
+          event.preventDefault()
+          event.stopPropagation()
+          point.current = event.clientX || event.clientY ? new DOMRect(event.clientX, event.clientY, 0, 0) : null
+          setMenuOpen(true)
+        }
+        let nativeMenu
+        if (menuOpen && renderSlot) {
+          try {
+            nativeMenu = renderSlot('sidebar.workspaces.session.menu.item',
+              { sessionId: row.id, displayTitle: title }, { hookContext: menuState })
+          } catch { /* a different host may not expose the workspace seats here */ }
+        }
+        const items = nativeMenu ? [] : [
+          { id: 'open', label: t('openConversation') }, { id: 'id', label: t('copyConversationId') },
+        ]
+        return h('li', { className: 'dsho-session-line', onContextMenu: showContext },
+          h('button', { type: 'button', className: 'dsho-row', disabled: busy, title,
+            'aria-current': current ? 'true' : undefined,
+            'aria-label': kind + ' · ' + title + (issue ? ' · ' + issue : ''),
+            onClick: open, onKeyDown: event => {
+              if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') showContext(event)
+            } },
+          h('span', { className: 'dsho-row-icon', ...(pinned && { 'data-octo-pinned': true, title: t('pinned') }) },
+            pinned && IconPinFillRegular ? h(IconPinFillRegular) : mark()),
+          h('span', null, h('span', { className: 'dsho-title' }, title), h('span', { className: 'dsho-muted' }, detail)),
+          badge(t(row.state) || t('established'), jobTone[row.state])),
+          h(Menu, { open: menuOpen, portal: true, autoFocus: true, align: 'end',
+            getAnchorRect: () => point.current ?? more.current?.getBoundingClientRect() ?? null,
+            items, onClose: () => setMenuOpen(false), onSelect: id => {
+              setMenuOpen(false)
+              if (id === 'open') void open()
+              else if (id === 'id') void navigator.clipboard?.writeText(row.id).catch(() => {})
+            },
+            anchor: h('button', { ref: more, type: 'button', className: 'dsho-session-menu-trigger',
+              'aria-label': t('sessionActions') + ' · ' + title, 'aria-haspopup': 'menu', 'aria-expanded': menuOpen,
+              onClick: () => { point.current = null; setMenuOpen(!menuOpen) } },
+            IconEllipsisOutlineRegular ? h(IconEllipsisOutlineRegular) : '⋯') }, nativeMenu))
+      }
+
+      function ChannelList({ close, rail = false, renderSlot }) {
         const t = useT()
         const data = useSyncExternalStore(subscribe, read)
         const sessions = useSyncExternalStore(subscribeSessions, sessionSnapshot)
+        const workspaceList = ctx.get?.('workspaces')?.list ?? ctx.workspaces?.list
+        const workspaces = useSyncExternalStore(fn => workspaceList?.subscribe(fn) ?? (() => {}),
+          () => workspaceList?.getSnapshot() ?? null)
+        const archived = new Set(workspaces?.archivedSessionIds ?? [])
+        const pins = new Map((workspaces?.pinnedSessionIds ?? []).map((id, index) => [id, index]))
         const [filter, setFilter] = useState('all')
         const [query, setQuery] = useState('')
         const [opening, setOpening] = useState('')
         const [failed, setFailed] = useState(false)
-        const entries = (data.conversations ?? []).map(row => {
+        const entries = (data.conversations ?? []).filter(row => !archived.has(row.id))
+          .sort((a, b) => (pins.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (pins.get(b.id) ?? Number.MAX_SAFE_INTEGER))
+          .map(row => {
           const rawTitle = sessions.byId[row.id]?.title
           const title = typeof rawTitle === 'string' && !rawTitle.includes('\uFFFD') ? rawTitle.trim() : ''
           const kind = t(channelNames[row.type]) || t('sessions')
@@ -270,18 +333,14 @@ window.__ModuleLoader__.load({
             const issue = row.state === 'review' && issueLabel(row.issue, t)
             const detail = [kind, data.accounts?.length > 1 && row.accountLabel, row.scope && t('inherited'),
               row.historical && t('previousSession'), issue].filter(Boolean).join(' · ')
-            return h('li', { key: row.id },
-              h('button', { type: 'button', className: 'dsho-row', disabled: !!opening, title,
-                'aria-current': sessions.byId[row.id]?.retainedBy?.mainView ? 'true' : undefined,
-                'aria-label': kind + ' · ' + title + (issue ? ' · ' + issue : ''),
-                onClick: async () => {
-                  setFailed(false); setOpening(row.id)
-                  try { await openSession(row.id); close?.() } catch { setFailed(true) }
-                  finally { setOpening('') }
-                } },
-              h('span', { className: 'dsho-row-icon' }, mark()),
-              h('span', null, h('span', { className: 'dsho-title' }, title), h('span', { className: 'dsho-muted' }, detail)),
-              badge(t(row.state) || t('established'), jobTone[row.state])))
+            return h(ChannelRow, { key: row.id, row, kind, title, detail, issue, t, renderSlot,
+              current: sessions.byId[row.id]?.retainedBy?.mainView, pinned: pins.has(row.id),
+              busy: !!opening,
+              open: async () => {
+                setFailed(false); setOpening(row.id)
+                try { await openSession(row.id); close?.() } catch { setFailed(true) }
+                finally { setOpening('') }
+              } })
           })) : data.status && h(Empty, { title: t(entries.length ? 'noResults' : 'empty'),
             note: t(entries.length ? 'noResultsNote' : 'emptyNote') }))
       }
@@ -451,7 +510,7 @@ window.__ModuleLoader__.load({
           registry = next
           remove = registry?.insert?.({ id: 'octo', label: 'Octo', order: 25,
             matchSession: id => snapshot.conversations?.some(row => row.id === id) ?? false,
-            render: () => h(ChannelList, { rail: true }) })
+            render: props => h(ChannelList, { rail: true, renderSlot: props?.renderSlot }) })
           hasNativeTab = typeof remove === 'function'
           notify()
         }

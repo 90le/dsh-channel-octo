@@ -10,6 +10,15 @@ import { createCard, parseCardAction, resolveCardAction, sendCard } from './octo
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
   : config.groupCommands === 'safe' && job.sender === config.ownerUid && !job.ambient)
+// Chat admission is separate from tools. Owner identity comes only from verify-bot.
+function authorizedToolDm(config, job) {
+  return job.channel_type === 1 && (config.senderPolicy === 'allowlist'
+    ? config.allowed.has(job.sender)
+    : config.senderPolicy === 'octo' && !!config.ownerUid && job.sender === config.ownerUid)
+}
+function asksForFile(input) {
+  return /(?:发送|发给|发我|回传|传给|交付|附上).{0,14}(?:文件|附件)|(?:文件|附件).{0,14}(?:发送|发给|发我|回传|传给|交付)|\b(?:send|attach|deliver)\b.{0,24}\b(?:file|attachment)\b/iu.test(input)
+}
 const cardForm = command => command === 'card'
   ? { title: 'DSH · Octo', text: '这是 Octo 展示卡片。输入 /choose 可以试用带按钮的交互卡片。' }
   : { title: '请选择一个选项', text: '这个选择只在当前会话内确认。', actions: [{ id: 'confirm', label: '确认选择' }],
@@ -44,8 +53,8 @@ const hostIssues = new Set(['session_busy', 'session_timeout', 'session_preset_c
   'missing_scoped_tool_controls', 'missing_host_permission', 'session_requires_owned_writer', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
 
 export class Worker {
-  constructor({ api, store, host, config, log, attach }) {
-    Object.assign(this, { api, store, host, config, log, attach })
+  constructor({ api, store, host, config, log, attach, isArchived }) {
+    Object.assign(this, { api, store, host, config, log, attach, isArchived })
     this.progress = new Progress(api, log)
     this.cursor = '0'
   }
@@ -89,7 +98,7 @@ export class Worker {
     const next = this.store.steerCandidate(active.job)
     if (!next || next.sender !== active.job.sender || next.metadata || !next.input) return
     active.offer(next.input, () => {
-      this.store.running(next.seq)
+      this.store.running(next.seq, active.sessionId)
       active.merged.push(next.seq)
     })
   }
@@ -145,7 +154,7 @@ export class Worker {
       // Keep the old mappings in thread-only mode. An inherited thread may
       // retain parent rules in its history, so keep it in a separate session.
       const inheritance = channelType === 5 && config.threadRuleMode === 'inherit-group' ? ['inherit-group'] : []
-      const toolsAllowed = channelType === 1 && config.senderPolicy === 'allowlist' && config.allowed.has(job.sender)
+      const toolsAllowed = authorizedToolDm(config, job)
       const conversation = config.sessionProfile
         ? JSON.stringify([channelType, recipient, inheritance[0] ?? null, config.sessionProfile])
         : channelType === 1 ? job.sender : JSON.stringify([channelType, recipient, ...inheritance])
@@ -164,7 +173,9 @@ export class Worker {
         } else {
           progress = this.progress.start(job, config.progress, signal)
           const attachments = meta.attachment ? [await downloadAttachment(config, meta.attachment, signal)] : []
-          const session = this.store.session(conversation, config.idleMinutes)
+          let session = this.store.session(conversation, config.idleMinutes)
+          if (this.isArchived?.(session.session_id)) session = this.store.session(conversation, config.idleMinutes, Date.now(), true)
+          this.store.running(job.seq, session.session_id)
           const authorCard = safeCommand(config, job) && !attachments.length
             && /卡片|\bcard\b/iu.test(job.input)
           reply = await this.host.run(session, job.input, async () => {
@@ -172,10 +183,26 @@ export class Worker {
             await this.attach?.(session.session_id)
           }, signal, rules,
             phase => { if (phase === 'reused') this.log('dsh_session_reused'); else progress.stage(phase) }, config.timeoutMs, toolsAllowed,
-            { attachments, authorCard,
+            { attachments, authorCard, taskContext: channelType === 1, onTrace: trace => progress.trace(trace),
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
               ...(toolsAllowed && config.transport === 'websocket' && config.sendMode === 'steer' && !attachments.length
-                && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged } : undefined } }) })
+                && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id } : undefined } }) })
+          if (channelType === 1 && asksForFile(job.input) && !deliverables?.length) {
+            const issue = !config.allowFiles ? 'files_disabled' : !toolsAllowed || config.toolPermission === 'text-only'
+              ? 'file_tools_unavailable' : 'file_not_presented'
+            this.store.review(job.seq, issue)
+            for (const seq of merged) this.store.review(seq, issue)
+            this.log(issue)
+            const explanation = issue === 'files_disabled' ? '此账号尚未启用附件。'
+              : issue === 'file_tools_unavailable' ? '本次私聊没有工作区工具权限。'
+                : 'DSH 没有交付可发送的文件。'
+            const notified = await progress.finish('error', { detail: explanation })
+            if (!notified && !signal.aborted) {
+              try { await this.api.send(recipient, '文件未发送：' + explanation, signal, channelType) }
+              catch { if (!signal.aborted) this.log('failure_notice_not_confirmed') }
+            }
+            return
+          }
           if (authorCard) {
             card = authoredCard(reply)
             if (card) reply = card.fallback
@@ -205,8 +232,19 @@ export class Worker {
     }
     signal.throwIfAborted()
     this.store.sending(job.seq)
+    progress?.stage('delivering')
     let confirmed = false
     try {
+      if (meta.deliverables?.length) {
+        if (!config.allowFiles || !authorizedToolDm(config, job) || config.toolPermission === 'text-only') throw new Error('files_not_authorized')
+        for (const path of meta.deliverables) {
+          const file = await readDeliverable(config.cwd, isAbsolute(path) ? relative(config.cwd, path) : path, signal)
+          const delivered = await uploadAttachment(config, route, file, signal)
+          confirmed = true
+          this.store.recordDelivery(job.seq, delivered)
+          progress?.trace({ kind: 'file-sent' })
+        }
+      }
       let resultId
       if (meta.command === 'card' || meta.command === 'choose' || (meta.displayCard && safeCommand(config, job))) {
         try {
@@ -227,17 +265,11 @@ export class Worker {
           if (chunks.length > 1 || meta.deliverables?.length) this.store.recordDelivery(job.seq, resultId)
         }
       }
-      if (config.allowFiles && channelType === 1 && config.senderPolicy === 'allowlist' && config.allowed.has(job.sender)) {
-        for (const path of meta.deliverables ?? []) {
-          const file = await readDeliverable(config.cwd, isAbsolute(path) ? relative(config.cwd, path) : path, signal)
-          await uploadAttachment(config, route, file, signal)
-        }
-      }
       this.store.sent(job.seq, resultId, merged)
       await progress?.finish('completed')
     } catch (error) {
       // Do not replay a text/card or any already sent file if delivery failed mid-batch.
-      if (!confirmed && !merged.length && error instanceof OctoError && error.status === 429 && job.attempts < 3) {
+      if (!confirmed && !meta.deliverables?.length && !merged.length && error instanceof OctoError && error.status === 429 && job.attempts < 3) {
         this.store.retry(job.seq, Date.now() + Math.max(error.retryAfterMs, 3000 * (2 ** job.attempts)))
       } else {
         const issue = meta.deliverables?.length ? 'file_delivery_not_confirmed' : confirmed ? 'partial_delivery' : 'delivery_not_confirmed'
@@ -245,7 +277,7 @@ export class Worker {
         for (const seq of merged) this.store.review(seq, issue)
         this.log(issue)
       }
-      await progress?.finish('stopped')
+      await progress?.finish('stopped', meta.deliverables?.length ? { detail: '文件或正文尚未确认全部送达' } : undefined)
     }
   }
 

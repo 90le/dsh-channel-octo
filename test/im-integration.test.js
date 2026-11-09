@@ -20,7 +20,7 @@ const msg = (id, payload) => ({ event_id: id, message: {
 } })
 
 test('admitted attachment goes to DSH; the same turn sends its declared file to the same DM', async t => {
-  const { store, config, cwd } = fixture(t, { allowFiles: true,
+  const { store, config, cwd } = fixture(t, { allowFiles: true, senderPolicy: 'octo', toolPermission: 'workspace-write',
     mediaDownloadOrigins: ['https://files.example.invalid'], mediaUploadOrigins: ['https://storage.example.invalid'] })
   const received = Buffer.from('incoming attachment')
   const made = Buffer.from('generated output')
@@ -39,13 +39,14 @@ test('admitted attachment goes to DSH; the same turn sends its declared file to 
       calls.push('upload')
       return new Response()
     }
+    if (url.pathname.endsWith('/messages/sync')) return Response.json({ messages: [] })
     if (url.pathname.endsWith('/upload/presigned')) return Response.json({
       method: 'PUT', uploadUrl: 'https://storage.example.invalid/output.txt?signature=fixture',
       downloadUrl: 'https://files.example.invalid/output.txt', contentType: 'text/plain',
     })
     if (url.pathname.endsWith('/sendMessage')) {
       const body = JSON.parse(init.body)
-      assert.equal(body.channel_id, 'alice')
+      assert.equal(body.channel_id, calls.length === 0 ? 'friend' : 'alice')
       assert.equal(body.channel_type, 1)
       if (body.payload.type === 8) {
         assert.equal(body.payload.url, 'https://files.example.invalid/output.txt')
@@ -66,12 +67,11 @@ test('admitted attachment goes to DSH; the same turn sends its declared file to 
     },
   } })
   const message = msg('1', { type: 8, name: 'input.txt', url: 'https://files.example.invalid/input.txt' })
+  message.message.from_uid = 'friend'
   assert.equal(admit(message, { ...config, allowFiles: false }), undefined)
   store.add('1', admit(message, config))
   await worker.process(store.next(Date.now()), signal)
-  // Model tools are enabled only with the explicit private allowlist. The host
-  // fixture emulates one deliverable event already correlated to that turn.
-  config.senderPolicy = 'allowlist'
+  // Friend admission permits chat but not tools; verified owner has the configured workspace policy.
   worker.host = { async run(_s, _text, _create, _signal, _rules, _progress, _timeout, tools, extras) {
     assert.equal(tools, true)
     extras.onDeliverables([join(cwd, 'output.txt')])
@@ -79,7 +79,7 @@ test('admitted attachment goes to DSH; the same turn sends its declared file to 
   } }
   store.add('2', admit(msg('2', { type: 1, content: 'prepare a file' }), config))
   await worker.process(store.next(Date.now()), signal)
-  assert.deepEqual(calls, ['text', 'text', 'upload', 'file'])
+  assert.deepEqual(calls, ['text', 'upload', 'file', 'text'])
   assert.deepEqual(store.overview().counts.map(row => [row.state, row.total]), [['sent', 2]])
 })
 

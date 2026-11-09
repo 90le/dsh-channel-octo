@@ -197,7 +197,7 @@ export function createAccountView(React, primitives, { request, status, label })
       failed ? h('div', { className: 'dsho-account-body' }, h('p', { className: 'dsho-alert', role: 'alert' }, tr('failedOptions'))) : !options
         ? h('div', { className: 'dsho-account-body' }, h('p', { role: 'status' }, tr('loading')))
         : h(Editor, {
-          account, options, allowCredentials, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
+          account, options, allowCredentials, secureSettings: window.isSecureContext, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
           connectionStatus: account && status(account.enabled === false ? 'disabled' : account.status, lang),
           onVerify: ({ token }) => perform('POST', '/accounts/verify', { token }),
           onSave: fields => perform(account ? 'PUT' : 'POST', account ? endpoint(account.id) : '/accounts',

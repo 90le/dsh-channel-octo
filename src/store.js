@@ -48,6 +48,8 @@ export class Store {
       if (!columns.has('channel_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN channel_id TEXT')
       if (!columns.has('ambient')) this.db.exec('ALTER TABLE jobs ADD COLUMN ambient INTEGER NOT NULL DEFAULT 0')
       if (!columns.has('metadata')) this.db.exec('ALTER TABLE jobs ADD COLUMN metadata TEXT')
+      if (!columns.has('session_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN session_id TEXT')
+      this.db.exec('CREATE INDEX IF NOT EXISTS jobs_by_session ON jobs(session_id, seq)')
       this.db.exec(`
         CREATE INDEX IF NOT EXISTS jobs_by_route
           ON jobs(channel_type, COALESCE(channel_id, sender), seq) WHERE state IN ('queued','ready','running','sending');
@@ -160,8 +162,14 @@ export class Store {
       )
       SELECT r.session_id AS id, r.type, r.address, r.scope, r.historical, j.state, j.issue
       FROM routes r LEFT JOIN jobs j ON j.seq=(
-        SELECT seq FROM jobs WHERE channel_type=r.type AND COALESCE(channel_id, sender)=r.address
-          AND state <> 'ignored' ORDER BY seq DESC LIMIT 1
+        SELECT COALESCE(
+          (SELECT seq FROM jobs WHERE session_id=r.session_id AND state <> 'ignored' ORDER BY seq DESC LIMIT 1),
+          CASE WHEN r.historical=0 AND (SELECT COUNT(*) FROM routes other
+            WHERE other.type=r.type AND other.address=r.address)=1 THEN
+            (SELECT seq FROM jobs WHERE session_id IS NULL AND channel_type=r.type AND COALESCE(channel_id, sender)=r.address
+              AND state IN ('sent','review') ORDER BY seq DESC LIMIT 1)
+          END
+        )
       )
       ORDER BY r.last_ms DESC,j.seq DESC
     `).all()
@@ -171,7 +179,9 @@ export class Store {
   hasPending() {
     return !!this.db.prepare("SELECT 1 FROM jobs WHERE state IN ('queued','running','ready','sending') LIMIT 1").get()
   }
-  running(seq) { this.db.prepare("UPDATE jobs SET state='running' WHERE seq=?").run(seq) }
+  running(seq, sessionId = null) {
+    this.db.prepare("UPDATE jobs SET state='running', session_id=COALESCE(?,session_id) WHERE seq=?").run(sessionId, seq)
+  }
   ready(seq, reply, metadata) {
     this.db.prepare("UPDATE jobs SET state='ready', reply=?, metadata=? WHERE seq=?")
       .run(reply, metadata ? JSON.stringify(metadata) : null, seq)

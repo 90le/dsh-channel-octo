@@ -1,6 +1,6 @@
 // Opt-in: uses an installed, exact-version DSH CLI and a temporary Web profile.
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,6 +20,8 @@ const npm = process.env.npm_execpath
 const wire = process.argv[3] !== 'events'
 const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
+const ownerSmoke = process.env.DSH_OCTO_SMOKE_OWNER === '1'
+if (ownerSmoke && (!wire || browserModule)) throw new Error('Owner tool smoke uses headless WebSocket')
 const screenshots = process.env.DSH_OCTO_SMOKE_SCREENSHOTS
 const codexUi = process.env.DSH_OCTO_SMOKE_CODEX_UI
 const automation = process.env.DSH_OCTO_SMOKE_AUTOMATION
@@ -30,10 +32,11 @@ const browserReady = join(home, 'browser-ready')
 const observer = join(home, 'fixture-observer.mjs')
 // Keep filesystem/runtime discovery variables, but never pass existing API keys to the fixture process.
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-  /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|TEMP|TMP|TMPDIR|USERPROFILE|APPDATA|LOCALAPPDATA|HOME|LANG)$/i.test(key)))
+  /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|TEMP|TMP|TMPDIR|USERPROFILE|APPDATA|LOCALAPPDATA|HOME|LANG|npm_config_cache)$/i.test(key)))
 Object.assign(env, {
   DSH_HOME: home, DSH_OCTO_BOT_TOKEN: 'bf_fixture', DEEPSEEK_API_KEY: 'sk-fixture-for-local-smoke',
   DSH_TELEMETRY_DISABLED: '1',
+  DSH_OCTO_FIXTURE_OWNER: ownerSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
   ...(browserModule && { DSH_OCTO_BROWSER_READY: browserReady }),
 })
@@ -54,8 +57,10 @@ function sentCount() {
 let child, browser
 try {
   if (node([cli, '--version']).trim() !== '0.2.1-rc.5') throw new Error('Expected DSH 0.2.1-rc.5')
-  const [{ filename }] = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
-  for (const spec of [join(home, filename), '@michengai/dsh-im-connect@1.0.30',
+  const packed = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
+  const { filename } = Array.isArray(packed) ? packed[0] : packed['dsh-channel-octo']
+  if (typeof filename !== 'string' || !/^dsh-channel-octo-\d+\.\d+\.\d+\.tgz$/.test(filename)) throw new Error('Unexpected fixture package')
+  for (const spec of [join(home, filename), ...(ownerSmoke ? [] : ['@michengai/dsh-im-connect@1.0.30']),
     ...(codexUi ? ['@michengai/dsh-codex-ui@' + codexUi] : []),
     ...(automation ? ['@michengai/dsh-automation@' + automation] : [])]) {
     node([cli, 'plugin', '--profile', 'web', 'add', spec, '--registry=https://registry.npmjs.org/'])
@@ -67,12 +72,18 @@ export const name = 'octo-fixture-observer'
 export const inject = ['agents', 'agentPresets', 'agentDefaultModel']
 export function apply(ctx) {
   ctx.logger.exporter({ levels: { default: 2 }, export: ({ name, args }) => {
-    if (name === 'dsh-channel-octo' && ['dsh_session_reused', 'session_busy', 'session_preset_conflict',
+    if (name === 'dsh-channel-octo' && ['dsh_session_reused', 'session_busy', 'session_preset_conflict', 'bot_verified', 'octo_ws_connected', 'file_not_presented', 'file_tools_unavailable', 'worker_stopped: internal_error',
       'delivery_not_confirmed', 'file_delivery_not_confirmed', 'agent_run_not_confirmed', 'no_confirmed_final_text', 'shared_turn_not_forwarded', 'workspace_attach_failed',
       'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context'].includes(args?.[0])) {
       console.log('FIXTURE_DSH=' + args[0])
     }
   } })
+  if (process.env.DSH_OCTO_FIXTURE_OWNER === '1') {
+    ctx.on('session/event', (_session, event) => {
+      if (event.type === 'tool/result') console.log('FIXTURE_TOOL=' + (event.data.message?.isError ? 'failed' : 'ok'))
+      if (event.type === 'turn/end') console.log('FIXTURE_END=' + event.data.reason?.kind)
+    }, { global: true })
+  }
   const marker = process.env.DSH_OCTO_BROWSER_READY
   if (marker) ctx.effect(() => {
     let handle
@@ -92,6 +103,16 @@ export function apply(ctx) {
   })
 }
 `)
+  if (ownerSmoke) {
+    mkdirSync(state, { mode: 0o700 })
+    writeFileSync(join(state, 'accounts.json'), JSON.stringify({
+      version: 1, endpoint: 'https://octo-fixture.invalid/api', accounts: [{
+        id: 'legacy', botUid: 'fixture-bot', spaceId: 'fixture-space', cwd: home,
+        label: 'Octo Bot', enabled: true, permission: 'workspace-write', agentPreset: 'standard',
+        senderPolicy: 'octo', transport: 'websocket', allowFiles: true,
+      }],
+    }), { mode: 0o600 })
+  }
   writeFileSync(join(home, 'profiles', 'web', 'cordis.patch.yml'), [
     '- insert:', '  - id: octo-fixture-observer', '    name: ' + q(pathToFileURL(observer).href),
     '- id: dsh-channel-octo', '  config:', '    enabled: true',
@@ -103,6 +124,9 @@ export function apply(ctx) {
         '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
         '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]']),
     '    threadRuleMode: inherit-group',
+    '    hostPermissions: [read-only, workspace-write]',
+    ...(ownerSmoke ? ['    mediaDownloadOrigins: ["https://files-fixture.invalid"]',
+      '    mediaUploadOrigins: ["https://storage-fixture.invalid"]'] : []),
     '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 22000',
     '- id: llm-deepseek', '  config:', '    baseURL: https://model-fixture.invalid',
   ].join('\n') + '\n')
@@ -191,6 +215,19 @@ export function apply(ctx) {
     await search.fill('this-does-not-match')
     await page.getByText('没有匹配的会话', { exact: true }).waitFor()
     await search.fill('fixture-user')
+    if (await native.isVisible()) {
+      const more = page.locator('.dsho-rail .dsho-session-menu-trigger').first()
+      await more.click()
+      await page.getByRole('menuitem', { name: /重命名|Rename/ }).first().waitFor({ timeout: 7000 })
+      await page.keyboard.press('Escape')
+      await channel.click({ button: 'right' })
+      await page.getByRole('menuitem', { name: /^(置顶会话|Pin session)$/ }).first().click({ timeout: 7000 })
+      await page.locator('.dsho-rail [data-octo-pinned]').first().waitFor({ timeout: 7000 })
+      await more.click()
+      await page.getByRole('menuitem', { name: /^(取消置顶|Unpin session)$/ }).first().click({ timeout: 7000 })
+      await page.locator('.dsho-rail [data-octo-pinned]').first().waitFor({ state: 'detached', timeout: 7000 })
+      console.log('PASS: Octo overflow and context menu use native DSH actions and reflect pin changes.')
+    }
     await channel.click({ timeout: 15000 })
     try { await page.getByText('fixture response 1', { exact: true }).waitFor({ timeout: 12000 }) } catch (error) {
       throw new Error('native session unavailable: ' + (await page.locator('body').innerText()).slice(-550)
@@ -253,13 +290,16 @@ export function apply(ctx) {
     await roster.getByText('Fixture spare', { exact: true }).waitFor({ timeout: 9000 })
     await config.getByRole('button', { name: '设置 · Fixture spare', exact: true }).click()
     const edit = page.locator('.dsho-account-modal[open]')
+    const policy = edit.getByLabel('权限策略', { exact: true })
+    await policy.selectOption({ label: '工作区写入' })
+    await edit.getByText('已保存', { exact: true }).waitFor({ timeout: 9000 })
     await edit.getByLabel('账号名称', { exact: true }).fill('Fixture spare renamed')
     await edit.getByLabel('账号名称', { exact: true }).press('Enter')
     await edit.getByRole('heading', { name: 'Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
     await edit.getByRole('button', { name: '关闭', exact: true }).click()
     await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
     const overview = await (await page.request.get(new URL('/api/dsh-channel-octo', launch).href)).json()
-    if (!overview.accounts.some(row => row.label === 'Fixture spare renamed' && row.enabled === false)) {
+    if (!overview.accounts.some(row => row.label === 'Fixture spare renamed' && row.enabled === false && row.permission === 'workspace-write' && row.senderPolicy === 'octo')) {
       throw new Error('The second Bot did not stay separately configured')
     }
     const stored = readFileSync(join(state, 'accounts.json'), 'utf8')
@@ -288,10 +328,17 @@ export function apply(ctx) {
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   }
   if (browserModule && !/dsh_session_reused/.test(output)) throw new Error('Web did not hold the fixture session open during the second turn')
-  const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')
-  if (!imLog.includes('API 已注册') || !imLog.includes('attachMappedSessions')) throw new Error('IM Connect did not initialize')
-  console.log('PASS: DSH Web + IM Connect; ' + (wire ? 'Octo friends/members with @ and no-@ over WebSocket' : 'explicit @ over HTTP events')
-    + '; rules, isolated history and no model tools.')
+  if (ownerSmoke && (readFileSync(join(home, 'octo-tool-fixture.txt'), 'utf8') !== 'written by native DSH'
+    || !output.includes('FIXTURE_FILE_OK'))) throw new Error('Native write/present/delivery failed: '
+      + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
+  if (ownerSmoke) console.log('PASS: verified Octo owner ran DSH write and present, and the same bytes reached the mock file recipient.')
+  if (!ownerSmoke) {
+    const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')
+    if (!imLog.includes('API 已注册') || !imLog.includes('attachMappedSessions')) throw new Error('IM Connect did not initialize')
+  }
+  console.log('PASS: DSH Web' + (ownerSmoke ? '' : ' + IM Connect') + '; '
+    + (wire ? 'Octo friends/members with @ and no-@ over WebSocket' : 'explicit @ over HTTP events')
+    + '; channel rules and isolated histories.')
 } finally {
   await browser?.close()
   if (child && child.exitCode === null && child.signalCode === null) {

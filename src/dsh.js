@@ -31,6 +31,7 @@ export class DshHost {
     const agentOptions = { provider: selected.provider, model: selected.model,
       ...(this.profile.provider && selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) }
     const permission = toolsAllowed && this.profile.permission !== 'text-only' ? this.profile.permission : null
+    const authority = { active: false, mixed: false }
     const chosen = this.profile.agentPreset ?? 'octo-text'
     const preset = permission && chosen === 'octo-text' ? 'standard' : chosen
     const applyPermission = (agent) => {
@@ -51,13 +52,24 @@ export class DshHost {
         if (typeof scoped.on === 'function') cleanup.push(scoped.on('system-prompt/assemble',
           async (_assembly, _context, next) => ({ ...await next(), tools: [] })))
       }
-      if (rules || extras.authorCard) {
+      if (permission) {
+        const tools = scoped.get('tools')
+        if (!tools?.guard) throw new Error('missing_scoped_tool_controls')
+        cleanup.push(tools.guard(() => !authority.active || authority.mixed || signal.aborted ? denial : undefined))
+      }
+      if (rules || extras.authorCard || extras.taskContext) {
         const prompt = scoped.get('systemPrompt')
         if (typeof prompt?.context !== 'function') throw new Error('missing_scoped_rule_context')
         // DSH projects runtime facts into a user-role snapshot, not the system role.
         if (rules) cleanup.push(prompt.context({
           name: 'dsh-channel-octo.channel-rules',
           order: 50, required: true, interpolate: false, text: ruleContext(rules),
+        }))
+        if (extras.taskContext) cleanup.push(prompt.context({
+          name: 'dsh-channel-octo.task-delivery', order: 49, interpolate: false, required: true,
+          text: permission
+            ? 'For an Octo action request, perform the work using the available tools before returning a final answer. A plan is not a result. If asked to send a generated file, use the DSH present tool to declare the actual workspace file before ending; keep the file in place until delivery. Explicitly report work that was blocked.'
+            : 'This Octo turn is in text-only mode. No tools or workspace actions are available. Do not claim that you checked, created, edited, or sent a file. Explain the limitation when asked to perform an action.',
         }))
         if (extras.authorCard) cleanup.push(prompt.context({
           name: 'dsh-channel-octo.card-format', order: 51, interpolate: false,
@@ -91,7 +103,6 @@ export class DshHost {
         }
       }
       if (!handle) {
-        if (permission) throw new Error('session_requires_owned_writer')
         if (agent.session?.header?.cwd !== this.cwd || ctx.agentPresets.composedPreset?.(agent.ctx) !== preset) {
           throw new Error('session_preset_conflict')
         }
@@ -101,6 +112,11 @@ export class DshHost {
         await wait(agent.whenIdle(), signal)
         if (find() !== agent || agent.status !== 'idle' || agent.inbox?.hasPending ||
           agent.inbox?.nextTurn?.length || agent.inbox?.nextStep?.length) throw new Error('session_busy')
+        // Reuse only the exact permission already saved in this Octo session.
+        // Never change the permission of a Web-owned writer.
+        if (permission && ctx.get?.('permissionPresets')?.current?.(agent.session) !== permission) {
+          throw new Error('session_requires_owned_writer')
+        }
         controls(agent.ctx, cleanup)
         onStage('reused')
       }
@@ -112,7 +128,8 @@ export class DshHost {
       signal.throwIfAborted()
       failure = 'session_turn_failed'
       const content = await prepareInput(ctx, agent, text, extras.attachments, signal)
-      const reply = await this.#turn(agent, content, signal, onStage, permission ? extras.onDeliverables : undefined, handle ? extras.onSteer : undefined)
+      const reply = await this.#turn(agent, content, signal, onStage, authority,
+        permission ? extras.onDeliverables : undefined, handle ? extras.onSteer : undefined, extras.onTrace)
       failure = 'session_flush_failed'
       await ctx.sessions.flush(agent.session)
       return reply
@@ -134,11 +151,11 @@ export class DshHost {
     }
   }
 
-  async #turn(agent, content, signal, onStage, onDeliverables, onSteer) {
+  async #turn(agent, content, signal, onStage, authority, onDeliverables, onSteer, trace = () => {}) {
     const requestId = randomUUID()
     let claimedTurn, attempt, finalText = '', open = true
     const steering = new Map()
-    const otherTurns = new Set(), deliverables = new Set()
+    const otherTurns = new Set(), deliverables = new Set(), pendingCalls = new Set()
     const dispose = []
     try {
       return await new Promise((resolve, reject) => {
@@ -148,11 +165,19 @@ export class DshHost {
         const matches = (payload) => payload?.agent?.id === agent.id && payload?.message?.id === requestId
         dispose.push(this.ctx.on('agent/inbox/claimed', (payload) => {
           if (payload?.agent?.id !== agent.id || !Number.isSafeInteger(payload.turn)) return
-          if (matches(payload)) { claimedTurn = payload.turn; onStage('running') }
+          if (matches(payload)) {
+            claimedTurn = payload.turn
+            authority.active = true
+            authority.mixed = otherTurns.has(claimedTurn)
+            onStage('running')
+          }
           else if (payload.turn === claimedTurn && steering.has(payload?.message?.id)) {
             finalText = ''
             steering.get(payload.message.id).claimed = true
-          } else if (payload?.message?.source?.kind !== 'runtime-context') otherTurns.add(payload.turn)
+          } else if (payload?.message?.source?.kind !== 'runtime-context') {
+            otherTurns.add(payload.turn)
+            if (payload.turn === claimedTurn) authority.mixed = true
+          }
         }, { global: true }))
         dispose.push(this.ctx.on('agent/inbox/discarded', (payload) => {
           if (matches(payload)) reject(new Error('prompt_discarded'))
@@ -166,21 +191,33 @@ export class DshHost {
         }, { global: true }))
         dispose.push(this.ctx.on('session/event', (session, event) => {
           if (session?.id !== agent.id || claimedTurn === undefined || event?.data?.turn !== claimedTurn) return
-          if (event.type === 'assistant/message' && !event.data.interrupted) {
+          if (event.type === 'step/start') {
+            finalText = ''
+            trace({ kind: 'step' })
+          } else if (event.type === 'tool/call') {
+            finalText = ''
+            pendingCalls.add(event.data.callId)
+            trace({ kind: 'tool-start', id: event.data.callId, name: event.data.name })
+          } else if (event.type === 'tool/result') {
+            const { toolCallId: callId, isError } = event.data.message ?? {}
+            pendingCalls.delete(callId)
+            trace({ kind: 'tool-end', id: callId, failed: !!(isError || event.data.error) })
+          } else if (event.type === 'assistant/message') {
             const parts = event.data.message?.content
             const text = Array.isArray(parts)
               ? parts.filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text).join('')
               : ''
-            if (text.trim()) finalText = text
+            finalText = !event.data.interrupted && !parts?.some?.(p => p?.type === 'tool-call') ? text : ''
           } else if (event.type === 'deliverables/presented' && onDeliverables) {
             for (const file of (Array.isArray(event.data.files) ? event.data.files.slice(0, 8) : [])) {
               if (typeof file?.path === 'string' && deliverables.size < 5) deliverables.add(file.path)
             }
           } else if (event.type === 'turn/end') {
             open = false
+            authority.active = false
             if ([...steering.values()].some(item => !item.claimed)) reject(new Error('prompt_discarded'))
             else if (otherTurns.has(claimedTurn)) reject(new Error('shared_turn_not_forwarded'))
-            else if (event.data.reason?.kind === 'completed' && (finalText.trim() || deliverables.size)) {
+            else if (event.data.reason?.kind === 'completed' && pendingCalls.size === 0 && (finalText.trim() || deliverables.size)) {
               if (deliverables.size) onDeliverables([...deliverables])
               resolve(finalText.trim() ? finalText : '已生成文件。')
             }
@@ -211,6 +248,7 @@ export class DshHost {
       })
     } finally {
       open = false
+      authority.active = false
       onSteer?.(undefined)
       for (const cleanup of dispose.reverse()) cleanup()
     }

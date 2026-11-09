@@ -1,3 +1,17 @@
+const builtinPolicy = {
+  'text-only': ['仅文字（无工具）', 'Text only (no tools)'],
+  'read-only': ['只读', 'Read only'],
+  'workspace-write': ['工作区写入', 'Workspace write'],
+  'danger-full-access': ['完全访问', 'Full access'],
+  auto: ['自动权限', 'Auto'],
+}
+const builtinPreset = {
+  'octo-text': ['Octo 文字模式', 'Octo text mode'],
+  standard: ['标准模式', 'Standard'],
+  minimal: ['精简模式', 'Minimal'],
+  ptc: ['程序化工具调用', 'Programmatic tool calling'],
+  cordis: ['Cordis 开发模式', 'Cordis development'],
+}
 const copy = {
   unnamed: ['Octo 账号', 'Octo account'],
   legacy: ['此账号来自服务器原有配置。', 'This account comes from the server configuration.'],
@@ -33,7 +47,8 @@ const copy = {
   pickPolicy: ['请选择权限策略', 'Select a permission'],
   noPolicies: ['暂无可选权限策略', 'No permissions available'],
   policyDisabled: ['灰色选项需要管理员在服务器上开放。', 'A server administrator must enable the unavailable options.'],
-  requiresAllowlist: ['工具权限仅限名单中的私聊用户。请先设置私聊名单。', 'Tools are limited to DM users on the allowlist. Set the DM allowlist first.'],
+  policyScope: ['跟随 Octo 准入时，工具仅对已验证的 Bot 所有者私聊开放；其他好友、群聊和子区可正常对话。', 'When following Octo access, only the verified bot owner can use tools in DMs. Other friends and group or topic members can still chat.'],
+  permissionHttps: ['请从 HTTPS 管理入口修改工具权限。', 'Open the HTTPS management page to change tool permissions.'],
   senderPolicy: ['私聊准入', 'Private chat access'],
   senderAllowlist: ['仅允许名单中的用户', 'Allowlisted users only'],
   senderOcto: ['跟随 Octo 好友和群成员权限', 'Follow Octo friend and group access'],
@@ -55,7 +70,7 @@ const copy = {
   commandsOff: ['仅正常对话', 'Conversation only'],
   commandsSafe: ['仅允许插件命令', 'Plugin commands only'],
   allowFiles: ['允许处理文件附件', 'Allow file attachments'],
-  filesNote: ['允许处理符合聊天准入规则的附件。只有名单中的私聊用户可以接收工作区交付文件。', 'Process attachments from eligible chats. Only allowlisted DM users can receive files produced in the workspace.'],
+  filesNote: ['允许处理符合聊天准入规则的附件。只有获准使用工具的私聊用户可以接收工作区交付文件。', 'Process attachments from eligible chats. Only DMs authorized for tools can receive files produced in the workspace.'],
   current: ['当前设置', 'Current setting'],
   enabled: ['启用此账号', 'Enable this account'],
   save: ['保存账号', 'Save account'],
@@ -100,7 +115,7 @@ export function accountFields(account) {
 export function createAccountEditor(React, { Button, Input }) {
   const { createElement: h, useEffect, useId, useRef, useState } = React
 
-  function AccountForm({ account, options, allowCredentials, onVerify, onSave, onCancel,
+  function AccountForm({ account, options, allowCredentials, secureSettings, onVerify, onSave, onCancel,
     onDiagnose, onReconnect, onRemove, t, lang = 'zh', connectionStatus, errorMessage }) {
     const tr = key => {
       const id = 'octo.accountEditor.' + key
@@ -199,11 +214,13 @@ export function createAccountEditor(React, { Button, Input }) {
     const modelItems = choices(models.map(item => ({
       value: modelChoice(item.provider, item.model), label: (item.label || item.model) + ' · ' + item.provider,
     })), originalModel, [initial.model, initial.provider].filter(Boolean).join(' · '))
-    const catalogChoices = items => items.map(item => ({
-      value: item.id, label: item.label || item.id, disabled: item.disabled === true,
+    const catalogChoices = (items, builtins, checkSecure = false) => items.map(item => ({
+      value: item.id,
+      label: (Object.hasOwn(builtins, item.id) ? builtins[item.id][lang === 'zh' ? 0 : 1] : null) || item.label || item.id,
+      disabled: item.disabled === true || (checkSecure && !secureSettings && item.id !== 'text-only' && item.id !== initial.permission),
     }))
-    const policyItems = choices(catalogChoices(policies), initial.permission)
-    const presetOptions = catalogChoices(presets)
+    const policyItems = choices(catalogChoices(policies, builtinPolicy, true), initial.permission)
+    const presetOptions = catalogChoices(presets, builtinPreset)
     if (!presetOptions.some(item => item.value === 'octo-text')) {
       presetOptions.unshift({ value: 'octo-text', label: tr('defaultPreset') })
     }
@@ -216,7 +233,6 @@ export function createAccountEditor(React, { Button, Input }) {
       return !validChoice(workspaceItems, fields.cwd, initial.cwd) ? (workspaces.length ? 'pickWorkspace' : 'noWorkspaces')
         : model && !validChoice(modelItems, model, originalModel) ? 'pickModel'
         : !validChoice(policyItems, fields.permission, initial.permission) ? (policies.length ? 'pickPolicy' : 'noPolicies')
-        : fields.permission !== 'text-only' && fields.senderPolicy !== 'allowlist' ? 'requiresAllowlist'
         : fields.senderPolicy === 'allowlist' && !fields.allowedUids.length ? 'allowedUidsRequired'
         : ''
     }
@@ -344,7 +360,9 @@ export function createAccountEditor(React, { Button, Input }) {
       select('policy', 'permission', policyItems, draft.permission, permission => update({ permission }),
         policyItems.length ? 'pickPolicy' : 'noPolicies'),
       select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),
-      policyItems.some(item => item.disabled) && hint('policyDisabled', { className: 'dsho-account-note dsho-account-wide' }),
+      !secureSettings && hint('permissionHttps', { className: 'dsho-account-note dsho-account-wide' }),
+      policies.some(item => item.disabled) && hint('policyDisabled', { className: 'dsho-account-note dsho-account-wide' }),
+      draft.senderPolicy === 'octo' && hint('policyScope', { className: 'dsho-account-note dsho-account-wide' }),
       draft.senderPolicy === 'allowlist' && field('uids', 'allowedUids', h(React.Fragment, null,
         h('textarea', { id: id + '-uids', rows: 3, value: uidText, disabled: locked, 'aria-required': true,
           'aria-describedby': id + '-uids-hint', onChange: event => setUidText(event.target.value),

@@ -136,21 +136,29 @@ export class Accounts {
       : Promise.resolve(record.id === legacy ? this.env.DSH_OCTO_BOT_TOKEN : undefined)
   }
 
-  privatePolicy(record, config) {
+  privatePolicy(record) {
     if (!record.permission || record.permission === textOnly) return
-    if (!this.policies().some(p => p.id === record.permission && !p.disabled)) fail('permission_unavailable')
-    if (config.senderPolicy !== 'allowlist' || !config.allowed.size) fail('permission_requires_allowlist')
+    // The host can restore accounts before permissionPresets has loaded.
+    // Check the deployment policy now; edits check the live catalog and
+    // DshHost requires a live permission service before granting any tools.
+    if (!Array.isArray(this.deployment.hostPermissions) || !this.deployment.hostPermissions.includes(record.permission)) {
+      fail('permission_unavailable')
+    }
   }
 
   settingsFor(record, token) {
     if (!validToken(token)) fail('invalid_bot_token')
     const stateDir = record.id === legacy ? this.root : join(this.root, 'bots', record.id)
     const base = {
-      ...(record.id === legacy ? this.deployment : { senderPolicy: 'octo', channelPolicy: 'allowlist', mentionPolicy: 'required' }),
+      ...(record.id === legacy ? this.deployment : {
+        senderPolicy: 'octo', channelPolicy: 'allowlist', mentionPolicy: 'required',
+        mediaDownloadOrigins: this.deployment.mediaDownloadOrigins, mediaUploadOrigins: this.deployment.mediaUploadOrigins,
+        mediaMaxBytes: this.deployment.mediaMaxBytes, mediaTimeoutMs: this.deployment.mediaTimeoutMs,
+      }),
       apiBase: this.endpoint, stateDir, cwd: record.cwd, botUid: record.botUid, spaceId: record.spaceId, transport: record.transport,
     }
     const admission = record.senderPolicy ? { senderPolicy: record.senderPolicy, allowedUids: record.allowedUids ?? [] } : {}
-    return loadSettings(base, stateDir, token, config => this.privatePolicy(record, config), admission)
+    return loadSettings(base, stateDir, token, () => this.privatePolicy(record), admission)
   }
 
   open(record, token) {
@@ -176,6 +184,7 @@ export class Accounts {
       ])).digest('hex').slice(0, 24)
     }
     config.idleMinutes = record.idleMinutes ?? 0
+    config.toolPermission = record.permission ?? textOnly
     Object.assign(config, normalizeImControls({ ...this.deployment, ...record }), { fetchImpl: this.fetchImpl })
     let workspace
     const attach = async sessionId => {
@@ -189,7 +198,8 @@ export class Accounts {
     const worker = new Worker({
       api: new OctoClient({ ...config, fetchImpl: this.fetchImpl }), store,
       host: new DshHost(this.ctx, config.cwd, config.timeoutMs, record),
-      config, attach, log: (line) => {
+      config, attach, isArchived: sessionId => this.ctx.get('workspaceRegistry')?.archivedSessionIds?.includes(sessionId),
+      log: (line) => {
         if (line === 'octo_ws_connected' || line === 'octo_poll_ok') runtime.status = 'online'
         else if (line.startsWith('octo_ws_retry_') || line.startsWith('octo_poll_')) runtime.status = 'reconnecting'
         if (line !== 'octo_poll_ok') this.log.info(line)
