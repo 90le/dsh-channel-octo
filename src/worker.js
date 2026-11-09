@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { admit, decimalId, OctoError, permitsRoute } from './octo.js'
+import { receiveRealtime } from './realtime.js'
 
 export class Worker {
   constructor({ api, store, host, config, log }) {
@@ -25,6 +26,20 @@ export class Worker {
     if (!permitsRoute(this.config, job.sender, channelType, recipient)) {
       this.store.review(job.seq, 'route_not_allowed')
       return
+    }
+    if (job.ambient || this.config.senderPolicy === 'octo' || (channelType !== 1 && this.config.channelPolicy === 'joined')) {
+      try {
+        if (!await this.api.allowsMessage(this.config, job, signal)) {
+          this.store.discard(job.seq, 'octo_access_denied')
+          return
+        }
+      } catch (error) {
+        if (signal.aborted) return
+        const issue = 'access_' + (error instanceof OctoError ? error.code : 'internal_error')
+        this.store.discard(job.seq, issue, 'review')
+        this.log(issue)
+        return
+      }
     }
     if (job.state === 'queued') {
       let rules
@@ -76,6 +91,7 @@ export class Worker {
   async run(signal) {
     await this.api.verify(this.config.botUid, this.config.spaceId, signal)
     this.log('bot_verified')
+    if (this.config.transport === 'websocket') return this.runRealtime(signal)
     let failures = 0
     while (!signal.aborted) {
       const job = this.store.next(Date.now())
@@ -93,6 +109,34 @@ export class Worker {
         this.log('octo_poll_' + error.code)
         await delay(Math.max(error.retryAfterMs, Math.min(30_000, 1000 * (2 ** Math.min(5, failures)))), undefined, { signal })
       }
+    }
+  }
+
+  async runRealtime(lifetime) {
+    const stop = new AbortController()
+    const signal = AbortSignal.any([lifetime, stop.signal])
+    const accept = m => {
+      signal.throwIfAborted()
+      const candidate = admit({ message: {
+        message_id: m.messageId, from_uid: m.fromUid, channel_type: m.channelType,
+        channel_id: m.channelId, payload: m.payload,
+      } }, this.config)
+      if (candidate) this.store.add('ws:' + candidate.messageId, candidate)
+      // WukongConnection sends RECVACK only after this function returns.
+    }
+    const receiving = receiveRealtime({ api: this.api, botUid: this.config.botUid, accept, signal, log: this.log })
+    const draining = (async () => {
+      while (!signal.aborted) {
+        const job = this.store.next(Date.now())
+        if (job) await this.process(job, signal)
+        else await delay(250, undefined, { signal })
+      }
+    })()
+    try {
+      await Promise.all([receiving, draining])
+    } finally {
+      stop.abort()
+      await Promise.allSettled([receiving, draining])
     }
   }
 }

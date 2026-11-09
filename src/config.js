@@ -23,12 +23,26 @@ export function resolveConfig(config, env = process.env) {
   if (!/^(app|bf)_[A-Za-z0-9_-]+$/.test(token ?? '')) throw new Error('missing_bot_token')
   const groups = scopeList(config.allowedGroupIds, 2)
   const threads = scopeList(config.allowedThreadIds, 5)
-  if ((groups.size || threads.size) && !token.startsWith('bf_')) throw new Error('group_and_thread_require_user_bot')
+  const senderPolicy = config.senderPolicy ?? 'allowlist'
+  const channelPolicy = config.channelPolicy ?? 'allowlist'
+  const mentionPolicy = config.mentionPolicy ?? 'required'
+  const transport = config.transport ?? (mentionPolicy === 'octo' ? 'websocket' : 'events')
+  if (!['allowlist', 'octo'].includes(senderPolicy) || !['allowlist', 'joined'].includes(channelPolicy)
+    || !['required', 'octo'].includes(mentionPolicy) || !['events', 'websocket'].includes(transport)) {
+    throw new Error('invalid_access_policy')
+  }
+  if (mentionPolicy === 'octo' && transport !== 'websocket') throw new Error('mention_free_requires_websocket')
+  if ((groups.size || threads.size || channelPolicy === 'joined' || mentionPolicy === 'octo') && !token.startsWith('bf_')) {
+    throw new Error('group_and_thread_require_user_bot')
+  }
+  if (channelPolicy === 'joined' && (groups.size || threads.size)) throw new Error('ambiguous_channel_policy')
   const threadRuleMode = config.threadRuleMode ?? 'thread-only'
   if (!['thread-only', 'inherit-group'].includes(threadRuleMode)) throw new Error('invalid_thread_rule_mode')
   if (!validUid(config.botUid) || !validUid(config.spaceId)) throw new Error('missing_bot_identity')
-  if (!Array.isArray(config.allowedUids) || !config.allowedUids.length || config.allowedUids.length > 20
-    || config.allowedUids.some(uid => !validUid(uid) || uid === config.botUid)) throw new Error('invalid_user_allowlist')
+  const allowedUids = config.allowedUids ?? []
+  if (!Array.isArray(allowedUids) || allowedUids.length > 20
+    || (senderPolicy === 'allowlist' ? !allowedUids.length : allowedUids.length > 0)
+    || allowedUids.some(uid => !validUid(uid) || uid === config.botUid)) throw new Error('invalid_user_allowlist')
   const stateDir = config.stateDir ?? join(env.DSH_HOME ?? join(homedir(), '.dsh'), 'dsh-channel-octo')
   if (!isAbsolute(stateDir) || typeof config.cwd !== 'string' || !isAbsolute(config.cwd) || !statSync(config.cwd).isDirectory()) {
     throw new Error('invalid_working_or_state_directory')
@@ -39,6 +53,7 @@ export function resolveConfig(config, env = process.env) {
     || !Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000) throw new Error('invalid_timeouts')
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
-    botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(config.allowedUids), groups, threads, threadRuleMode,
+    botUid: config.botUid, spaceId: config.spaceId, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
+    senderPolicy, channelPolicy, mentionPolicy, transport,
   }
 }

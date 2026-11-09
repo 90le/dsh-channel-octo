@@ -1,3 +1,5 @@
+import { wirePeer } from './wukong-fixture.mjs'
+
 let received = 0
 let sent = 0
 const group = '00112233445566778899aabbccddeeff'
@@ -6,12 +8,45 @@ const routes = [
   [1, 'fixture-user'], [1, 'fixture-user'],
   [2, group], [5, group + '____' + thread], [2, group],
 ]
+const peer = process.env.DSH_OCTO_FIXTURE_WIRE === '1' ? await wirePeer() : null
+function nextMessage() {
+  const [type, address] = routes[received]
+  received++
+  return {
+    messageId: String(received), sender: 'fixture-user', channelType: type, channelId: address,
+    payload: {
+      type: 1, content: 'fixture prompt ' + received,
+      ...(!peer || received === 3 ? { mention: { uids: ['fixture-bot'] } } : {}),
+    },
+  }
+}
+if (peer) setInterval(() => {
+  if (peer.send && received < routes.length && received === sent) peer.send(nextMessage())
+}, 50).unref()
 const realFetch = globalThis.fetch
 globalThis.fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : String(input))
   const json = value => Response.json(value)
   if (url.hostname === 'octo-fixture.invalid') {
     if (url.pathname.endsWith('/verify-bot')) return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space' })
+    if (url.pathname.endsWith('/register') && peer) {
+      return json({ robot_id: 'fixture-bot', im_token: 'fixture-im-secret', ws_url: peer.wsUrl })
+    }
+    if (url.pathname.endsWith('/messages/sync')) {
+      const request = JSON.parse(init.body)
+      return request.channel_id === 'fixture-user' && request.channel_type === 1 && request.limit === 1
+        ? json({ messages: [] }) : new Response(null, { status: 403 })
+    }
+    if (url.pathname.endsWith('/groups') && url.searchParams.get('space_id') === 'fixture-space') {
+      return json([{ group_no: group, space_id: 'fixture-space' }])
+    }
+    if (url.pathname.endsWith('/groups/' + group + '/members')) {
+      return json([{ uid: 'fixture-bot', robot: 1 }, { uid: 'fixture-user', robot: 0 }])
+    }
+    if (url.pathname.endsWith('/groups/' + group + '/mention_pref')) {
+      const enabled = received === 4 || received === 5
+      return json({ effective: enabled, group_allow_no_mention: enabled })
+    }
     if (init.method === 'GET' && url.pathname.endsWith('/groups/' + group + '/md')) {
       return received === 5
         ? json({ content: '', version: 2 })
@@ -33,12 +68,12 @@ globalThis.fetch = async (input, init) => {
       return json({ message_id: 100 + sent })
     }
     if (url.pathname.endsWith('/events')) {
+      if (peer) return new Response(null, { status: 403 })
       if (received < routes.length && received === sent) {
-        const [type, address] = routes[received]
-        received++
+        const m = nextMessage()
         return json({status:1, results:[{event_id:received, message:{
-          message_id:received, from_uid:'fixture-user', channel_type:type, channel_id:address,
-          payload:{ type:1, content:'fixture prompt ' + received, mention:{uids:['fixture-bot']} },
+          message_id:m.messageId, from_uid:m.sender, channel_type:m.channelType, channel_id:m.channelId,
+          payload:m.payload,
         }}]})
       }
       return json({ status: 1, results: [] })

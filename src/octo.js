@@ -2,6 +2,12 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { ruleScope } from './rules.js'
 
 const maxBody = 1024 * 1024
+const flag = (value) => value === 1 || value === true
+const memberList = (value, field) => {
+  if (Array.isArray(value) || value === null) return value ?? []
+  if (Array.isArray(value?.[field])) return value[field]
+  throw new OctoError('invalid_access_response')
+}
 
 export class OctoError extends Error {
   constructor(code, status = 0, retryAfterMs = 0) {
@@ -81,6 +87,55 @@ export class OctoClient {
     if (result?.bot_uid !== botUid || result?.space_id !== spaceId) throw new OctoError('bot_identity_mismatch')
   }
 
+  async register(botUid, signal) {
+    const data = await this.#request('/v1/bot/register', '{}', signal)
+    if (data?.robot_id !== botUid || typeof data.im_token !== 'string' || !data.im_token
+      || typeof data.ws_url !== 'string') throw new OctoError('invalid_bot_registration')
+    const url = URL.parse(data.ws_url)
+    const loopback = url && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+    if (!url || (url.protocol !== 'wss:' && !(url.protocol === 'ws:' && loopback))
+      || url.username || url.password || url.hash) throw new OctoError('invalid_ws_url')
+    return { robot_id: botUid, im_token: data.im_token, ws_url: url.href }
+  }
+
+  async allowsMessage(config, job, signal) {
+    const { sender, channel_type: type, ambient } = job
+    const address = job.channel_id ?? sender
+    if (type === 1) {
+      if (config.senderPolicy !== 'octo') return true
+      if (sender.includes('@')) return false // Octo's internal DM channel separator
+      // Use the bot's ordinary history gate: it enforces friend/owner policy
+      // without OBO. Request at most one record and never use its content.
+      const result = await this.#request('/v1/bot/messages/sync', JSON.stringify({
+        channel_id: sender, channel_type: 1, start_message_seq: 0, end_message_seq: 0, limit: 1, pull_mode: 0,
+      }), signal, { timeout: 5000 })
+      if (result?.messages !== null && !Array.isArray(result?.messages)) throw new OctoError('invalid_access_response')
+      return true
+    }
+    const scope = ruleScope(type, address)
+    if (!scope) return false
+    const root = '/v1/bot/groups/' + encodeURIComponent(scope.group)
+    if (ambient) {
+      if (config.mentionPolicy !== 'octo') return false
+      const pref = await this.#request(root + '/mention_pref', undefined, signal, { timeout: 3000 })
+      if ((pref?.group_allow_no_mention !== undefined && !flag(pref.group_allow_no_mention))
+        || !flag(pref?.effective ?? pref?.no_mention)) return false
+    }
+    if (config.channelPolicy === 'joined') {
+      const query = new URLSearchParams({ space_id: config.spaceId })
+      const groups = memberList(await this.#request('/v1/bot/groups?' + query, undefined, signal, { timeout: 5000 }), 'groups')
+      if (!groups.some(g => g?.group_no === scope.group && g.space_id === config.spaceId)) return false
+    }
+    if (ambient || config.senderPolicy === 'octo' || config.channelPolicy === 'joined') {
+      const members = memberList(await this.#request(root + '/members', undefined, signal, { timeout: 5000 }), 'members')
+      const actor = members.find(m => m?.uid === sender)
+      // Do not auto-trigger other bots or unknown member kinds.
+      if (!actor || ((ambient || config.senderPolicy === 'octo') && actor.robot !== 0 && actor.robot !== false)
+        || !members.some(m => m?.uid === config.botUid)) return false
+    }
+    return true
+  }
+
   async events(signal) {
     const started = Date.now()
     const result = await this.#request('/v1/bot/events', JSON.stringify({ event_id: 0, limit: 20, wait: this.wait }), signal, {
@@ -131,8 +186,10 @@ export class OctoClient {
 }
 
 export function permitsRoute(config, sender, channelType, channelId) {
-  if (sender === config.botUid || !config.allowed.has(sender)) return false
+  if (typeof sender !== 'string' || !/^[A-Za-z0-9_.:@-]{1,128}$/.test(sender) || sender === config.botUid
+    || (config.senderPolicy !== 'octo' && !config.allowed.has(sender))) return false
   if (channelType === 1) return channelId === sender
+  if (config.channelPolicy === 'joined') return !!ruleScope(channelType, channelId)
   if (channelType === 2) return config.groups?.has(channelId) === true
   if (channelType === 5) return config.threads?.has(channelId) === true
   return false
@@ -145,16 +202,23 @@ export function admit(event, config) {
   const messageId = decimalId(message?.message_id)
   const channelType = message?.channel_type
   const channelId = channelType === 1 ? sender : message?.channel_id
-  if (!messageId || event.event_type || message.payload?.type !== 1
+  if (!messageId || event.event_type || message.payload?.type !== 1 || message.payload?.event != null
     || !permitsRoute(config, sender, channelType, channelId)
     || (message.payload.space_id != null && message.payload.space_id !== config.spaceId)
     || !text || text.startsWith('/') || Buffer.byteLength(text, 'utf8') > 8000) return
+  let ambient = false
   if (channelType !== 1) {
     const mention = message.payload.mention
-    const broadcast = [mention?.all, mention?.ais, mention?.humans].some(flag => flag === 1 || flag === true)
-    if (broadcast || !Array.isArray(mention?.uids) || !mention.uids.includes(config.botUid)) return
+    if (mention != null && (typeof mention !== 'object' || Array.isArray(mention))) return
+    if ([mention?.all, mention?.ais, mention?.humans].some(flag)) return
+    if (mention?.uids != null && !Array.isArray(mention.uids)) return
+    const targets = mention?.uids ?? []
+    if (!targets.includes(config.botUid)) {
+      if (config.mentionPolicy !== 'octo' || targets.length || /(?:^|\s)[@＠]\S/u.test(text)) return
+      ambient = true
+    }
   }
   // For a DM the raw channel ID is not necessarily the recipient's UID. Group
   // and topic replies use the original channel address, never the sender UID.
-  return { messageId, sender, text, channelId, channelType }
+  return { messageId, sender, text, channelId, channelType, ambient }
 }

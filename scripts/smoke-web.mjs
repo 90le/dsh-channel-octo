@@ -16,12 +16,14 @@ const temporary = realpathSync(tmpdir())
 const home = mkdtempSync(join(temporary, 'dsh-octo-smoke-'))
 const state = join(home, 'octo-state')
 const npm = process.env.npm_execpath
+const wire = process.argv[3] !== 'events'
 // Keep filesystem/runtime discovery variables, but never pass existing API keys to the fixture process.
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|TEMP|TMP|TMPDIR|USERPROFILE|APPDATA|LOCALAPPDATA|HOME|LANG)$/i.test(key)))
 Object.assign(env, {
   DSH_HOME: home, DSH_OCTO_BOT_TOKEN: 'bf_fixture', DEEPSEEK_API_KEY: 'sk-fixture-for-local-smoke',
   DSH_TELEMETRY_DISABLED: '1',
+  DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
 })
 const common = { cwd: project, env, windowsHide: true, encoding: 'utf8', timeout: 50_000 }
 function node(args) {
@@ -48,9 +50,12 @@ try {
   writeFileSync(join(home, 'profiles', 'web', 'cordis.patch.yml'), [
     '- id: dsh-channel-octo', '  config:', '    enabled: true',
     '    apiBase: https://octo-fixture.invalid/api', '    botUid: fixture-bot',
-    '    spaceId: fixture-space', '    allowedUids: [fixture-user]',
-    '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
-    '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]',
+    '    spaceId: fixture-space',
+    ...(wire
+      ? ['    senderPolicy: octo', '    channelPolicy: joined', '    mentionPolicy: octo']
+      : ['    allowedUids: [fixture-user]',
+        '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
+        '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]']),
     '    threadRuleMode: inherit-group',
     '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 8000',
     '- id: llm-deepseek', '  config:', '    baseURL: https://model-fixture.invalid',
@@ -68,7 +73,8 @@ try {
   }
   const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')
   if (!imLog.includes('API 已注册') || !imLog.includes('attachMappedSessions')) throw new Error('IM Connect did not initialize')
-  console.log('PASS: DSH Web + IM Connect; scoped group/topic rules, cleared latest snapshot, isolated history, no model tools.')
+  console.log('PASS: DSH Web + IM Connect; ' + (wire ? 'Octo friends/members with @ and no-@ over WebSocket' : 'explicit @ over HTTP events')
+    + '; rules, isolated history and no model tools.')
 } finally {
   if (child && child.exitCode === null && child.signalCode === null) {
     const exited = new Promise(resolve => child.once('exit', resolve))

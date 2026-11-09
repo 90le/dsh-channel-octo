@@ -1,6 +1,6 @@
 {
   "name": "dsh-channel-octo",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Octo IM as a native DeepSeek Harness Web channel",
   "private": true,
   "license": "UNLICENSED",
@@ -15,7 +15,25 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
-  "files": ["src", "cordis.patch.yml", "README.md", "PLAN.md", "OCTO-COVERAGE.md"],
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
-  "scripts": { "test": "node --test", "smoke:web": "node scripts/smoke-web.mjs" }
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "PLAN.md",
+    "OCTO-COVERAGE.md",
+    "LICENSE-OCTO-APACHE-2.0",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "smoke:web": "node scripts/smoke-web.mjs"
+  },
+  "dependencies": {
+    "ws": "8.22.2"
+  }
 }

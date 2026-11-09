@@ -36,6 +36,7 @@ export class Store {
       const columns = new Set(this.db.prepare('PRAGMA table_info(jobs)').all().map(row => row.name))
       if (!columns.has('channel_type')) this.db.exec('ALTER TABLE jobs ADD COLUMN channel_type INTEGER NOT NULL DEFAULT 1')
       if (!columns.has('channel_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN channel_id TEXT')
+      if (!columns.has('ambient')) this.db.exec('ALTER TABLE jobs ADD COLUMN ambient INTEGER NOT NULL DEFAULT 0')
       this.db.exec(`
         CREATE INDEX IF NOT EXISTS jobs_by_route
           ON jobs(channel_type, COALESCE(channel_id, sender), seq) WHERE state IN ('queued','ready','running','sending');
@@ -50,9 +51,9 @@ export class Store {
 
   add(eventId, m) {
     this.db.prepare(`
-      INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id) VALUES (?,?,?,?,?,?)
+      INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient) VALUES (?,?,?,?,?,?,?)
       ON CONFLICT(message_id) DO NOTHING
-    `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender)
+    `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender, m.ambient ? 1 : 0)
   }
 
   next(now) {
@@ -81,5 +82,8 @@ export class Store {
   sent(seq, id) { this.db.prepare("UPDATE jobs SET state='sent', result_id=?, input='', reply=NULL WHERE seq=?").run(id, seq) }
   retry(seq, at) { this.db.prepare("UPDATE jobs SET state='ready', next_ms=? WHERE seq=?").run(at, seq) }
   review(seq, issue) { this.db.prepare("UPDATE jobs SET state='review', issue=? WHERE seq=?").run(issue, seq) }
+  discard(seq, issue, state = 'ignored') {
+    this.db.prepare("UPDATE jobs SET state=?, issue=?, input='', reply=NULL WHERE seq=?").run(state, issue, seq)
+  }
   close() { try { this.db?.close() } finally { this.lease.close() } }
 }
