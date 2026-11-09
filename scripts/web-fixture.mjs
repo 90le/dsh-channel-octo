@@ -17,6 +17,13 @@ let groupQuestion
 let groupDisplaySent = false, groupDisplayReceipt = false
 let groupFormAnswered = false, groupFormFeedback = false
 let approvalSent = false, approvalFeedback = false
+let groupDisplayPayload
+const adminOperations = ['octo_webhooks_update', 'octo_webhooks_test', 'octo_webhooks_delete', 'octo_messages_clear_card_revisions']
+const adminCompleted = new Set()
+const fixtureHookId = 'iwh_' + 'a'.repeat(32)
+let fixtureHook = { webhook_id: fixtureHookId, group_no: '00112233445566778899aabbccddeeff',
+  creator_uid: 'fixture-bot', name: 'Build fixture', status: 1, allow_mention_all: 0, allow_mention_bots: 0,
+  mention_uids: [], last_used_at: 0, call_count: 0, created_at: 1 }
 const typedForm = { title: 'Fixture typed form', inputs: [
   { id: 'note', kind: 'text', label: '说明', required: true },
   { id: 'amount', kind: 'number', label: '数量', required: true },
@@ -151,6 +158,34 @@ globalThis.fetch = async (input, init) => {
     if (url.pathname.endsWith('/groups/' + group + '/members')) {
       return json([{ uid: 'fixture-bot', name: 'Fixture Bot', robot: 1, role: 2 },
         { uid: 'fixture-user', name: 'Fixture User', robot: 0, role: 1 }])
+    }
+    const hooksRoot = '/api/v1/bot/groups/' + group + '/incoming-webhooks'
+    if (groupToolsSmoke && url.pathname === hooksRoot && init.method === 'GET') return json({ list: fixtureHook ? [fixtureHook] : [] })
+    if (groupToolsSmoke && url.pathname.startsWith(hooksRoot + '/' + fixtureHookId)) {
+      if (received !== 3 || !fixtureHook) return new Response(null, { status: 404 })
+      if (url.pathname === hooksRoot + '/' + fixtureHookId && init.method === 'PUT') {
+        const body = JSON.parse(init.body)
+        if (JSON.stringify(body) !== JSON.stringify({ name: 'Updated fixture', status: 0 })) return new Response(null, { status: 400 })
+        fixtureHook = { ...fixtureHook, ...body }
+        return json(fixtureHook)
+      }
+      if (url.pathname === hooksRoot + '/' + fixtureHookId + '/test' && init.method === 'POST') return json({ status: 0, message_id: '701' })
+      if (url.pathname === hooksRoot + '/' + fixtureHookId && init.method === 'DELETE') {
+        fixtureHook = undefined
+        return json({ status: 200 })
+      }
+      return new Response(null, { status: 400 })
+    }
+    if (groupToolsSmoke && url.pathname === '/api/v1/bot/groups/' + group + '/messages/700') {
+      if (!groupDisplayPayload) return new Response(null, { status: 404 })
+      return json({ message_id: '700', message_seq: 35, from_uid: 'fixture-bot', channel_type: 2, channel_id: group,
+        payload: groupDisplayPayload })
+    }
+    if (groupToolsSmoke && url.pathname === '/api/v1/bot/message/card/revisions/clear' && init.method === 'POST') {
+      const body = JSON.parse(init.body)
+      if (received !== 3 || body.message_id !== '700' || body.channel_type !== 2 || body.channel_id !== group
+        || !groupDisplayPayload) return new Response(null, { status: 400 })
+      return json({ cleared: 2 })
     }
     if (url.pathname.endsWith('/groups/' + group + '/mention_pref')) {
       const enabled = received === 4 || received === 5
@@ -308,6 +343,7 @@ globalThis.fetch = async (input, init) => {
           return new Response(null, { status: 400 })
         }
         groupDisplaySent = true
+        groupDisplayPayload = structuredClone(payload)
         console.log('FIXTURE_GROUP_DISPLAY_CARD_OK=700')
         return json({ message_id: 700 })
       }
@@ -334,7 +370,7 @@ globalThis.fetch = async (input, init) => {
         return new Response(null, { status: 400 })
       }
       if (groupToolsSmoke && sent === 2 && (!groupQuestion?.answered || !groupQuestion?.writeCompleted
-        || !groupDisplaySent || !groupDisplayReceipt || !groupFormAnswered)) {
+        || !groupDisplaySent || !groupDisplayReceipt || !groupFormAnswered || adminCompleted.size !== 4)) {
         console.error('FIXTURE_GROUP_FINAL_BEFORE_TOOLS')
         return new Response(null, { status: 400 })
       }
@@ -442,14 +478,31 @@ globalThis.fetch = async (input, init) => {
         groupFormAnswered = true
         console.log('FIXTURE_TYPED_FORM_ANSWERED')
       }
-      if (groupStep < (groupToolsSmoke ? 5 : 1)) {
+      if (groupToolsSmoke && groupStep >= 6) {
+        const name = adminOperations[groupStep - 6]
+        const result = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+          .find(part => part.type === 'tool_result' && part.tool_use_id === 'toolu_fixture_group_' + name)
+        const text = typeof result?.content === 'string' ? result.content : (result?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
+        let receipt; try { receipt = JSON.parse(text) } catch {}
+        if (result?.is_error || receipt?.ok !== true
+          || name === 'octo_webhooks_update' && receipt.webhook?.status !== 0
+          || name === 'octo_webhooks_test' && receipt.message_id !== '701'
+          || name === 'octo_webhooks_delete' && receipt.deleted !== true
+          || name === 'octo_messages_clear_card_revisions' && receipt.cleared !== 2) return new Response(null, { status: 400 })
+        adminCompleted.add(name)
+        console.log('FIXTURE_ADMIN_TOOL_OK=' + name)
+      }
+      if (groupStep < (groupToolsSmoke ? 9 : 1)) {
         const step = groupStep++
-        const name = ['octo_members', 'ask_user_question', 'write', 'octo_display_card', 'octo_form'][step]
+        const name = ['octo_members', 'ask_user_question', 'write', 'octo_display_card', 'octo_form', ...adminOperations][step]
         const id = 'toolu_fixture_group_' + (step === 0 ? 'members' : name)
         const args = [{}, { questions: [{ id: 'fixture-group-choice', question: 'Continue with the group file?', options: [
           { label: 'Fixture group answer', description: 'Write the group file' },
           { label: 'Wrong callback answer', description: 'Must not be accepted' },
-        ] }] }, { file_path: 'group-tool-fixture.txt', content: 'group native tools executed' }, groupDisplayForm, typedForm][step]
+        ] }] }, { file_path: 'group-tool-fixture.txt', content: 'group native tools executed' }, groupDisplayForm, typedForm,
+          { webhook_id: fixtureHookId, name: 'Updated fixture', enabled: false },
+          { webhook_id: fixtureHookId, confirm_send: true }, { webhook_id: fixtureHookId },
+          { message_id: '700', confirm_clear: true }][step]
         const frames = [
           { type: 'message_start', message: { id: 'fixture-group-tool', model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
           { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id, name, input: {} } },

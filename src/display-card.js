@@ -378,7 +378,7 @@ export function assertEditableDisplayCard(payload) {
     if (typeof value === 'string') {
       size += bytes(value)
       // Legacy progress/question display frames have no template provenance.
-      if (size > maxPayloadBytes || /DSH (?:回复进度|等待你的回答|提问回执)/u.test(value)) reject()
+      if (size > maxPayloadBytes || /DSH (?:回复进度|等待你的回答|等待你的批准|提问回执)/u.test(value)) reject()
     } else if (Array.isArray(value)) {
       if (value.length > 200) reject()
       for (const item of value) walk(item, depth + 1)

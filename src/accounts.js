@@ -11,6 +11,7 @@ import { normalizeImControls } from './im-controls.js'
 import { Worker } from './worker.js'
 import { sessionExists } from './session-state.js'
 import { botCommandMenu, setBotCommands } from './bot-commands.js'
+import { administerWebhooks, validateWebhookInput, webhookWrites } from './webhook-admin.js'
 
 const legacy = 'legacy'
 const textOnly = 'text-only'
@@ -407,7 +408,8 @@ export class Accounts {
       if (!this.ready || this.lifetime.signal.aborted) fail('accounts_unavailable')
       return work()
     })
-    this.ops = next.catch(() => {})
+    // The sequencing promise must not retain one-time management secrets.
+    this.ops = next.then(() => undefined, () => undefined)
     return next
   }
 
@@ -581,6 +583,31 @@ export class Accounts {
     const identity = await this.identify(token)
     if (!sameBot(identity, record)) fail('bot_identity_mismatch')
     return identity
+  }
+
+  manageWebhooks(accountId, input, requestSignal) {
+    return this.locked(async () => {
+      this.checkRevision(input)
+      validateWebhookInput(input)
+      const record = this.record(accountId)
+      const runtime = this.runtimes.get(accountId)
+      if (!runtime?.settings?.config) fail('channel_not_configured')
+      if (runtime.changing) fail('account_transition')
+      let token
+      try { token = await this.tokenFor(record) } catch { fail('invalid_bot_token') }
+      if (!validToken(token)) fail('invalid_bot_token')
+      const identity = await this.identify(token)
+      if (!sameBot(identity, record)) fail('bot_identity_mismatch')
+      const signal = AbortSignal.any([this.lifetime.signal, ...(requestSignal ? [requestSignal] : [])])
+      signal.throwIfAborted()
+      const result = await administerWebhooks({ apiBase: this.endpoint, token, fetchImpl: this.fetchImpl,
+        signal, record, conversations: runtime.store.overview().conversations }, input)
+      signal.throwIfAborted()
+      if (webhookWrites(input.action)) this.revision = id()
+      // Deliberately no overview(), persistence, logger, vault writes or worker
+      // publication. Only the authenticated HTTP caller gets this result.
+      return { accountId, accountRevision: this.revision, ...result }
+    })
   }
 
   reconnect(accountId, input) {

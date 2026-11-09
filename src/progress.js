@@ -11,7 +11,7 @@ const labels = {
   approval: '等待你批准这次操作',
   completed: '回复已发送',
   stopped: '回复发送待确认',
-  error: '本次回复未完成，请稍后重发',
+  error: '本次回复未完成，请先核对 DSH 执行状态',
 }
 
 const stages = ['queued', 'running', 'responding', 'delivering']

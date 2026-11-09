@@ -5,6 +5,9 @@ import { ruleScope } from './rules.js'
 import { normalizeOctoContent } from './octo-content.js'
 import { parseSafeCommand } from './im-controls.js'
 import { ChannelApi } from './channel-api.js'
+import { OctoError, readApiError } from './api-errors.js'
+
+export { OctoError } from './api-errors.js'
 
 const maxBody = 1024 * 1024
 const flag = (value) => value === 1 || value === true
@@ -12,15 +15,6 @@ const memberList = (value, field) => {
   if (Array.isArray(value) || value === null) return value ?? []
   if (Array.isArray(value?.[field])) return value[field]
   throw new OctoError('invalid_access_response')
-}
-
-export class OctoError extends Error {
-  constructor(code, status = 0, retryAfterMs = 0) {
-    super(code)
-    this.code = code
-    this.status = status
-    this.retryAfterMs = retryAfterMs
-  }
 }
 
 export function decimalId(value) {
@@ -77,23 +71,26 @@ export class OctoClient {
       : undefined
   }
 
-  async #request(path, body, signal, { timeout = 15_000, auth = true, method, multipart = false } = {}) {
+  async #request(path, body, signal, { timeout = 15_000, auth = true, method, multipart = false,
+    invalidResponseCode = 'invalid_api_response' } = {}) {
     try {
+      const requestSignal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(timeout)])
       const response = await this.fetch(this.base + path, {
         method: method ?? (body === undefined ? 'GET' : 'POST'), redirect: 'manual',
         headers: { ...(body !== undefined && !multipart && { 'Content-Type': 'application/json' }), ...(auth && { Authorization: 'Bearer ' + this.#token }) },
-        body, signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
+        body, signal: requestSignal,
       })
-      if (!response.ok) {
-        await response.body?.cancel().catch(() => {})
-        const header = response.headers.get('retry-after')
-        const seconds = header === null ? 0 : Number(header)
-        const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now()
-        throw new OctoError('http_' + response.status, response.status, Number.isFinite(ms) ? Math.max(0, ms) : 0)
+      if (!response.ok) throw await readApiError(response, requestSignal)
+      const result = await boundedJson(response)
+      // The reviewed official facade does not emit errors on HTTP 200. Reject
+      // error-shaped successes generically, without granting their body authority.
+      if (result && !Array.isArray(result) && (result.error != null || result.ok === false
+        || Number.isInteger(result.status) && result.status >= 400)) {
+        throw new OctoError(invalidResponseCode, response.status)
       }
-      return await boundedJson(response)
+      return result
     } catch (error) {
-      if (signal.aborted) throw signal.reason
+      if (signal?.aborted) throw signal.reason
       if (error instanceof OctoError) throw error
       throw new OctoError('transport_or_invalid_response')
     }
@@ -111,7 +108,9 @@ export class OctoClient {
     // requires "audio"; its proxy unit fixture's "file" key is not sufficient.
     form.set('audio', new Blob([attachment.bytes], { type: attachment.mime }), name || 'recording')
     form.set('mode', mode)
-    const result = await this.#request('/v1/bot/voice/transcribe', form, signal, { multipart: true, timeout: 60_000 })
+    const result = await this.#request('/v1/bot/voice/transcribe', form, signal, {
+      multipart: true, timeout: 60_000, invalidResponseCode: 'invalid_voice_transcript',
+    })
     if (!result || typeof result.text !== 'string' || !result.text.trim() || result.text.length > 24_000
       || result.status != null && result.status !== 200) throw new OctoError('invalid_voice_transcript')
     return { text: result.text, mode }

@@ -19,7 +19,7 @@ const template = {
 }
 const labels = {
   queued: '已收到，等待 DSH 开始处理', running: 'DSH 正在处理', responding: '正在生成回复',
-  completed: '回复已发送', error: '本次回复未完成，请稍后重发', stopped: '回复发送待确认',
+  completed: '回复已发送', error: '本次回复未完成，请先核对 DSH 执行状态', stopped: '回复发送待确认',
 }
 
 function clock(t) {

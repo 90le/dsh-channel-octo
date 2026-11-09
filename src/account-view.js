@@ -1,4 +1,5 @@
 import { createAccountEditor } from './account-editor.js'
+import { createWebhookView } from './webhook-view.js'
 
 const styles = `
 .dsho-account-roster {
@@ -165,6 +166,7 @@ export function createAccountView(React, primitives, { request, status, label })
   const { Button, Switch } = primitives
   const Editor = createAccountEditor(React, primitives)
   const BotCommandMenu = createBotCommandMenu(React, primitives)
+  const WebhookView = createWebhookView(React, primitives)
   const talk = lang => key => Object.hasOwn(caption, key) ? caption[key][lang === 'zh' ? 0 : 1] : ''
   const send = (suffix, method, body) => request(suffix, {
     method, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
@@ -261,6 +263,20 @@ export function createAccountView(React, primitives, { request, status, label })
         }),
       account && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
         perform: action => perform('POST', endpoint(account.id) + '/commands', { action, revision: revision.current }) }),
+      account && h(WebhookView, { accountId: account.id, accountLabel: account.label, lang, busy, disabled: !data.canManage || !account.config,
+        perform: async (input, signal) => {
+          const result = await request(endpoint(account.id) + '/webhooks', {
+            method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
+            body: JSON.stringify({ ...input, revision: revision.current }),
+          })
+          if (!signal.aborted && result.accountId === account.id) {
+            revision.current = result.accountRevision
+            // Refresh ordinary account metadata separately; the protected result
+            // is never passed to publish() or the shared client snapshot.
+            if (result.webhook || result.deleted || result.test) refresh()
+          }
+          return result
+        } }),
       confirming && h(ConfirmRemove, { tr, onClose: () => setConfirming(false),
         remove: () => perform('POST', endpoint(account.id) + '/remove', { revision: revision.current }, true) }))
   }

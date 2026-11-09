@@ -102,6 +102,10 @@ export function apply(ctx) {
     }, { prepend: true })
     ctx.on('session/event', (_session, event) => {
       if (event.type === 'tool/result') console.log('FIXTURE_TOOL=' + (event.data.message?.isError ? 'failed' : 'ok'))
+      if (event.type === 'tool/result' && event.data.message?.isError) {
+        const known = JSON.stringify(event.data.message).match(/(?:channel_tool_failed: )([a-z_]+)/)?.[1]
+        console.log('FIXTURE_TOOL_ERROR=' + (known || 'unclassified'))
+      }
       if (event.type === 'turn/end') console.log('FIXTURE_END=' + event.data.reason?.kind)
     }, { global: true })
   }
@@ -419,6 +423,10 @@ export function apply(ctx) {
     await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ state: 'detached', timeout: 9000 })
     if (readFileSync(join(state, 'accounts.json'), 'utf8').includes('bf_fixture_second_rotated')) throw new Error('Rotated credential escaped its vault')
     console.log('PASS: delayed account PUT preserves rapid permission/send-mode/tool-scope/name edits; Chinese scopes, persisted and reopened settings, credential rotation and confirmed removal; credentials not exposed.')
+    if (process.env.DSH_OCTO_SMOKE_WEBHOOK_UI === '1') {
+      const { runWebhookUiSmoke } = await import('./webhook-ui-smoke.mjs')
+      console.log('PASS: protected Webhook native settings UI ' + JSON.stringify(await runWebhookUiSmoke(page)))
+    }
   }
   // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
   const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
@@ -472,6 +480,8 @@ export function apply(ctx) {
         'FIXTURE_ANSWER_FEEDBACK=504', 'FIXTURE_GROUP_WRITE_OK', 'FIXTURE_GROUP_DISPLAY_CARD_OK=700',
         'FIXTURE_GROUP_DISPLAY_RECEIPT_OK', 'FIXTURE_GROUP_FINAL_OK', 'FIXTURE_TYPED_FORM_SENT', 'FIXTURE_TYPED_FORM_FEEDBACK', 'FIXTURE_TYPED_FORM_ANSWERED',
         'FIXTURE_NATIVE_APPROVAL_REQUEST', 'FIXTURE_APPROVAL_CARD', 'FIXTURE_APPROVAL_FEEDBACK'].some(marker => !output.includes(marker))
+      || ['octo_webhooks_update', 'octo_webhooks_test', 'octo_webhooks_delete', 'octo_messages_clear_card_revisions']
+        .some(name => !output.includes('FIXTURE_ADMIN_TOOL_OK=' + name))
       || /FIXTURE_GROUP_INVALID_CALLBACK_ACCEPTED|FIXTURE_QUESTION_FEEDBACK_MISMATCH|FIXTURE_GROUP_DISPLAY_(?:CARD_MISMATCH|RECEIPT_WRONG)/.test(output))) {
       throw new Error('Group native question/write/display-card/final roundtrip failed: '
         + output.replace(/https?:\/\/\S+/g, '[url]').slice(-2000))
@@ -499,7 +509,7 @@ export function apply(ctx) {
       }
     } finally { db.close() }
     console.log('PASS: three DM card answers, file plus full description, group member tool, and '
-      + (groupToolsSmoke ? 'native group question, approval card, wrong callback rejection, workspace write, structured display, typed form and final.' : 'Octo-only group tool isolation.'))
+      + (groupToolsSmoke ? 'native group question, approval card, wrong callback rejection, workspace write, structured display, typed form, webhook tools, card revision cleanup and final.' : 'Octo-only group tool isolation.'))
   }
   if (deleteSmoke) {
     const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })

@@ -88,7 +88,7 @@ test('four bounded operations use ordinary frozen readonly schemas', () => {
     assert.ok(Object.isFrozen(spec.parameters.properties))
     assert.equal(spec.parameters.properties.channel_id, undefined)
   }
-  assert.deepEqual(CHANNEL_API_OPERATIONS.filter(spec => spec.name.startsWith('webhooks.')).map(spec => spec.name), names.slice(2))
+  assert.deepEqual(CHANNEL_API_OPERATIONS.filter(spec => spec.name.startsWith('webhooks.') && !spec.mutating).map(spec => spec.name), names.slice(2))
 })
 
 test('identity info uses bot GET query, returns only admitted key/name, and rechecks membership', async t => {

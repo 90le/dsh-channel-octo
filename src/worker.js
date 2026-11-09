@@ -9,6 +9,7 @@ import { readDeliverable } from './dsh-media.js'
 import { createCard, parseCardAction, resolveCardAction, sendCard } from './octo-cards.js'
 import { finalMentions, textSegments, hasMarkdown, boundedMarkdown, mentionGuidance } from './outbound-text.js'
 import { CHANNEL_API_OPERATIONS as operationSpecs } from './channel-api.js'
+import { apiErrorCode } from './api-errors.js'
 import { spec as displayCardSpec, sendDisplayCard } from './display-card.js'
 import { voiceTool } from './voice-tool.js'
 import { formToolSpec } from './form-tool.js'
@@ -77,6 +78,26 @@ const hostIssues = new Set(['session_busy', 'session_timeout', 'session_preset_c
   'missing_host_model', 'shared_turn_not_forwarded', 'prompt_discarded', 'no_confirmed_final_text',
   'session_missing', 'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context',
   'missing_scoped_tool_controls', 'missing_host_permission', 'session_requires_owned_writer', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
+
+const failureDetails = {
+  session_busy: '此 DSH 会话正由另一个回合使用，请待当前回合结束后继续。',
+  session_timeout: '本次处理超时。可能已有工具执行，请先在 DSH 核对进度再决定是否继续。',
+  session_preset_conflict: '当前会话的 Agent 预设与账号设置不一致，请新建会话后继续。',
+  missing_host_model: 'DSH 尚未提供可用模型，请在账号设置中选择可用模型。',
+  missing_host_permission: '当前 DSH 权限策略不可用，请检查账号权限设置。',
+  dsh_attachment_rejected: 'DSH 未接受本条附件，请核对文件格式及模型能力。',
+  dsh_attachment_storage_unavailable: 'DSH 附件存储暂不可用，请检查服务状态。',
+  attachment_unavailable: '本条附件未能读取，请核对附件是否仍可下载。',
+  no_confirmed_final_text: 'DSH 没有提交可确认的最终回复。请先在 DSH 查看执行结果，避免重复操作。',
+  shared_turn_not_forwarded: '此回合混入了其他来源的输入，回复保留在 DSH 中，请在那里查看。',
+  api_permission_denied: 'Octo 拒绝了此次访问，请检查 Bot 的成员身份和当前频道权限。',
+  api_authentication_failed: 'Octo 令牌认证失败，请在账号设置中重新验证令牌。',
+  api_disabled: 'Octo 服务端尚未开启此功能，请检查服务配置。',
+  api_unavailable: 'Octo 功能服务暂不可用，请先核对服务及已执行操作的状态。',
+  api_unsupported: '当前 Octo Bot 类型或服务端不支持此操作。',
+  api_rate_limited: 'Octo 暂时限制了请求频率，请先核对处理状态后再继续。',
+}
+const unknownFailure = '本次回复未完成。请先在 DSH 查看执行状态，再决定是否继续，避免重复操作。'
 
 export class Worker {
   constructor({ api, store, host, config, log, attach, isArchived }) {
@@ -467,14 +488,15 @@ export class Worker {
         this.store.ready(job.seq, bounded, meta)
         job = { ...job, reply: bounded }
       } catch (error) {
-        const code = error instanceof OctoError ? error.code : hostIssues.has(error?.message) ? error.message
+        const code = error instanceof OctoError ? (error.status ? apiErrorCode(error) : error.code) : hostIssues.has(error?.message) ? error.message
           : error?.name === 'SessionAlreadyOwnedError' ? 'session_busy' : 'agent_run_not_confirmed'
         this.store.review(job.seq, code)
         for (const seq of merged) this.store.review(seq, code)
         this.log(code)
-        const notified = await progress?.finish('error')
+        const detail = failureDetails[code] ?? unknownFailure
+        const notified = await progress?.finish('error', { detail })
         if (!signal.aborted && !notified && !job.ambient && config.progress !== undefined) {
-          try { await this.api.send(recipient, 'DSH 已收到消息，但本次回复未完成。请稍后重发。', signal, channelType) }
+          try { await this.api.send(recipient, 'DSH 已收到消息。' + detail, signal, channelType) }
           catch { if (!signal.aborted) this.log('failure_notice_not_confirmed') }
         }
         return
@@ -569,7 +591,10 @@ export class Worker {
 
   async run(signal) {
     const identity = await this.api.verify(this.config.botUid, this.config.spaceId, signal)
-    if (identity?.ownerUid) this.config.ownerUid = identity.ownerUid
+    this.config.ownerUid = identity?.ownerUid
+    // Accounts creates OctoClient from a connection config copy. Refresh its
+    // scoped API only AFTER identity verification, and remove any stale owner.
+    this.api.configureChannel?.(this.config)
     this.log('bot_verified')
     await this.questions.closeInterrupted(signal)
     if (this.config.transport === 'websocket') return this.runRealtime(signal)

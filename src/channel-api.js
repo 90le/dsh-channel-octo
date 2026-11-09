@@ -1,5 +1,6 @@
 import { validUid } from './config.js'
 import { ruleScope } from './rules.js'
+import { apiErrorCode } from './api-errors.js'
 import { normalizeOctoContent } from './octo-content.js'
 import { displayCardParameters, normalizeDisplayCard, renderDisplayCard,
   assertEditableDisplayCard, normalizeRichtextBlocks } from './display-card.js'
@@ -80,9 +81,12 @@ const structuredEdits = new Set(['messages.edit_richtext', 'messages.edit_displa
 // 1123-1170,model.go:180-228}. Bot-token reads only, never user-session routes.
 const identityReads = new Set(['messages.user_info', 'messages.users_batch'])
 const webhookReads = new Set(['webhooks.list', 'webhooks.deliveries'])
+const webhookWrites = new Set(['webhooks.update', 'webhooks.delete', 'webhooks.test'])
 const identityUID = { type: 'string', pattern: '^[A-Za-z0-9_.:@-]{1,64}$' }
 const webhookID = { type: 'string', pattern: '^iwh_[a-f0-9]{32}$' }
 const bareUID = value => value.replace(/^s\d+_(.+)$/, '$1')
+// Go strings.TrimSpace uses Unicode White_Space (including U+0085, excluding BOM).
+const webhookName = value => value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '')
 const deliveryReasons = new Set(['', 'token', 'body', 'too_large', 'json', 'no_event',
   'content', 'blocks', 'card', 'msg_type', 'delivery_failed', 'ping', 'event'])
 const deliveryAdapters = new Set(['native', 'test', 'github', 'wecom', 'multica', 'octo', 'gitlab', 'feishu'])
@@ -103,6 +107,14 @@ export const CHANNEL_API_OPERATIONS = freeze([
   spec('webhooks.list', 'List incoming webhook metadata only in this group or current topic. Requires live requester group owner/admin and bot membership. No tokens, URLs or examples.', schema({ limit })),
   spec('webhooks.deliveries', 'Read recent delivery diagnostics for a listed webhook in this group or current topic. Requester must be live group owner/admin; bot must own the webhook or be group owner/admin. No test push or secrets.',
     schema({ webhook_id: webhookID, limit }, ['webhook_id'])),
+  spec('webhooks.update', 'Change a listed incoming webhook in this exact group/topic. Requester must be current group owner/admin; bot must own it or be group owner/admin. Only explicitly requested changes; setting mention permissions enables future notifications, and mention_uids replaces the targeted recipient list (empty clears). Does not send a test. Creation, credentials and avatar are managed in account settings. Inspect after an unconfirmed write; never automatically retry.',
+    schema({ webhook_id: webhookID, name: { type: 'string', minLength: 1, maxLength: 64 },
+      enabled: { type: 'boolean' }, allow_mention_all: { type: 'boolean' }, allow_mention_bots: { type: 'boolean' },
+      mention_uids: { type: 'array', items: uid, maxItems: 10, uniqueItems: true } }, ['webhook_id']), true),
+  spec('webhooks.delete', 'Delete an explicitly selected incoming webhook from this exact group/topic, permanently disabling its push URL. Requester must be group owner/admin; bot must own it or be group owner/admin. Does not delete chat messages. No automatic retry after an unconfirmed response.',
+    schema({ webhook_id: webhookID }, ['webhook_id']), true),
+  spec('webhooks.test', 'SEND a real fixed-text webhook test message to this exact group/topic, including its configured targeted @mentions. Does not broadcast @all or @all-bots. Only on explicit user request to send this test: confirm_send must be true. Requester must be group owner/admin; bot must own the webhook or be group owner/admin. No automatic retry.',
+    schema({ webhook_id: webhookID, confirm_send: { type: 'boolean' } }, ['webhook_id', 'confirm_send']), true),
   spec('members.add', 'Add explicitly requested human UIDs from the configured Space to the current parent group; requester must be group owner/admin.',
     schema({ uids: memberTargets }, ['uids']), true),
   spec('members.remove', 'Remove explicitly requested current members with role 0 from the current parent group. Requester must be group owner/admin; server requires bot_admin. Octo may also remove their bots and thread memberships.',
@@ -169,6 +181,8 @@ export const CHANNEL_API_OPERATIONS = freeze([
     displayEditParameters, true),
   spec('messages.mark_read', 'Mark specified current-channel messages as read by the bot and clear the bot unread count; does not act as the requester.',
     schema({ message_ids: { type: 'array', items: messageID, minItems: 1, maxItems: 10, uniqueItems: true } }, ['message_ids']), true),
+  spec('messages.clear_card_revisions', 'Erase prior revisions of this bot\'s existing display card in the current conversation, retaining the current card and a server audit tombstone. Irreversible history cleanup, only on explicit user request with confirm_clear=true. Verified bot owner only; in groups also requires current group owner/admin. No question, approval, progress or Registry cards. Does not cancel an interaction or delete a message. Never retry an uncertain write.',
+    schema({ message_id: messageID, confirm_clear: { type: 'boolean' } }, ['message_id', 'confirm_clear']), true),
   spec('voice.context.read', 'Owner DM only: read personal voice-correction context in the bot server-selected primary Space, not group/thread settings.'),
   spec('voice.context.update', 'Owner DM only: replace personal voice-correction context in the bot server-selected primary Space.',
     schema({ context: { type: 'string', minLength: 1, maxLength: 10000 } }, ['context']), true),
@@ -188,6 +202,11 @@ const errorHints = Object.freeze({
   api_rate_limited: 'Octo rate-limited this request. Wait before retrying; no automatic retry was attempted.',
   api_server_error: 'Octo reported a server failure. Check the resource state before retrying a mutation.',
   api_request_failed: 'The request failed. Check connectivity/API support and inspect the resource before retrying a mutation.',
+  api_disabled: 'This Octo server has disabled the requested feature. Check its capability/feature configuration; retrying unchanged arguments will not enable it.',
+  api_unavailable: 'The Octo feature or its upstream service is unavailable. Check service health; inspect mutation state before retrying.',
+  api_unsupported: 'This operation or format is unsupported for the current bot type or server capability. Use the documented supported operation.',
+  api_search_not_found: 'The requested search anchor/resource is not available in this visible conversation. Refresh the target; this is not proof of empty history.',
+  api_search_depth_exceeded: 'The search cursor exceeded the server depth limit. Start a new, narrower time or sender search.',
   requester_admin_required: 'The requesting member must be this group owner or administrator; bot ownership grants no extra authority.',
   identity_outside_channel: 'Use an exact UID currently visible in this conversation; directory aliases and bot ownership grant no extra visibility.',
   webhook_outside_channel: 'Select a webhook listed in this exact group or topic.',
@@ -420,8 +439,9 @@ export class ChannelApi {
     try { result = await this.#request(path, body === undefined ? undefined : JSON.stringify(body), signal, { method }) }
     catch (error) {
       if (signal?.aborted) fail('aborted')
-      // OctoClient discards HTTP error bodies. Preserve only known status classes.
-      fail(statusError(error?.status))
+      // The transport brands exact official code/status pairs. All text remains
+      // a static local hint; never expose translated upstream messages/details.
+      fail(apiErrorCode(error))
     }
     if (signal?.aborted) fail('aborted')
     // Never expose a transport exception, HTTP body, nested error, or credentials.
@@ -622,6 +642,68 @@ export class ChannelApi {
     return result
   }
 
+  async #writeWebhook(scope, sender, operation, args, access, signal) {
+    const gate = async current => {
+      if (!admin(current.actor)) fail('requester_admin_required')
+      return (await this.#currentReadScope(scope, current, signal)) + '/incoming-webhooks'
+    }
+    const path = await gate(access)
+    const select = async current => {
+      const rows = webhookRows(await this.#call(path, undefined, signal), scope)
+      const selected = rows.find(row => row.webhook_id === args.webhook_id)
+      if (!selected) fail('webhook_outside_channel')
+      if (selected.creator_uid !== this.#config.botUid && !admin(current.bot)) fail('webhook_bot_permission_required')
+      if (args.mention_uids?.some(target => ['all', 'all_bots'].includes(target)
+        || !current.rows.some(member => member.uid === target))) fail('invalid_mention_target')
+      return selected
+    }
+    const selected = await select(access)
+    // Listing can take time. Re-read current route/roles and the selected row;
+    // then recheck roles once more immediately before the sole mutation.
+    const current = await this.#access(scope, sender, true, signal, true)
+    await gate(current)
+    const latest = await select(current)
+    if (selected.creator_uid !== latest.creator_uid) fail('mutation_permission_changed')
+    const fresh = await this.#access(scope, sender, true, signal, true)
+    await gate(fresh)
+    if (latest.creator_uid !== this.#config.botUid && !admin(fresh.bot)) fail('mutation_permission_changed')
+    if (args.mention_uids?.some(target => !fresh.rows.some(member => member.uid === target))) fail('mutation_permission_changed')
+    const endpoint = path + '/' + args.webhook_id
+    if (operation === 'webhooks.delete') {
+      const raw = await this.#mutation(endpoint, undefined, signal, 'DELETE')
+      if (raw?.status !== 200) fail('mutation_unconfirmed')
+      return { ok: true, webhook_id: args.webhook_id, deleted: true }
+    }
+    if (operation === 'webhooks.test') {
+      const raw = await this.#mutation(endpoint + '/test', undefined, signal, 'POST')
+      if (raw?.status !== 0 || !id(raw.message_id)) fail('mutation_unconfirmed')
+      return { ok: true, webhook_id: args.webhook_id, message_id: id(raw.message_id), ...scope.route,
+        sent: true, targeted_mentions: 'configured_webhook_recipients', broadcast: false }
+    }
+    const { webhook_id, enabled, ...fields } = args
+    if (enabled !== undefined) fields.status = enabled ? 1 : 0
+    const raw = await this.#mutation(endpoint, fields, signal, 'PUT')
+    let result
+    try { result = webhookRows({ list: [raw] }, scope)[0] } catch { fail('mutation_unconfirmed') }
+    if (result.webhook_id !== webhook_id || result.creator_uid !== latest.creator_uid) fail('mutation_unconfirmed')
+    for (const [key, value] of Object.entries(fields)) {
+      const received = raw[key]
+      if (key === 'mention_uids' ? !Array.isArray(received) || received.length !== value.length
+        || new Set(received).size !== value.length
+        || received.some(target => !value.includes(target))
+        : received !== (typeof value === 'boolean' ? Number(value) : value)) fail('mutation_unconfirmed')
+    }
+    return { ok: true, webhook: result }
+  }
+
+  async #mutation(path, body, signal, method = 'POST') {
+    try { return await this.#call(path, body, signal, method) } catch (error) {
+      if (['api_invalid_request', 'api_authentication_failed', 'api_permission_denied', 'api_not_found',
+        'api_method_not_allowed', 'api_conflict', 'api_rate_limited', 'api_disabled', 'api_unsupported'].includes(error?.code)) throw error
+      fail('mutation_unconfirmed')
+    }
+  }
+
   async #rules(path, signal) {
     const raw = await this.#call(path + '/md', undefined, signal)
     if (typeof raw?.content !== 'string' || Buffer.byteLength(raw.content, 'utf8') > 10240
@@ -792,7 +874,14 @@ export class ChannelApi {
     const structuredEdit = structuredEdits.has(operation)
     const identityRead = identityReads.has(operation)
     const scopedRead = identityRead || webhookReads.has(operation)
-    if (scopedRead) args = readArguments(args, definition.parameters)
+    const clearRevisions = operation === 'messages.clear_card_revisions'
+    if (scopedRead || webhookWrites.has(operation) || clearRevisions) args = readArguments(args, definition.parameters)
+    if (operation === 'webhooks.test' && args.confirm_send !== true
+      || clearRevisions && args.confirm_clear !== true) fail('explicit_confirmation_required')
+    if (operation === 'webhooks.update') {
+      if (args.name !== undefined) args.name = webhookName(args.name)
+      if (Object.keys(args).length < 2 || args.name !== undefined && (!args.name || Buffer.byteLength(args.name, 'utf8') > 64)) fail('invalid_arguments')
+    }
     if (identityRead) {
       const targets = operation === 'messages.user_info' ? [args.uid] : args.uids
       if (targets.some(target => ['.', '..'].includes(bareUID(target)))
@@ -827,14 +916,36 @@ export class ChannelApi {
     const voice = operation.startsWith('voice.context.')
     if (voice) this.#requireOwnerDM(scope, sender)
     if (operation === 'groups.create') this.#requireOwner(sender)
+    if (clearRevisions) this.#requireOwner(sender)
     if (!scope.group && !voice && !search && !structuredEdit && !identityRead && !['inspect', 'messages.recent', 'messages.read', 'messages.edit', 'messages.notify',
-      'messages.mark_read', 'space.members.search', 'groups.create'].includes(operation)) fail('group_required')
+      'messages.mark_read', 'messages.clear_card_revisions', 'space.members.search', 'groups.create'].includes(operation)) fail('group_required')
     const thread = operation.startsWith('thread.') ? this.#threadPath(scope, args) : undefined
     const access = await this.#access(scope, sender, definition.mutating, signal, scopedRead)
     const requireAdmin = () => { if (scope.group && !admin(access.actor)) fail('requester_admin_required') }
 
     if (identityRead) return this.#identities(scope, sender, operation, args, access, signal)
     if (webhookReads.has(operation)) return this.#webhooks(scope, sender, operation, args, access, signal)
+    if (webhookWrites.has(operation)) return this.#writeWebhook(scope, sender, operation, args, access, signal)
+    if (clearRevisions) {
+      requireAdmin()
+      const read = async () => {
+        const message = await this.#readMessage(scope, sender, args.message_id, signal, false, 17)
+        if (message.from_uid !== this.#config.botUid) fail('bot_message_required')
+      }
+      await read()
+      // Recheck the actual card after authorization lookup, then current
+      // authority before destructive history cleanup. No cached card identity.
+      const fresh = await this.#access(scope, sender, true, signal)
+      if (scope.group && !admin(fresh.actor)) fail('mutation_permission_changed')
+      await read()
+      this.#requireOwner(sender)
+      const final = await this.#access(scope, sender, true, signal)
+      if (scope.group && !admin(final.actor)) fail('mutation_permission_changed')
+      this.#requireOwner(sender)
+      const raw = await this.#mutation('/v1/bot/message/card/revisions/clear', { ...scope.route, message_id: args.message_id }, signal)
+      if (!Number.isSafeInteger(raw?.cleared) || raw.cleared < 0) fail('mutation_unconfirmed')
+      return { ok: true, message_id: args.message_id, cleared: raw.cleared, current_card_retained: true, audit_tombstone: true }
+    }
 
     if (operation === 'inspect') return { ...scope.route, ...(access.group && { group: access.group }),
       requester_group_admin: admin(access.actor), bot_group_admin: admin(access.bot),

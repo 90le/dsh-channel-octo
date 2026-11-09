@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.10.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.11.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -53,7 +53,7 @@ dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.10.0.tgz
 - `channelPolicy: joined`：删除或清空 `allowedGroupIds` 和 `allowedThreadIds`。接收 Bot 在绑定 Space 已加入的普通群及 Octo 实际投递到 Bot 的子区。
 - `mentionPolicy: octo`：自动用 WebSocket 接收消息。明确 @ 仍有效；免 @ 仅在 Octo 返回父群有效开关为开、发送者是已确认的普通成员、且消息未 @ 其他人时触发。只想开放给好友和群友但保留必需 @，可省略此项。
 
-WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。旧模式仍可使用 `transport: events`；如需在必需 @ 模式使用实时接收，可设置 `transport: websocket`。短时断线会重连，当前版本不主动补拉断线期间漏收的普通群消息。
+WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。旧模式仍可使用 `transport: events`；如需在必需 @ 模式使用实时接收，可设置 `transport: websocket`。短时断线会重连，已登记频道会按持久起点有界补读；从未登记的频道和服务端历史保留范围外的消息不保证恢复。
 
 主区每轮读群规则。默认子区仅加载本区规则；设置 `threadRuleMode: inherit-group` 后，该插件允许的子区先读本区规则，再读父群规则，有冲突时以子区为准。父群继承会使用独立的子区会话，切回默认模式不会携带继承模式的历史。详见[群规则边界](OCTO-COVERAGE.md#群主区与子区规则)。
 
@@ -61,7 +61,7 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
 
-## 0.10.0
+## 0.11.0
 
 账号管理参照 IM Connect 1.0.30。两个插件可共存，各自保留账号、会话与凭据。默认的文字模式可复用已经在 DSH Web 打开的空闲 Octo 会话。同回合混入其他来源的输入时不会向 Octo 转发。
 
@@ -84,6 +84,9 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 - **权限审批**：本轮 DSH 工具发起的审批可在 Octo 中回答。展示已提交的真实工具参数，仅批准一次；拒绝、取消、超时、信息缺失或未完整展示均不执行。审批绑定原发起人、原频道和原生回合，参数含敏感内容时不在 IM 中批准；不改变宿主权限策略，不代替插件安装等其他审批流程。
 - **离线恢复**：从此版本实际收到过的频道建立恢复起点，重连和定时检查按历史顺序补收、去重。恢复失败时暂存新消息并在账号页提示；撤回内容不从暂存区执行。升级前的旧聊天、新频道尚未收到的第一条消息和服务端已丢失的历史不在恢复保证内。
 - **身份与集成诊断**：增加当前会话成员的单个/批量身份查询，以及当前群/子区的 Webhook 列表和投递记录。查询不增加跨群权限，不返回 Webhook 密钥或推送地址，不执行测试推送。
+- **Webhook 管理**：账号设置中打开「管理 Webhook」，选择当前 Bot 所在空间的群或子区，可创建、修改、启停、删除、轮换密钥、查看投递记录，并明确确认后发送测试消息。一次性令牌和适配器地址仅在当前已登录管理界面显示，默认遮盖，关闭或切换频道后清除；不会保存到模型、聊天记录或账号概览。HTTP 局域网入口也可使用，仍须登录与同源校验。模型工具另支持当前群/子区的修改、删除和明确请求的测试发送，实时核对请求者和 Bot 的管理权限。
+- **卡片历史清理**：Bot 所有者可明确要求清除当前会话中 Bot 自己展示卡的修订历史；群内还要求群管理权限。保留当前卡片与服务端审计记录；不清理提问、审批、进度或 Registry 卡片，不会取消正在等待的交互。
+- **明确失败原因**：按官方错误码区分权限不足、功能关闭、服务不可用和搜索边界，兼容部分接口 HTTP 400 内携带其他错误状态的情况。不暴露服务端原始错误、令牌或链接。会话忙、模型缺失、超时和附件失败分别给出中文提示；结果不明时先核对执行状态，不自动重放或要求直接重发。
 - **范围**：User Bot（`bf_`）是当前验收目标。没有通用 App Bot 绑定、任意 Adaptive Card 结构、原生逐字流、任意目标主动发送或 Octo Drive/Docs。详见[双方源码对照与验收边界](IM-CONNECT-PARITY.md)。
 
 自动测试覆盖权限校验、断线重连、收件确认和重复消息去重。隔离 DSH Web 与 IM Connect 共同加载，用模拟 Octo 和模型检查规则、会话隔离和进度卡更新。可另传 Playwright 模块与 Chromium 路径，验证浏览器设置页。
@@ -99,7 +102,9 @@ DSH_OCTO_SMOKE_OWNER=1 DSH_OCTO_SMOKE_GROUP_TOOLS=1 npm run smoke:web -- /absolu
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket /absolute/path/to/playwright-core/index.mjs /absolute/path/to/chrome
 ```
 
-浏览器验收默认与 IM Connect 1.0.30 共存。设置 `DSH_OCTO_SMOKE_CODEX_UI=2.0.19` 或 `DSH_OCTO_SMOKE_AUTOMATION` 可加测指定版本；可选的 `DSH_OCTO_SMOKE_SCREENSHOTS` 指向已存在的截图目录，截图只含测试账号和会话。
+浏览器验收默认与 IM Connect 1.0.30 共存。设置 `DSH_OCTO_SMOKE_WEBHOOK_UI=1` 加测 Webhook 独立管理窗口、确认与密钥清除，所有请求拦截到合成接口，不向正式频道发送测试。设置 `DSH_OCTO_SMOKE_CODEX_UI=2.0.19` 或 `DSH_OCTO_SMOKE_AUTOMATION` 可加测指定版本；可选的 `DSH_OCTO_SMOKE_SCREENSHOTS` 指向已存在的截图目录，截图只含测试账号和会话。
+
+0.11.0 共 628 项自动测试通过，无跳过，包含中英文管理窗口及 390px 窄屏检查。增加 Webhook 管理和当前频道操作、展示卡修订清理及明确错误反馈；修复启动时验证到的 Bot 所有者未同步给频道工具的问题。真实 DSH Web 与 IM Connect 共存的浏览器检查通过，管理窗口的桌面/窄屏截图另行目视检查；功能测试使用合成 Octo 数据，不代表正式平台写操作已经验收。
 
 0.7.0 验证：182 项自动测试通过，无跳过，包含 DSH `0.2.1-rc.5` 原生工具作用域测试。Debian 同版本隔离宿主验证了私聊三题回调、答案进入原生工具结果、答完后继续写文件及完整说明；另验证群成员工具、群提问回调、错误操作者拒绝、群工作区写入、结构化展示卡和最终正文。浏览器与 IM Connect 共存验收覆盖原生菜单、中文设置、连续快速修改的保存顺序、重新打开、令牌更换和账号移除。官方文本组件的 24 组浏览器检查复现了空引用条，未复现正文隐藏；生产客户端中“文件有说明但未显示”的反馈仍需实际复验。这些自动化检查使用模拟 Octo 和模型，不能代替真实平台权限和显示验收。
 

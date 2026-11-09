@@ -2,13 +2,17 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveConfig } from './config.js'
+import { webhookErrors } from './webhook-admin.js'
 
 const path = '/api/dsh-channel-octo'
 const editor = readFileSync(new URL('./account-editor.js', import.meta.url), 'utf8')
 const view = readFileSync(new URL('./account-view.js', import.meta.url), 'utf8')
-const uiVersion = createHash('sha256').update(editor).update(view).digest('hex').slice(0, 16)
+const webhookView = readFileSync(new URL('./webhook-view.js', import.meta.url), 'utf8')
+const uiVersion = createHash('sha256').update(editor).update(view).update(webhookView).digest('hex').slice(0, 16)
 const modules = new Map([[path + '/account-editor.js', editor],
-  [path + '/account-view.js', view.replace('./account-editor.js', './account-editor.js?v=' + uiVersion)]])
+  [path + '/webhook-view.js', webhookView],
+  [path + '/account-view.js', view.replace('./account-editor.js', './account-editor.js?v=' + uiVersion)
+    .replace('./webhook-view.js', './webhook-view.js?v=' + uiVersion)]])
 const editable = ['senderPolicy', 'channelPolicy', 'mentionPolicy', 'threadRuleMode',
   'allowedUids', 'allowedGroupIds', 'allowedThreadIds', 'progress', 'timeoutMs']
 
@@ -80,6 +84,7 @@ async function body(req) {
 }
 
 const accountErrors = {
+  ...webhookErrors,
   accounts_unavailable: 503, credential_provider_unavailable: 503,
   account_not_found: 404, account_changed: 409, account_transition: 409, duplicate_bot: 409,
   invalid_account: 400, invalid_bot_token: 400, bot_identity_mismatch: 400, bot_verification_failed: 400,
@@ -119,7 +124,20 @@ export function registerWeb(ctx, accounts) {
         if (req.method === 'POST' && target === path + '/accounts/verify') {
           return send(200, await accounts.verify(input?.token))
         }
-        const match = /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})(?:\/(settings|state|diagnose|reconnect|remove|commands))?$/.exec(target)
+        const match = /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})(?:\/(settings|state|diagnose|reconnect|remove|commands|webhooks))?$/.exec(target)
+        if (req.method === 'POST' && match?.[2] === 'webhooks') {
+          const controller = new AbortController()
+          const disconnected = () => { if (!res.writableEnded) controller.abort() }
+          res.once?.('close', disconnected)
+          try {
+            const result = await accounts.manageWebhooks(match[1], input, controller.signal)
+            // Recheck the host session before disclosing a one-time credential.
+            const rejection = connection.requestRejection(req)
+            if (rejection !== undefined) return send(rejection, { error: 'authentication_required' })
+            if (!controller.signal.aborted) return send(200, result)
+            return
+          } finally { res.off?.('close', disconnected) }
+        }
         if (req.method === 'PUT' && (target === path + '/settings' || match?.[2] === 'settings')) {
           return send(200, await accounts.saveRules(match?.[1], input))
         }
