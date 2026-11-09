@@ -9,6 +9,7 @@ import { Store } from './store.js'
 import { channelView, loadSettings } from './web.js'
 import { normalizeImControls } from './im-controls.js'
 import { Worker } from './worker.js'
+import { sessionExists } from './session-state.js'
 
 const legacy = 'legacy'
 const textOnly = 'text-only'
@@ -213,6 +214,7 @@ export class Accounts {
       },
     })
     runtime.stopped = (async () => {
+      await this.reconcileSessions(runtime)
       if (attachExisting && record.id === legacy && !config.sessionProfile) {
         for (const row of store.overview().conversations) {
           signal.throwIfAborted()
@@ -265,6 +267,20 @@ export class Accounts {
     })()
     runtime.transition = operation
     if (!inFlight) await operation
+  }
+
+  async reconcileSessions(onlyRuntime) {
+    for (const runtime of onlyRuntime ? [onlyRuntime] : this.runtimes.values()) {
+      for (const sessionId of runtime.store.knownSessions()) {
+        try {
+          if (await sessionExists(this.ctx, sessionId, this.lifetime.signal) === false
+            && this.runtimes.get(runtime.record.id) === runtime) runtime.store.forgetSession(sessionId)
+        } catch {
+          if (!this.lifetime.signal.aborted) this.log.info('session_inventory_unavailable')
+          break
+        }
+      }
+    }
   }
 
   publicAccount(record) {

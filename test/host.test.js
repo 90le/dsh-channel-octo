@@ -60,6 +60,22 @@ test('DSH scopes tools and only forwards the result of the claimed turn', async 
   assert.deepEqual(calls[0], ['resume', agentId])
 })
 
+test('only a confirmed missing native session permits recovery without replaying a turn', async () => {
+  const { ctx, agentId } = fakeHost()
+  const host = new DshHost(ctx, '/fixture', 1000)
+  const session = { session_id: agentId, created: 1 }
+  for (const [name, expected] of [['SessionPersistenceNotFoundError', 'session_missing'],
+    ['SessionPersistenceCorruptionError', 'session_open_failed'], ['Error', 'session_open_failed']]) {
+    ctx.agents.resume = async () => { throw Object.assign(new Error('fixture'), { name, sessionId: agentId }) }
+    await assert.rejects(host.run(session, 'hello', () => assert.fail('must not create'),
+      new AbortController().signal), { message: expected })
+  }
+  ctx.agents.resume = async () => { throw Object.assign(new Error('fixture'),
+    { name: 'SessionPersistenceNotFoundError', sessionId: 'unrelated' }) }
+  await assert.rejects(host.run(session, 'hello', () => assert.fail('must not create'),
+    new AbortController().signal), { message: 'session_open_failed' })
+})
+
 test('account model, reasoning and preset are applied, and group turns remain tool-free', async () => {
   const { ctx, calls, agentId } = fakeHost()
   const optionsSeen = []

@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.6.3.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.6.4.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -61,7 +61,7 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
 
-## 0.6.3
+## 0.6.4
 
 账号管理参照 IM Connect 1.0.30。两个插件可共存，各自保留账号、会话与凭据。默认的文字模式可复用已经在 DSH Web 打开的空闲 Octo 会话。同回合混入其他来源的输入时不会向 Octo 转发。
 
@@ -71,6 +71,7 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 - **发送方式**：默认排队。启用「插话发送」后，同一获准使用工具的私聊用户可在 WebSocket 下补充文字。附件准备期间，补充要求与附件一起交给模型；模型已开始时，DSH 在可插话的下一步接收补充。其他来源的会话继续按原方式处理。
 - **渠道设置**：选择账号后独立配置群聊/子区名单、@ 触发、子区规则、进度和超时。普通配置保存后对新消息立即生效，不中断当前任务；修改工作区、模型或权限会在需要时开新 DSH 会话，旧会话仍可查看。
 - **侧栏 → Octo**：有宿主扩展页签时，显示一个 Octo 页签；没有时，在侧栏底部提供「Octo 频道」入口。私聊、群聊和子区自动归档；可按类型筛选、搜索并打开原生 DSH 会话。原生 Octo 页签的「…」和右键打开同一组宿主会话操作。
+- **删除会话后继续聊天**：频道列表以 DSH 原生会话是否存在为准，正常刷新会移除已删除项。下一条 Octo 消息自动创建新会话，不再尝试恢复已删除的会话；原消息的去重和投递回执保留。宿主读取失败、格式损坏或会话忙不会当成删除。
 - **进度**：长回复优先使用 Octo 推理过程模板，或使用展示卡；卡片不可用时回退到“正在输入”。卡片显示 DSH 的真实步骤、工具执行结果、文件交付数量和耗时，不包含模型原始推理或工具参数。进度失败不阻止正文；明确失败有提示，旧任务不会自动重放。
 
 - **文件**：启用账号的文件选项后，已通过准入的私聊、群聊和子区可以接收文件、图片、GIF、语音和视频附件。图片是否可识别取决于所选模型；其他非文本媒体保留为 DSH 附件，不自动转录。发送仅限已启用工具的授权私聊，且仅发送本轮通过 DSH 正式交付的工作区文件。默认每个文件上限 16 MiB；部署需配置确切的 `mediaDownloadOrigins`、`mediaUploadOrigins` HTTPS 来源。文件上传与消息投递任一步无法确认时不会自动重放。
@@ -85,6 +86,7 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 ```sh
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js events
+DSH_OCTO_SMOKE_DELETE=1 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket /absolute/path/to/playwright-core/index.mjs /absolute/path/to/chrome
 ```
 

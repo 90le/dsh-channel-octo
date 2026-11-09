@@ -1,11 +1,14 @@
 import { wirePeer } from './wukong-fixture.mjs'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, renameSync } from 'node:fs'
+import { basename, join, resolve, relative, isAbsolute } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 
 let received = 0
 let sent = 0
 let openedCard = false
 const ownerSmoke = process.env.DSH_OCTO_FIXTURE_OWNER === '1'
+const deleteSmoke = process.env.DSH_OCTO_FIXTURE_DELETE === '1'
 let ownerStep = 0, uploaded = false, questionAnswered = false
 const browserReady = process.env.DSH_OCTO_BROWSER_READY
 const group = '00112233445566778899aabbccddeeff'
@@ -13,7 +16,27 @@ const thread = '123456789012345678'
 const routes = [
   [1, 'fixture-user'], [1, 'fixture-user'],
   [2, group], [5, group + '____' + thread], [2, group],
+  ...(deleteSmoke ? [[1, 'fixture-user']] : []),
 ]
+function removeFirstFixtureSession() {
+  const root = resolve(process.env.DSH_HOME)
+  if (!/^dsh-octo-smoke-/.test(basename(root))) throw new Error('Not an isolated fixture home')
+  const db = new DatabaseSync(join(process.env.DSH_OCTO_FIXTURE_STATE, 'channel.sqlite'), { readOnly: true })
+  let id
+  try { id = db.prepare("SELECT session_id FROM jobs WHERE message_id='1'").get()?.session_id } finally { db.close() }
+  if (!/^session-[a-f0-9-]{36}$/.test(id ?? '')) throw new Error('Missing fixture identity')
+  const dirs = readdirSync(join(root, 'sessions'), { withFileTypes: true }).filter(row => row.isDirectory())
+  const source = dirs.map(row => resolve(root, 'sessions', row.name, id)).find(dir => existsSync(dir))
+  const destination = resolve(root, 'removed-fixture-session')
+  if (!source || [source, destination].some(dir => {
+    const path = relative(root, dir)
+    return !path || isAbsolute(path) || path.startsWith('..')
+  })) throw new Error('Fixture session is outside its isolated home')
+  // Preserve the synthetic log outside the host's session root to reproduce
+  // the durable result of deletion without erasing any data.
+  renameSync(source, destination)
+  console.log('FIXTURE_SESSION_REMOVED')
+}
 const peer = process.env.DSH_OCTO_FIXTURE_WIRE === '1' ? await wirePeer() : null
 function nextMessage() {
   const [type, address] = routes[received]
@@ -21,9 +44,9 @@ function nextMessage() {
   return {
     messageId: String(received), sender: 'fixture-user', channelType: type, channelId: address, seq: 10 * received,
     payload: ownerSmoke && received === 1 ? { type: 8, url: 'file/preview/chat/fixture/note.txt', name: 'note.txt' }
-      : received === 3 ? {
+      : received === 3 || deleteSmoke && received === 2 ? {
         type: 14,
-        content: [{ type: 'text', text: 'fixture prompt 3' }, { type: 'image', url: '/api/v1/file/preview/chat/fixture/test.png' }],
+        content: [{ type: 'text', text: 'fixture prompt ' + received }, { type: 'image', url: '/api/v1/file/preview/chat/fixture/test.png' }],
         mention: { entities: [{ uid: 'fixture-bot', offset: 0, length: 3 }] },
       } : {
       type: 1, content: 'fixture prompt ' + received,
@@ -80,7 +103,8 @@ globalThis.fetch = async (input, init) => {
     }
     if (url.pathname.endsWith('/file/download/chat/fixture/test.png')) {
       console.log('FIXTURE_RICH_IMAGE_DOWNLOADED')
-      return new Response(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/eioAAAAASUVORK5CYII=', 'base64'),
+      if (deleteSmoke && received === 2) console.log('FIXTURE_POST_DELETE_IMAGE')
+      return new Response(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMQMgkDAAD4AJ3MaiF4AAAAAElFTkSuQmCC', 'base64'),
         { headers: { 'Content-Type': 'image/png' } })
     }
     if (url.pathname.endsWith('/groups') && url.searchParams.get('space_id') === 'fixture-space') {
@@ -156,6 +180,7 @@ globalThis.fetch = async (input, init) => {
         return new Response(null, { status: 400 })
       }
       sent++
+      if (deleteSmoke && sent === 1) removeFirstFixtureSession()
       console.log('FIXTURE_REPLY_OK=' + sent)
       return json({ message_id: 100 + sent })
     }
@@ -176,7 +201,7 @@ globalThis.fetch = async (input, init) => {
     const history = JSON.stringify(body.messages)
     const tail = JSON.stringify(body.messages.at(-1))
     const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
-    const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-5])/g)).at(-1)?.[1] ?? 0)
+    const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-6])/g)).at(-1)?.[1] ?? 0)
     if (ownerSmoke && round === 1 && ownerStep < 3) {
       const names = (body.tools ?? []).map(tool => tool.name)
       if (!names.includes('write') || !names.includes('present') || !names.includes('ask_user_question')) {
@@ -215,18 +240,19 @@ globalThis.fetch = async (input, init) => {
     const snapshot = body.messages.filter(m => m.role === 'user').flatMap(m =>
       typeof m.content === 'string' ? [m.content] : m.content.map(c => c.text ?? ''),
     ).filter(text => text.includes('Octo 当前会话规则快照')).at(-1) ?? ''
-    const rulesOk = round <= 2 ? !snapshot
+    const rulesOk = round <= 2 || round === 6 ? !snapshot
       : round === 3 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && !snapshot.includes('THREAD-FIXTURE')
         : round === 4 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && snapshot.includes('THREAD-FIXTURE')
           : snapshot.includes('"status":"empty"') && !snapshot.includes('PARENT-FIXTURE') && !snapshot.includes('THREAD-FIXTURE')
-    const historyOk = round <= 2 ? !/GROUP-HISTORY-FIXTURE|TOPIC-HISTORY-FIXTURE/.test(history)
+    const historyOk = round <= 2 || round === 6 ? !/GROUP-HISTORY-FIXTURE|TOPIC-HISTORY-FIXTURE/.test(history)
       : round === 4 ? history.includes('TOPIC-HISTORY-FIXTURE') && history.includes('TOPIC-QUOTE-FIXTURE') && !history.includes('GROUP-HISTORY-FIXTURE')
         : history.includes('GROUP-HISTORY-FIXTURE') && !history.includes('TOPIC-HISTORY-FIXTURE')
     if (round && ((body.tools ?? []).length !== 0 && !(ownerSmoke && round <= 2)
       || !rulesOk || !historyOk || /FUTURE-HISTORY-FIXTURE|WRONG-ROUTE-FIXTURE/.test(history)
       || JSON.stringify(body.system ?? '').includes('PARENT-FIXTURE')
-      || (round === 2 && !history.includes('fixture response 1'))
-      || (round >= 3 && /fixture (prompt|response) [1-2]/.test(history))
+      || (round === 2 && (deleteSmoke ? history.includes('fixture response 1') : !history.includes('fixture response 1')))
+      || (round >= 3 && round !== 6 && /fixture (prompt|response) [1-2]/.test(history))
+      || (round === 6 && (!history.includes('fixture response 2') || history.includes('fixture response 1')))
       || (round === 4 && /fixture (prompt|response) 3/.test(history))
       || (round === 5 && (!history.includes('fixture response 3') || /fixture (prompt|response) 4/.test(history))))) {
       console.error('FIXTURE_MODEL_CONTEXT_OR_TOOLS_WRONG round=' + round + ' rules=' + rulesOk + ' tools=' + (body.tools ?? []).length)

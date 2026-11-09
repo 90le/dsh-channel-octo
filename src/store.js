@@ -160,6 +160,20 @@ export class Store {
   }
 
   sessionCreated(sender) { this.db.prepare('UPDATE conversations SET created=1 WHERE sender=?').run(sender) }
+  knownSessions() {
+    return this.db.prepare(`SELECT session_id FROM conversations WHERE created=1
+      UNION SELECT session_id FROM conversation_history`).all().map(row => row.session_id)
+  }
+  forgetSession(sessionId) {
+    // Forget only the routing/display mapping. Delivery receipts still prevent
+    // replay, and existing native sessions/history are never deleted here.
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('DELETE FROM conversations WHERE session_id=?').run(sessionId)
+      this.db.prepare('DELETE FROM conversation_history WHERE session_id=?').run(sessionId)
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
   overview() {
     const conversations = this.db.prepare(`
       WITH known AS (

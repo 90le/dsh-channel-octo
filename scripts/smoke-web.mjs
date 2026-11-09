@@ -21,6 +21,9 @@ const wire = process.argv[3] !== 'events'
 const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
 const ownerSmoke = process.env.DSH_OCTO_SMOKE_OWNER === '1'
+const deleteSmoke = process.env.DSH_OCTO_SMOKE_DELETE === '1'
+const includeImConnect = !ownerSmoke && process.env.DSH_OCTO_SMOKE_CORE_ONLY !== '1'
+if (deleteSmoke && (ownerSmoke || browserModule)) throw new Error('Deletion smoke uses an isolated headless profile')
 if (ownerSmoke && (!wire || browserModule)) throw new Error('Owner tool smoke uses headless WebSocket')
 const screenshots = process.env.DSH_OCTO_SMOKE_SCREENSHOTS
 const codexUi = process.env.DSH_OCTO_SMOKE_CODEX_UI
@@ -37,6 +40,8 @@ Object.assign(env, {
   DSH_HOME: home, DSH_OCTO_BOT_TOKEN: 'bf_fixture', DEEPSEEK_API_KEY: 'sk-fixture-for-local-smoke',
   DSH_TELEMETRY_DISABLED: '1',
   DSH_OCTO_FIXTURE_OWNER: ownerSmoke ? '1' : '0',
+  DSH_OCTO_FIXTURE_DELETE: deleteSmoke ? '1' : '0',
+  DSH_OCTO_FIXTURE_STATE: state,
   DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
   ...(browserModule && { DSH_OCTO_BROWSER_READY: browserReady }),
 })
@@ -60,7 +65,7 @@ try {
   const packed = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
   const { filename } = Array.isArray(packed) ? packed[0] : packed['dsh-channel-octo']
   if (typeof filename !== 'string' || !/^dsh-channel-octo-\d+\.\d+\.\d+\.tgz$/.test(filename)) throw new Error('Unexpected fixture package')
-  for (const spec of [join(home, filename), ...(ownerSmoke ? [] : ['@michengai/dsh-im-connect@1.0.30']),
+  for (const spec of [join(home, filename), ...(includeImConnect ? ['@michengai/dsh-im-connect@1.0.30'] : []),
     ...(codexUi ? ['@michengai/dsh-codex-ui@' + codexUi] : []),
     ...(automation ? ['@michengai/dsh-automation@' + automation] : [])]) {
     node([cli, 'plugin', '--profile', 'web', 'add', spec, '--registry=https://registry.npmjs.org/'])
@@ -71,6 +76,12 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 export const name = 'octo-fixture-observer'
 export const inject = ['agents', 'agentPresets', 'agentDefaultModel']
 export function apply(ctx) {
+  if (process.env.DSH_OCTO_FIXTURE_DELETE === '1') ctx.on('session/event', (_session, event) => {
+    const content = event.type === 'user/message' && event.data.content
+    if (Array.isArray(content) && content.some(part => part.type === 'text' && part.text?.includes('fixture prompt 2'))) {
+      console.log('FIXTURE_NATIVE_IMAGE=' + content.some(part => part.type === 'image' && part.attachment))
+    }
+  }, { global: true })
   ctx.logger.exporter({ levels: { default: 2 }, export: ({ name, args }) => {
     if (name === 'dsh-channel-octo' && ['dsh_session_reused', 'session_busy', 'session_preset_conflict', 'bot_verified', 'octo_ws_connected', 'file_not_presented', 'file_tools_unavailable', 'worker_stopped: internal_error',
       'delivery_not_confirmed', 'file_delivery_not_confirmed', 'agent_run_not_confirmed', 'no_confirmed_final_text', 'shared_turn_not_forwarded', 'workspace_attach_failed',
@@ -327,7 +338,7 @@ export function apply(ctx) {
   }
   // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
   const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
-  const expectedReceipts = ownerSmoke ? 6 : 5
+  const expectedReceipts = ownerSmoke || deleteSmoke ? 6 : 5
   while (Date.now() < replyDeadline && child.exitCode === null && sentCount() !== expectedReceipts) await delay(200)
   if (sentCount() !== expectedReceipts) {
     let jobs = []
@@ -361,11 +372,26 @@ export function apply(ctx) {
     } finally { db.close() }
     console.log('PASS: file and follow-up shared one round; native question resumed from Octo, then DSH wrote and delivered identical file bytes.')
   }
-  if (!ownerSmoke) {
+  if (deleteSmoke) {
+    const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
+    try {
+      const rows = db.prepare("SELECT session_id FROM jobs WHERE message_id IN ('1','2','6') ORDER BY seq").all()
+      if (rows.length !== 3 || rows[0].session_id === rows[1].session_id || rows[1].session_id !== rows[2].session_id
+        || db.prepare('SELECT 1 FROM conversations WHERE session_id=?').get(rows[0].session_id)
+        || db.prepare('SELECT 1 FROM conversation_history WHERE session_id=?').get(rows[0].session_id)) {
+        throw new Error('Deleted session was retained or resumed')
+      }
+    } finally { db.close() }
+    if (!output.includes('FIXTURE_SESSION_REMOVED') || !output.includes('FIXTURE_POST_DELETE_IMAGE')
+      || !output.includes('FIXTURE_NATIVE_IMAGE=true')) throw new Error('Deletion or native image fixture did not run: '
+        + (output.match(/FIXTURE_[^\r\n]+/g) ?? []).join('; '))
+    console.log('PASS: deleted native session is forgotten; rich image+text and subsequent text use a fresh session.')
+  }
+  if (includeImConnect) {
     const imLog = readFileSync(join(home, 'dsh-im-connect', 'gateway.log'), 'utf8')
     if (!imLog.includes('API 已注册') || !imLog.includes('attachMappedSessions')) throw new Error('IM Connect did not initialize')
   }
-  console.log('PASS: DSH Web' + (ownerSmoke ? '' : ' + IM Connect') + '; '
+  console.log('PASS: DSH Web' + (includeImConnect ? ' + IM Connect' : '') + '; '
     + (wire ? 'Octo friends/members with @ and no-@ over WebSocket' : 'explicit @ over HTTP events')
     + '; channel rules and isolated histories.')
 } finally {

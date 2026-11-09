@@ -74,7 +74,7 @@ const textCommands = {
 
 const hostIssues = new Set(['session_busy', 'session_timeout', 'session_preset_conflict',
   'missing_host_model', 'shared_turn_not_forwarded', 'prompt_discarded', 'no_confirmed_final_text',
-  'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context',
+  'session_missing', 'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context',
   'missing_scoped_tool_controls', 'missing_host_permission', 'session_requires_owned_writer', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
 
 export class Worker {
@@ -284,6 +284,10 @@ export class Worker {
           ])
           const { attachments, order } = material
           let session = this.store.session(conversation, config.idleMinutes)
+          if (session.created && await host.exists?.(session.session_id, signal) === false) {
+            this.store.forgetSession(session.session_id)
+            session = this.store.session(conversation)
+          }
           if (this.isArchived?.(session.session_id)) session = this.store.session(conversation, config.idleMinutes, Date.now(), true)
           this.store.running(job.seq, session.session_id)
           const isFileOnly = attachments.length > 0 && !job.input.trim()
@@ -311,7 +315,7 @@ export class Worker {
           ] : order
           const authorCard = safeCommand(config, job) && !attachments.length
             && /卡片|\bcard\b/iu.test(input)
-          reply = await host.run(session, input, async () => {
+          const run = () => host.run(session, input, async () => {
             this.store.sessionCreated(conversation)
             await this.attach?.(session.session_id, config.cwd)
           }, signal, rules,
@@ -327,6 +331,16 @@ export class Worker {
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
               ...(toolsAllowed && config.transport === 'websocket'
                 && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })
+          try { reply = await run() }
+          catch (error) {
+            // The native session can be deleted between stat and resume. Only
+            // this explicit pre-run failure permits creating a new session.
+            if (error?.message !== 'session_missing') throw error
+            this.store.forgetSession(session.session_id)
+            session = this.store.session(conversation)
+            for (const seq of [job.seq, ...merged]) this.store.running(seq, session.session_id)
+            reply = await run()
+          }
           if (channelType === 1 && asksForFile(input) && !deliverables?.length) {
             const issue = !config.allowFiles ? 'files_disabled' : !toolsAllowed || config.toolPermission === 'text-only'
               ? 'file_tools_unavailable' : 'file_not_presented'

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { ruleContext } from './rules.js'
 import { prepareInput } from './dsh-media.js'
+import { sessionExists } from './session-state.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
@@ -21,6 +22,7 @@ export class DshHost {
   constructor(ctx, cwd, timeoutMs, profile = {}) {
     Object.assign(this, { ctx, cwd, timeoutMs, profile })
   }
+  exists(sessionId, signal) { return sessionExists(this.ctx, sessionId, signal) }
 
   async run(session, text, onCreated, lifetime, rules, onStage = () => {}, timeoutMs = this.timeoutMs, toolsAllowed = false, extras = {}) {
     const signal = AbortSignal.any([lifetime, AbortSignal.timeout(timeoutMs)])
@@ -156,6 +158,10 @@ export class DshHost {
       return reply
     } catch (error) {
       if (signal.aborted && !lifetime.aborted) throw new Error('session_timeout')
+      if (failure === 'session_open_failed' && session.created && error?.name === 'SessionPersistenceNotFoundError'
+        && error.sessionId === session.session_id) {
+        throw new Error('session_missing', { cause: error })
+      }
       if (classified.has(error?.message) || error?.name === 'SessionAlreadyOwnedError') throw error
       throw new Error(failure, { cause: error })
     } finally {

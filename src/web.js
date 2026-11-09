@@ -101,6 +101,7 @@ export function registerWeb(ctx, accounts) {
       if (rejected !== undefined) return send(rejected, { error: 'authentication_required' })
       const target = new URL(req.url ?? '/', 'http://localhost').pathname
       if (req.method === 'GET' && target === path) {
+        await accounts.reconcileSessions?.()
         return send(200, { ...accounts.overview(), accountUiVersion: uiVersion })
       }
       if (req.method === 'GET' && modules.has(target)) {
