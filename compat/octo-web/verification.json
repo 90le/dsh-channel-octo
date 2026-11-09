@@ -1,17 +1,61 @@
 {
-  "verifiedAt": "2026-11-09T12:28:09.095Z",
+  "verifiedAt": "2026-11-09T20:38:02.919416+00:00",
   "pin": "7ace0e96df36a2c03657178564c182fc23af6e25",
-  "patchSha256": "53504909459577e43545b5803762ab45ebc6fa959b6bc2cf4d5a127d04403d4a",
-  "cleanCloneApply": true,
-  "appliedFilesByteIdentical": 3,
+  "patchSha256": "fd4e89caca04b93d3478bb8d35e5b771d9d49ac77191ccb77df1a0d52429455c",
+  "cleanCheckoutApply": true,
+  "appliedFilesByteIdentical": 4,
   "officialCloneClean": true,
   "unitTestsPassed": 26,
-  "helperStrictTypecheck": "passed; helper only",
+  "vmAndHelperTestsPassed": 110,
+  "helperStrictTypecheck": "passed on current helper",
   "targetedReviewPassed": true,
   "originalScenarios": 32,
   "baselineExactlyMatchesOriginal": true,
   "unchangedControls": 26,
   "lossCasesFixed": 6,
   "additionalScenarios": 32,
-  "patchedScenarios": 64
+  "patchedScenarios": 64,
+  "workspaceVerification": {
+    "platform": "Windows x64",
+    "node": "24.15.0",
+    "pnpm": "10.32.0",
+    "frozenLockfileInstall": true,
+    "productionWebBuild": "passed; compiled history reconciliation and request-owned scroll intent present",
+    "moduleTests": {
+      "files": 584,
+      "passed": 6277,
+      "failed": 1,
+      "skipped": 0,
+      "total": 6278,
+      "exitCode": 1,
+      "remainingFailure": "chat-composer/ui/__tests__/dependencyBoundary.test.ts uses forward-slash matching for Windows-relative paths; reproduced on unchanged baseline"
+    },
+    "coveragePct": {
+      "statements": 75.46,
+      "branches": 68.28,
+      "functions": 71.47,
+      "lines": 77.18
+    },
+    "coverageThresholdsMet": true,
+    "baselineFocusedComparison": {
+      "passed": 79,
+      "failed": 1,
+      "total": 80
+    },
+    "typecheck": {
+      "baselineErrors": 7214,
+      "patchedErrors": 7214,
+      "addedDiagnostics": 0,
+      "removedDiagnostics": 0,
+      "comparison": "same frozen dependencies; exact diagnostics, shifted vm.ts and messageOrder.test.ts locations compared by source expression and column"
+    },
+    "independentScrollReview": {
+      "passed": 15,
+      "unselected": 77,
+      "extraReentrancyAndSupersessionProbes": 8,
+      "sourceUnchanged": true
+    },
+    "regressionFixed": "Keep unread/down-arrow state during fetch; bind scroll intent to its exact request and require the known latest message to be loaded.",
+    "fullClientCI": "not run; local module tests and Web build do not replace official Linux Node22 CI or live client acceptance"
+  }
 }

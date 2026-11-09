@@ -1,3 +1,87 @@
+diff --git a/packages/dmworkbase/src/Components/Conversation/__tests__/messageOrder.test.ts b/packages/dmworkbase/src/Components/Conversation/__tests__/messageOrder.test.ts
+index bfc5f59297c72351135f754eb6ca34760f67d0c7..528c86384dfa50417d1e52ad1617b5f07690cffc 100644
+--- a/packages/dmworkbase/src/Components/Conversation/__tests__/messageOrder.test.ts
++++ b/packages/dmworkbase/src/Components/Conversation/__tests__/messageOrder.test.ts
+@@ -1305,6 +1305,79 @@ describe("ConversationVM message ordering", () => {
+         expect(sdkState.markConversationUnread).not.toHaveBeenCalled()
+     })
+ 
++    it.each([
++        { name: "the latest message arrives", sequence: 11, scrolls: true },
++        { name: "the response is still behind", sequence: 10, scrolls: false },
++        { name: "the response is empty", sequence: 0, scrolls: false },
++    ])("preserves unread state while fetching and scrolls only when $name", async ({ sequence, scrolls }) => {
++        const vm = new ConversationVM(channel)
++        const loaded = wrap(rawMessage(10))
++        sdkState.conversation = { channel, lastMessage: rawMessage(11), unread: 1 }
++        vm.messagesOfOrigin = [loaded]
++        vm.lastMessage = loaded
++        vm.browseToMessageSeq = 9
++        vm.unreadCount = 1
++        vm.showScrollToBottomBtn = true
++        let resolve!: (messages: ReturnType<typeof rawMessage>[]) => void
++        sdkState.syncMessages.mockImplementationOnce(() => new Promise(done => { resolve = done }))
++
++        const request = vm.onDownArrow()
++        expect(vm.showScrollToBottomBtn).toBe(true)
++        expect(vm.unreadCount).toBe(1)
++        expect(sdkState.scrollToBottom).not.toHaveBeenCalled()
++        expect(sdkState.markConversationUnread).not.toHaveBeenCalled()
++        resolve(sequence ? [rawMessage(sequence)] : [])
++        await request
++
++        expect(sdkState.scrollToBottom.mock.calls.length > 0).toBe(scrolls)
++        if (!scrolls) {
++            expect(vm.showScrollToBottomBtn).toBe(true)
++            expect(vm.browseToMessageSeq).toBe(9)
++            expect(vm.unreadCount).toBe(1)
++            expect(sdkState.markConversationUnread).not.toHaveBeenCalled()
++        }
++    })
++
++    it("preserves unread state after a latest-message fetch fails", async () => {
++        const vm = new ConversationVM(channel)
++        const loaded = wrap(rawMessage(10))
++        sdkState.conversation = { channel, lastMessage: rawMessage(11), unread: 1 }
++        vm.messagesOfOrigin = [loaded]
++        vm.lastMessage = loaded
++        vm.browseToMessageSeq = 9
++        vm.unreadCount = 1
++        vm.showScrollToBottomBtn = true
++        sdkState.syncMessages.mockRejectedValueOnce(new Error("offline"))
++
++        await expect(vm.onDownArrow()).rejects.toThrow("offline")
++
++        expect(vm.showScrollToBottomBtn).toBe(true)
++        expect(vm.browseToMessageSeq).toBe(9)
++        expect(vm.unreadCount).toBe(1)
++        expect(sdkState.scrollToBottom).not.toHaveBeenCalled()
++        expect(sdkState.markConversationUnread).not.toHaveBeenCalled()
++    })
++
++    it("does not carry a superseded down-arrow request's scroll intent into background sync", async () => {
++        const vm = new ConversationVM(channel)
++        const loaded = wrap(rawMessage(10))
++        sdkState.conversation = { channel, lastMessage: rawMessage(11), unread: 1 }
++        vm.messagesOfOrigin = [loaded]
++        vm.lastMessage = loaded
++        vm.showScrollToBottomBtn = true
++        let resolve!: (messages: ReturnType<typeof rawMessage>[]) => void
++        sdkState.syncMessages.mockImplementationOnce(() => new Promise(done => { resolve = done }))
++        const firstRequest = vm.onDownArrow()
++        sdkState.syncMessages.mockResolvedValueOnce([rawMessage(11)])
++
++        await vm.syncMessages()
++        resolve([rawMessage(11)])
++        await firstRequest
++
++        expect(sdkState.scrollToBottom).not.toHaveBeenCalled()
++        expect(vm.showScrollToBottomBtn).toBe(true)
++    })
++
+     it("resolves subscriber readiness for direct conversations and populated groups", async () => {
+         const direct = new ConversationVM(new Channel("u1", 1))
+         await expect(direct.ensureSubscribersLoaded()).resolves.toBeUndefined()
 diff --git a/packages/dmworkbase/src/Components/Conversation/historySnapshot.test.ts b/packages/dmworkbase/src/Components/Conversation/historySnapshot.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..1b4515c3d5128e05e7ca4cbc309e05bfdf052167
@@ -331,7 +415,7 @@ index 0000000000000000000000000000000000000000..73b32b5133d91fac531675d7c52f4d50
 +    }
 +}
 diff --git a/packages/dmworkbase/src/Components/Conversation/vm.ts b/packages/dmworkbase/src/Components/Conversation/vm.ts
-index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84a800a2f9 100644
+index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0cd3375742804635363f1e81eccd37c2a24b7ed8 100644
 --- a/packages/dmworkbase/src/Components/Conversation/vm.ts
 +++ b/packages/dmworkbase/src/Components/Conversation/vm.ts
 @@ -66,6 +66,7 @@ import {
@@ -347,7 +431,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
      pulldownFinished: boolean = false // 下拉完成
      pendingMessages: MessageWrap[] = [] // 缓冲区：pullupHasMore 期间收到的实时消息
 +    private historySyncVersion = 0
-+    private historySync?: { journal: HistorySnapshot<MessageWrap>; preserveWindow: boolean }
++    private historySync?: { journal: HistorySnapshot<MessageWrap>; preserveWindow: boolean; scrollToLatest?: boolean }
      messageContainerId = `viewport-${ConversationVM.nextMessageContainerSeq++}` // 消息容器的ID
      static sendQueue: Map<string, Array<MessageWrap>> = new Map() // 发送队列
      static foldSessionPreview: Map<string, { participants: string[], count: number }> = new Map() // 会话列表折叠预览缓存
@@ -394,15 +478,23 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          this.readSyncRevision++
          this.readSyncDisposed = true
          this.pendingUnreadClearSeq = undefined
-@@ -1437,6 +1446,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -1437,7 +1446,14 @@ export default class ConversationVM extends ProviderListener {
              this.showScrollToBottomBtn = false
              await this.refreshNewMsgCount({ reconcileRead: true })
          } else {
-+            this.showScrollToBottomBtn = false // Explicit jump-to-latest may scroll after its fetch.
-             return this.requestMessagesOfFirstPage(0)
+-            return this.requestMessagesOfFirstPage(0)
++            const version = this.historySyncVersion + 1
++            const request = this.requestMessagesOfFirstPage(0)
++            // Keep the unread affordance until this exact fetch has caught up.
++            // A reentrant or subsequent request must not inherit the scroll intent.
++            if (version === this.historySyncVersion && this.historySync) {
++                this.historySync.scrollToLatest = true
++            }
++            return request
          }
  
-@@ -1736,6 +1746,9 @@ export default class ConversationVM extends ProviderListener {
+     }
+@@ -1736,6 +1752,9 @@ export default class ConversationVM extends ProviderListener {
              return
          }
          for (const messageExtra of messageExtras) {
@@ -412,7 +504,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
              this.updateReplyMessageContent(messageExtra)
              const message = this.findMessageWithMessageID(messageExtra.messageID)
              if (message) {
-@@ -1878,8 +1891,18 @@ export default class ConversationVM extends ProviderListener {
+@@ -1878,8 +1897,18 @@ export default class ConversationVM extends ProviderListener {
  
      // 向列表追加消息
      appendMessage(messageWrap: MessageWrap) {
@@ -431,7 +523,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          if (this.pullupHasMore) {
              // 缓存消息，等 pullupHasMore 变 false 后追加，避免消息丢失 (#246)
              this.pendingMessages.push(messageWrap)
-@@ -1897,13 +1920,8 @@ export default class ConversationVM extends ProviderListener {
+@@ -1897,13 +1926,8 @@ export default class ConversationVM extends ProviderListener {
              this.pendingMessages = []
          }
          // 去重：避免实时消息与历史拉取竞态导致同一条消息重复出现
@@ -447,7 +539,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          if (!alreadyExists) {
              this.messagesOfOrigin.push(messageWrap)
          }
-@@ -2128,6 +2146,46 @@ export default class ConversationVM extends ProviderListener {
+@@ -2128,6 +2152,46 @@ export default class ConversationVM extends ProviderListener {
          return 0
      }
  
@@ -494,7 +586,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
      // 同步消息
      async syncMessages(
          initMessageSeq?: number,
-@@ -2135,6 +2193,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2135,6 +2199,7 @@ export default class ConversationVM extends ProviderListener {
          locateOffsetY: number = 0,
          highlightLocatedMessage: boolean = false,
      ) {
@@ -502,7 +594,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          this.loading = true
          this.liveFoldRevokeClientMsgNos.clear()
          this.notifyListener()
-@@ -2158,10 +2217,13 @@ export default class ConversationVM extends ProviderListener {
+@@ -2158,10 +2223,13 @@ export default class ConversationVM extends ProviderListener {
              }
          }
          const remoteMessages = await WKApp.conversationProvider.syncMessages(this.channel, opts).catch((error) => {
@@ -516,7 +608,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
  
          const newMessages = new Array<Message>()
          if (remoteMessages && remoteMessages.length > 0) {
-@@ -2186,12 +2248,10 @@ export default class ConversationVM extends ProviderListener {
+@@ -2186,12 +2254,12 @@ export default class ConversationVM extends ProviderListener {
          } else {
              this.pullupHasMore = false;
          }
@@ -527,13 +619,15 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
 -            this.pendingMessages = []
 -        }
 +        allMessages = this.mergeHistorySnapshot(allMessages, remoteMessages || [])
-+        const scrollBottom = !this.historySync?.preserveWindow && !this.pullupHasMore
-+            && !this.showScrollToBottomBtn
++        const latestKnownSeq = Math.max(this.conversationLastMessageSeq(), this.lastMessage?.messageSeq || 0)
++        const hasLatest = latestKnownSeq <= 0 || allMessages.some(message => message.messageSeq >= latestKnownSeq)
++        const scrollBottom = !this.historySync?.preserveWindow && !this.pullupHasMore && hasLatest
++            && (this.historySync?.scrollToLatest || !this.showScrollToBottomBtn)
 +        this.historySync = undefined
          let initMessage: MessageWrap | undefined
          if (initMessageSeq && initMessageSeq > 0) {
              for (const message of allMessages) {
-@@ -2206,7 +2266,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2206,7 +2274,7 @@ export default class ConversationVM extends ProviderListener {
          }
  
          this.messagesOfOrigin = allMessages
@@ -542,7 +636,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
              this.loading = false
              if (stateCallback) {
                  stateCallback()
-@@ -2214,7 +2274,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2214,7 +2282,7 @@ export default class ConversationVM extends ProviderListener {
              // loading 完成后，主动确保 bot 消息的 channelInfo 已载入
              // 修复：loading 期间 channelInfoListener 会被跳过，导致 AI 标识不显示
              this.ensureBotChannelInfos()
@@ -551,7 +645,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
      }
  
      async requestMessagesAroundMessageSeq(messageSeq: number, stateCallback?: () => void) {
-@@ -2225,6 +2285,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2225,6 +2293,7 @@ export default class ConversationVM extends ProviderListener {
              return
          }
  
@@ -559,7 +653,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          this.loading = true
          this.initLocateMessageSeq = 0
          this.liveFoldRevokeClientMsgNos.clear()
-@@ -2246,10 +2307,13 @@ export default class ConversationVM extends ProviderListener {
+@@ -2246,10 +2315,13 @@ export default class ConversationVM extends ProviderListener {
              WKApp.conversationProvider.syncMessages(this.channel, olderOpts),
              WKApp.conversationProvider.syncMessages(this.channel, newerOpts),
          ]).catch((error) => {
@@ -573,7 +667,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          const toAvailableMessageWraps = (remoteMessages?: Message[]) => {
              const messages = new Array<Message>()
              if (remoteMessages && remoteMessages.length > 0) {
-@@ -2287,13 +2351,12 @@ export default class ConversationVM extends ProviderListener {
+@@ -2287,13 +2359,12 @@ export default class ConversationVM extends ProviderListener {
              this.pullupHasMore = newerRemoteCount >= newerOpts.limit
          }
  
@@ -590,7 +684,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
              this.loading = false
              if (stateCallback) {
                  stateCallback()
-@@ -2349,8 +2412,9 @@ export default class ConversationVM extends ProviderListener {
+@@ -2349,8 +2420,9 @@ export default class ConversationVM extends ProviderListener {
      }
  
      // 刷新消息列表并定位到某条消息
@@ -601,7 +695,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
              if (locateMessage) {
                  this.scrollToMessage(locateMessage, locateOffsetY)
              } else if (scrollBottom) {
-@@ -2466,6 +2530,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2466,6 +2538,7 @@ export default class ConversationVM extends ProviderListener {
          const previousScrollTop = viewport?.scrollTop || 0
          const previousScrollHeight = viewport?.scrollHeight || 0
  
@@ -609,7 +703,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          this.loading = true
          const opts = new SyncMessageOptions()
          opts.limit = WKApp.config.pageSizeOfMessage
-@@ -2473,10 +2538,12 @@ export default class ConversationVM extends ProviderListener {
+@@ -2473,10 +2546,12 @@ export default class ConversationVM extends ProviderListener {
          opts.startMessageSeq = minMessage.messageSeq - 1
  
          let remoteMessages = await WKApp.conversationProvider.syncMessages(this.channel, opts).catch((error) => {
@@ -622,7 +716,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          const newMessages = new Array<Message>()
          if (remoteMessages && remoteMessages.length > 0) {
              remoteMessages.forEach(msg => {
-@@ -2492,6 +2559,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2492,6 +2567,7 @@ export default class ConversationVM extends ProviderListener {
          this.messagesOfOrigin = ConversationVM.deduplicateMessages(this.messagesOfOrigin)
          this.messagesOfOrigin = this.sortMessages(this.messagesOfOrigin)
          this.refreshMessages(this.messagesOfOrigin, () => {
@@ -630,7 +724,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
              const nextViewport = document.getElementById(this.messageContainerId) as HTMLElement | null
              if (nextViewport) {
                  nextViewport.scrollTop = getPulldownRestoredScrollTop({
-@@ -2515,6 +2583,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2515,6 +2591,7 @@ export default class ConversationVM extends ProviderListener {
              return
          }
  
@@ -638,7 +732,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          this.loading = true
          const opts = new SyncMessageOptions()
          opts.limit = WKApp.config.pageSizeOfMessage
-@@ -2522,10 +2591,12 @@ export default class ConversationVM extends ProviderListener {
+@@ -2522,10 +2599,12 @@ export default class ConversationVM extends ProviderListener {
          opts.startMessageSeq = maxMessage.messageSeq
  
          let remoteMessages = await WKApp.conversationProvider.syncMessages(this.channel, opts).catch((error) => {
@@ -651,7 +745,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
          const newMessages = new Array<Message>()
          if (remoteMessages && remoteMessages.length > 0) {
              remoteMessages.forEach(msg => {
-@@ -2548,7 +2619,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2548,7 +2627,7 @@ export default class ConversationVM extends ProviderListener {
          this.messagesOfOrigin = ConversationVM.deduplicateMessages(this.messagesOfOrigin)
          this.refreshAndLocateMessages(this.messagesOfOrigin, undefined, false, () => {
              this.loading = false
@@ -660,7 +754,7 @@ index 224ebac3ae0c5924fec9433bf45a94c33ecb681f..0edb60bcfded8a88129fc715648c4c84
      }
  
      // 获取当前消息列表的最小序列号的消息
-@@ -2642,7 +2713,7 @@ export default class ConversationVM extends ProviderListener {
+@@ -2642,7 +2721,7 @@ export default class ConversationVM extends ProviderListener {
      distinctMessages(messages: Array<MessageWrap>) {
          for (let i = 0; i < messages.length; i++) {
              for (let j = i + 1; j < messages.length; j++) {
