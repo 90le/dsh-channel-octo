@@ -313,7 +313,28 @@ export class Worker {
 
   async ingest(signal, cardsOnly = false) {
     await this.flushCardAcks(signal)
-    const events = await this.api.events(signal, this.cursor)
+    if (cardsOnly === 'recover') this.store.activateEventRecovery()
+    const recovery = cardsOnly === 'recover' ? this.store.eventRecovery() : undefined
+    if (recovery) {
+      for (const id of this.store.pendingMessageEventAcks()) {
+        await this.ackMessageEvent(id, signal)
+      }
+      if (!this.eventRecoveryStarted) {
+        this.cursor = recovery.ready ? '0' : recovery.bootstrapCursor
+        this.eventRecoveryStarted = true
+        this.eventRescanAt = Date.now() + 60000
+        this.eventBootstrapPages = 0
+      }
+    }
+    // Alternate a fixed older prefix with forward pages. A continuously busy
+    // tail must not starve late lower IDs, nor should revisits starve that tail.
+    if (recovery?.ready && !this.eventRevisit && Date.now() >= this.eventRescanAt) {
+      this.eventRevisit = { cursor: '0', upper: this.cursor }
+      this.eventRevisitTurn = true
+    }
+    const revisit = recovery?.ready && this.eventRevisitTurn ? this.eventRevisit : undefined
+    if (this.eventRevisit) this.eventRevisitTurn = !revisit
+    const events = await this.api.events(signal, revisit?.cursor ?? this.cursor, recovery ? { wait: 0 } : undefined)
     const ordered = events.slice().sort((a, b) => {
       const aa = BigInt(decimalId(a?.event_id) ?? 0), bb = BigInt(decimalId(b?.event_id) ?? 0)
       return aa < bb ? -1 : aa > bb ? 1 : 0
@@ -322,7 +343,8 @@ export class Worker {
       signal.throwIfAborted()
       const id = decimalId(event?.event_id)
       if (!id) throw new OctoError('invalid_event_id')
-      if (BigInt(id) <= BigInt(this.cursor)) continue
+      if (revisit && BigInt(id) > BigInt(revisit.upper)) { revisit.cursor = revisit.upper; break }
+      if (BigInt(id) <= BigInt(revisit?.cursor ?? this.cursor)) continue
       const action = parseCardAction(event)
       if (action) {
         const binding = this.store.cardBinding(action.messageId) ?? this.store.deferredCard?.(action.messageId)
@@ -371,14 +393,61 @@ export class Worker {
           } else this.store.claimCard(selection, message)
           await this.ackCardEvent(id, signal)
         } else if (this.store.hasEvent(id)) await this.ackCardEvent(id, signal)
+      } else if (recovery?.ready && !this.stopIntake) {
+        const message = admit(event, this.config)
+        if (message) {
+          // Events only discover a route. Fetch current history before creating
+          // work so queued old/edited/revoked bodies cannot bypass recovery.
+          // Existing routes retain WS question/steering ownership and their own
+          // sequence checkpoints; the event consumer does not inject live text.
+          const timestamp = event.message.timestamp
+          const known = this.store.inboxRoute(message.channelType, message.channelId)
+          if ((!known || known.since_ms > 0 && message.messageSeq <= known.floor_seq)
+            && channelSequence(message.messageSeq) && this.inbox.enabled
+            && Number.isSafeInteger(timestamp) && timestamp * 1000 > recovery.startedAt
+            && timestamp * 1000 <= Date.now() + 300000) {
+            this.store.seedInboxEvent(id, message)
+          }
+          if (this.store.queueMessageEventAck(id, message.messageId)) {
+            await this.ackMessageEvent(id, signal)
+          }
+        }
       } else if (!cardsOnly) {
         const message = admit(event, this.config)
         if (message && !this.stopIntake) this.inbox.receive(id, message)
         await this.api.ack(id, signal)
       }
-      // In WebSocket mode this poll consumes only this plugin's own card actions.
-      // Never backfill old chat messages or ACK events owned by another integration.
-      this.cursor = id
+      // Typed events without this plugin's binding remain owned by their caller.
+      // Message event ACKs require a durable inbox/discovery receipt.
+      if (revisit) revisit.cursor = id
+      else this.cursor = id
+      if (recovery && !recovery.ready) this.store.advanceEventBootstrap(id)
+    }
+    if (recovery) {
+      if (!recovery.ready && (!events.length || ++this.eventBootstrapPages >= 20)) {
+        // Initialization is bounded even if the queue stays busy. The activation
+        // timestamp, never this scan baseline, rejects pre-activation commands.
+        this.store.finishEventBootstrap()
+        this.cursor = '0'
+        this.eventRescanAt = Date.now() + 60000
+      } else if (revisit && (!events.length || BigInt(revisit.cursor) >= BigInt(revisit.upper))) {
+        this.eventRevisit = undefined
+        this.eventRescanAt = Date.now() + 60000
+      }
+      this.store.eventRecoveryFailed(false)
+      if (events.length) await delay(250, undefined, { signal })
+    }
+  }
+
+  async ackMessageEvent(id, signal) {
+    if (!this.store.messageEventAckDue(id)) return
+    try {
+      await this.api.ack(id, signal)
+      this.store.messageEventAcked(id)
+    } catch (error) {
+      signal.throwIfAborted()
+      this.store.messageEventAckFailed(id)
+      this.log('octo_message_ack_retry')
     }
   }
 
@@ -909,7 +978,10 @@ export class Worker {
       try {
         await this.deferredFeedback(signal)
         const late = Date.now() >= (this.lateCardPollAt ?? 0) && this.store.hasDeferredCards?.()
-        if (this.store.hasOpenCard() || late) {
+        const recover = this.config.botKind !== 'app' && typeof this.api.events === 'function'
+          && this.inbox.enabled && typeof this.store.eventRecovery === 'function'
+        if (recover) await this.ingest(signal, 'recover')
+        else if (this.store.hasOpenCard() || late) {
           this.lateCardPollAt = Date.now() + 30000
           await this.ingest(signal, true)
         }
@@ -922,6 +994,7 @@ export class Worker {
         failures = 0
       } catch (error) {
         if (signal.aborted) return
+        if (this.config.botKind !== 'app') this.store.eventRecoveryFailed?.(true)
         this.log('card_action_poll_failed')
         await delay(Math.max(error?.retryAfterMs ?? 0, Math.min(30_000, 1000 * 2 ** Math.min(5, ++failures))), undefined, { signal })
       }
@@ -932,6 +1005,7 @@ export class Worker {
     const stop = new AbortController()
     const signal = AbortSignal.any([lifetime, stop.signal])
     this.intakeSignal = signal
+    if (this.config.botKind !== 'app' && this.inbox.enabled) this.store.activateEventRecovery?.()
     const accept = m => {
       signal.throwIfAborted()
       const candidate = admit({ message: {

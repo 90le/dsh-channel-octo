@@ -93,6 +93,8 @@ const caption = {
   processing: ['处理中…', 'Processing…'],
   inboxRecovering: ['正在补收断线期间的消息，按原频道顺序处理。', 'Recovering offline messages in channel order.'],
   inboxUnavailable: ['部分频道的消息恢复暂不可用，正在重试。该频道的新消息已暂存。', 'Recovery is unavailable for some channels. Retrying; new messages there are stored.'],
+  eventRecoveryStarting: ['正在准备离线消息补收，实时收信仍按当前设置处理。', 'Preparing offline message recovery. Live intake still follows the current settings.'],
+  eventRecoveryFailed: ['离线消息补收暂不可用，正在重试。请留意消息处理状态。', 'Offline message recovery is unavailable and retrying. Check the message processing status.'],
   failure: ['操作未完成，请稍后重试。', 'Could not complete the request. Try again.'],
   account_transition: ['账号正在切换连接，请稍后再试。', 'The account is changing its connection. Try again shortly.'],
   account_changed: ['账号设置已在别处更新，请重新打开设置后再试。', 'The account changed elsewhere. Reopen its settings and try again.'],
@@ -375,6 +377,9 @@ export function createAccountView(React, primitives, { request, status, label })
       notice && h('p', { className: 'dsho-alert dsho-account-list-note', role: 'alert' }, notice),
       open && current?.inbox?.recoveringRoutes > 0 && h('p', { className: 'dsho-account-list-note', role: 'status' },
         tr(current.inbox.failedRoutes ? 'inboxUnavailable' : 'inboxRecovering')),
+      open && current?.eventRecovery && (!current.eventRecovery.ready || current.eventRecovery.failed)
+        && h('p', { className: 'dsho-account-list-note', role: 'status' },
+          tr(current.eventRecovery.failed ? 'eventRecoveryFailed' : 'eventRecoveryStarting')),
       open && current?.counts?.length > 0 && h('div', { className: 'dsho-counts' }, ...current.counts.map(row =>
         h('span', { key: row.state }, (label(row.state, lang) || label('review', lang)) + ' ' + row.total))),
       modal && (!modal.id || selected) && h(Modal, { key: modal.id ?? 'new', account: selected, data, lang, tr, publish, refresh,

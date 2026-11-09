@@ -207,8 +207,8 @@ test('changing the followed host default model rejects old forms before acceptan
   })
 })
 
-test('production card poll ACKs late terminal events after the last form is closed, with no new run', async t => {
-  const f = await fixture(t), stop = new AbortController()
+test('App card-only poll ACKs late terminal events after the last form is closed, with no new run', async t => {
+  const f = await fixture(t, 1, true), stop = new AbortController()
   f.events = [f.submit()]
   f.store.closeDeferredCard(f.published.message_id, 'cancelled', '已取消')
   assert.equal(f.store.hasOpenCard(), false)

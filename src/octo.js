@@ -296,6 +296,12 @@ export class OctoClient {
         || type === 1 && row.from_uid !== id && row.from_uid !== config.botUid) throw new OctoError('invalid_inbox_response')
       seen.add(seq); ids.add(messageId); last = Math.max(last, seq)
       if (latest) continue
+      if (route.since_ms > 0) {
+        if (!Number.isSafeInteger(row.timestamp) || row.timestamp <= 0 || row.timestamp * 1000 > Date.now() + 300000) {
+          throw new OctoError('invalid_inbox_timestamp')
+        }
+        if (row.timestamp * 1000 <= route.since_ms) { suppressed.push(messageId); continue }
+      }
       if ([row.revoke, row.revoked, row.is_deleted, row.extra?.revoke, row.message_extra?.revoke].some(flag)) { suppressed.push(messageId); continue }
       let payload = row.message_extra?.content_edit ?? row.extra?.content_edit ?? row.payload
       if (typeof payload === 'string') {
@@ -311,19 +317,31 @@ export class OctoClient {
     return { last, messages: messages.sort((a, b) => a.messageSeq - b.messageSeq), count: seen.size, observed: [...ids], suppressed }
   }
 
-  async events(signal, cursor = '0') {
+  async events(signal, cursor = '0', options = {}) {
     const started = Date.now()
     if (cursor !== '0' && !decimalId(cursor)) throw new OctoError('invalid_event_id')
+    const { wait = this.wait } = options
+    if (!Number.isInteger(wait) || wait < 0 || wait > 30) throw new OctoError('invalid_event_wait')
     const result = await this.#request('/v1/bot/events', '{"event_id":' + cursor
-      + ',"limit":20,"wait":' + JSON.stringify(this.wait) + '}', signal, {
-      timeout: (this.wait + 10) * 1000,
+      + ',"limit":20,"wait":' + JSON.stringify(wait) + '}', signal, {
+      timeout: (wait + 10) * 1000,
     })
     if (result?.status !== 1 || (result.results !== null && !Array.isArray(result.results))) {
       throw new OctoError('invalid_events_response')
     }
     const batch = result.results ?? []
     if (!batch.length && Date.now() - started < 750) await delay(750, undefined, { signal })
-    return batch
+    return batch.map(event => {
+      const message = event?.message
+      // Only ordinary /events DMs omit BOTH channel fields in the official DTO.
+      // Preserve typed events and explicit routes (including type-1 wire IDs);
+      // partial/null fields must never be repaired into an admitted DM.
+      if (!message || typeof message !== 'object' || Array.isArray(message)
+        || Object.hasOwn(event, 'event_type') || message.payload?.event != null
+        || Object.hasOwn(message, 'channel_type') || Object.hasOwn(message, 'channel_id')
+        || !validUid(message.from_uid)) return event
+      return { ...event, message: { ...message, channel_type: 1, channel_id: message.from_uid } }
+    })
   }
 
   async ack(id, signal) {

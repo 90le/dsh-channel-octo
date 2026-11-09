@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.18.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.19.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -53,13 +53,23 @@ dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.18.0.tgz
 - `channelPolicy: joined`：删除或清空 `allowedGroupIds` 和 `allowedThreadIds`。接收 Bot 在绑定 Space 已加入的普通群及 Octo 实际投递到 Bot 的子区。
 - `mentionPolicy: octo`：自动用 WebSocket 接收消息。明确 @ 仍有效；免 @ 仅在 Octo 返回父群有效开关为开、发送者是已确认的普通成员、且消息未 @ 其他人时触发。只想开放给好友和群友但保留必需 @，可省略此项。
 
-WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。旧模式仍可使用 `transport: events`；如需在必需 @ 模式使用实时接收，可设置 `transport: websocket`。短时断线会重连，已登记频道会按持久起点有界补读；从未登记的频道和服务端历史保留范围外的消息不保证恢复。
+WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。旧模式仍可使用 `transport: events`；如需在必需 @ 模式使用实时接收，可设置 `transport: websocket`。短时断线会重连，已登记频道会按持久起点有界补读。0.19 为 User Bot 增加离线新私聊及群/子区明确 @ 消息的发现；依赖事件和历史均仍可读取，详情见下方边界。
 
 主区每轮读群规则。默认子区仅加载本区规则；设置 `threadRuleMode: inherit-group` 后，该插件允许的子区先读本区规则，再读父群规则，有冲突时以子区为准。父群继承会使用独立的子区会话，切回默认模式不会携带继承模式的历史。详见[群规则边界](OCTO-COVERAGE.md#群主区与子区规则)。
 
 需要为测试 profile 设置可用的 DSH 模型。使用独立 Bot，不与其他连接程序同时消费其事件；启用后会确认该 Bot 收到的事件，超出当前支持范围的事件不进入模型。暂停时将 `enabled` 改回 `false` 并按环境流程重载 Web；本地状态和会话保留。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
+
+## 0.19.0
+
+User Bot 的 WebSocket 连接由同一 worker 辅助读取 Bot 事件，用来发现离线期间的新私聊、群或子区点名消息。只登记频道和持久确认责任，实际正文从当前历史接口读取，再按现有好友/成员、群触发及工具权限执行。不会直接执行过期事件正文，也不把它当成当前提问答案或插话。
+
+首次真正启动恢复时记录时间界限；旧积压不自动执行，重启保留原界限。初始化最多扫描 20 页，再按时间界限过滤；前扫新消息与回查固定旧区间交替进行，持续有新消息也不会阻止较小 ID 的回查。分页使用不等待请求，单条确认失败独立退避。已发现但历史暂缺的消息持续阻止该频道放行，直到读到有效内容或明确撤回记录；其他频道可继续处理。账号页显示初始化或恢复失败状态。
+
+这不是全量离线同步：未知免 @ 群/子区消息、App Bot 普通私聊、服务端未入队/已过期或被其他消费者确认的消息，不在此发现保证内。时钟偏差与秒级时间边界、持续高负载、历史保留和迟发布仍有局限。不要用同一 Bot 启动第二个消费者。正式 Octo 客户端的长期离线验收单独跟踪。
+
+1583 项完整回归及 Debian 同版本原生宿主的 User Bot、App Bot、跨进程表单和离线发现四组隔离验证通过。离线发现使用真实 DSH 三次进程启动，确认当前正文、工具结果、文件字节、完整说明及重复消息不再执行；Octo 与模型使用合成接口，不代替正式客户端验收。
 
 ## 0.18.0
 

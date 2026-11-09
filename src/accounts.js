@@ -303,6 +303,8 @@ export class Accounts {
     const runtime = this.runtimes.get(record.id)
     const overview = runtime?.store.overview()
     const config = channelView(runtime?.settings.config)
+    const eventRecovery = record.enabled && runtime?.settings.config.transport === 'websocket'
+      && runtime.settings.config.botKind !== 'app' ? runtime.store.eventRecovery?.() : undefined
     return {
       id: record.id, legacy: record.id === legacy, label: record.label, enabled: record.enabled,
       botUid: record.botUid, spaceId: record.spaceId, cwd: record.cwd, transport: record.transport,
@@ -314,6 +316,7 @@ export class Accounts {
       status: runtime?.status ?? (record.enabled ? 'invalid_configuration' : 'disabled'),
       ...normalizeImControls({ ...this.deployment, ...record }),
       config, revision: runtime?.settings.revision(), counts: overview?.counts ?? [], inbox: overview?.inbox,
+      ...(eventRecovery && { eventRecovery: { ready: eventRecovery.ready, failed: eventRecovery.failed } }),
       conversations: (overview?.conversations ?? []).map(row => ({ ...row, accountId: record.id, accountLabel: record.label })),
     }
   }

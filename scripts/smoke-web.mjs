@@ -25,10 +25,11 @@ const ownerSmoke = process.env.DSH_OCTO_SMOKE_OWNER === '1'
 const groupToolsSmoke = process.env.DSH_OCTO_SMOKE_GROUP_TOOLS === '1'
 const delegatedSmoke = process.env.DSH_OCTO_SMOKE_DELEGATED_SEARCH === '1'
 const deferredSmoke = process.env.DSH_OCTO_SMOKE_DEFERRED === '1'
+const eventRecoverySmoke = process.env.DSH_OCTO_SMOKE_EVENT_RECOVERY === '1'
 if (delegatedSmoke && !ownerSmoke) throw new Error('Delegated search smoke requires owner fixture mode')
 if (groupToolsSmoke && !ownerSmoke) throw new Error('Group tools smoke requires owner mode')
 const deleteSmoke = process.env.DSH_OCTO_SMOKE_DELETE === '1'
-const includeImConnect = !deferredSmoke && !appBotSmoke && !ownerSmoke && process.env.DSH_OCTO_SMOKE_CORE_ONLY !== '1'
+const includeImConnect = !eventRecoverySmoke && !deferredSmoke && !appBotSmoke && !ownerSmoke && process.env.DSH_OCTO_SMOKE_CORE_ONLY !== '1'
 if (appBotSmoke && (ownerSmoke || groupToolsSmoke || delegatedSmoke || deleteSmoke || !wire || browserModule)) {
   throw new Error('AppBot smoke requires its own headless WebSocket scenario; do not combine USER fixture modes')
 }
@@ -37,6 +38,10 @@ if (ownerSmoke && (!wire || browserModule)) throw new Error('Owner tool smoke us
 const screenshots = process.env.DSH_OCTO_SMOKE_SCREENSHOTS
 const codexUi = process.env.DSH_OCTO_SMOKE_CODEX_UI
 const automation = process.env.DSH_OCTO_SMOKE_AUTOMATION
+if (eventRecoverySmoke && (deferredSmoke || appBotSmoke || ownerSmoke || groupToolsSmoke || delegatedSmoke || deleteSmoke
+  || !wire || browserModule || codexUi || automation || process.env.DSH_OCTO_SMOKE_WEBHOOK_UI === '1')) {
+  throw new Error('Event recovery smoke requires its own headless User Bot WebSocket scenario')
+}
 if (deferredSmoke && (appBotSmoke || ownerSmoke || groupToolsSmoke || delegatedSmoke || deleteSmoke
   || !wire || browserModule || codexUi || automation || process.env.DSH_OCTO_SMOKE_WEBHOOK_UI === '1')) {
   throw new Error('Deferred smoke requires its own headless WebSocket scenario')
@@ -59,8 +64,10 @@ Object.assign(env, {
   DSH_OCTO_FIXTURE_DELEGATED_SEARCH: delegatedSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_DELETE: deleteSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_DEFERRED: deferredSmoke ? '1' : '0',
+  DSH_OCTO_FIXTURE_EVENT_RECOVERY: eventRecoverySmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_STATE: state,
   DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
+  ...(eventRecoverySmoke && { npm_config_offline: 'true', npm_config_audit: 'false', npm_config_update_notifier: 'false' }),
   ...(browserModule && { DSH_OCTO_BROWSER_READY: browserReady }),
 })
 const common = { cwd: project, env, windowsHide: true, encoding: 'utf8', timeout: 50_000 }
@@ -153,6 +160,14 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 export const name = 'octo-fixture-observer'
 export const inject = ['agents', 'agentPresets', 'agentDefaultModel']
 export function apply(ctx) {
+  if (process.env.DSH_OCTO_FIXTURE_EVENT_RECOVERY === '1') ctx.on('session/event', (session, event) => {
+    if (event.type === 'turn/start' || event.type === 'turn/end') {
+      console.log('FIXTURE_EVENT_NATIVE=' + JSON.stringify({ type: event.type, sessionId: session.id,
+        reason: event.data.reason?.kind }))
+    }
+    if (event.type === 'tool/result') console.log(event.data.message?.isError
+      ? 'FIXTURE_EVENT_FAIL=NATIVE_TOOL_RESULT' : 'FIXTURE_EVENT_NATIVE_TOOL_OK')
+  }, { global: true })
   if (process.env.DSH_OCTO_FIXTURE_DEFERRED === '1') ctx.on('session/event', (session, event) => {
     if (event.type === 'turn/start' || event.type === 'turn/end') {
       console.log('FIXTURE_DEFERRED_NATIVE=' + JSON.stringify({ type: event.type, sessionId: session.id,
@@ -209,7 +224,7 @@ export function apply(ctx) {
   })
 }
 `)
-  if (ownerSmoke || deferredSmoke) {
+  if (ownerSmoke || deferredSmoke || eventRecoverySmoke) {
     mkdirSync(state, { mode: 0o700 })
     writeFileSync(join(state, 'accounts.json'), JSON.stringify({
       version: 1, endpoint: 'https://octo-fixture.invalid/api', accounts: [{
@@ -236,14 +251,14 @@ export function apply(ctx) {
     '    apiBase: https://octo-fixture.invalid/api',
     ...(appBotSmoke ? ['    botUid: app_fixture_bot', '    botKind: app', '    spaceId: null']
       : ['    botUid: fixture-bot', '    spaceId: fixture-space']),
-    ...(appBotSmoke || deferredSmoke ? ['    senderPolicy: octo', '    transport: websocket', '    progress: off'] : wire
+    ...(appBotSmoke || deferredSmoke || eventRecoverySmoke ? ['    senderPolicy: octo', '    transport: websocket', '    progress: off'] : wire
       ? ['    senderPolicy: octo', '    channelPolicy: joined', '    mentionPolicy: octo']
       : ['    allowedUids: [fixture-user]',
         '    allowedGroupIds: ["00112233445566778899aabbccddeeff"]',
         '    allowedThreadIds: ["00112233445566778899aabbccddeeff____123456789012345678"]']),
     '    threadRuleMode: inherit-group', '    allowFiles: true',
     '    hostPermissions: [read-only, workspace-write, danger-full-access, auto]',
-    ...(ownerSmoke || appBotSmoke || deferredSmoke ? ['    mediaDownloadOrigins: ["https://files-fixture.invalid"]',
+    ...(ownerSmoke || appBotSmoke || deferredSmoke || eventRecoverySmoke ? ['    mediaDownloadOrigins: ["https://files-fixture.invalid"]',
       '    mediaUploadOrigins: ["https://storage-fixture.invalid"]'] : []),
     '    cwd: ' + q(home), '    stateDir: ' + q(state), '    timeoutMs: 22000',
     '- id: llm-deepseek', '  config:', '    baseURL: https://model-fixture.invalid',
@@ -254,7 +269,7 @@ export function apply(ctx) {
   ], { ...common, stdio: ['ignore', 'pipe', 'pipe'] })
   child = launch()
   let output = ''
-  for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(deferredSmoke ? -100_000 : -12_000) })
+  for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(deferredSmoke || eventRecoverySmoke ? -100_000 : -12_000) })
   const deadline = Date.now() + 85_000
   if (browserModule) {
     const { chromium } = await import(pathToFileURL(resolve(browserModule)).href)
@@ -521,7 +536,11 @@ export function apply(ctx) {
       console.log('PASS: protected Webhook native settings UI ' + JSON.stringify(await runWebhookUiSmoke(page)))
     }
   }
-  if (deferredSmoke) {
+  if (eventRecoverySmoke) {
+    const { assertEventRecoverySmoke } = await import('./event-recovery-fixture.mjs')
+    await assertEventRecoverySmoke({ home, state, child, output: () => output,
+      restart: () => { child = launch(); return child } })
+  } else if (deferredSmoke) {
     const { assertDeferredSmoke } = await import('./deferred-fixture.mjs')
     await assertDeferredSmoke({ home, state, child, output: () => output,
       restart: () => { child = launch(); return child } })

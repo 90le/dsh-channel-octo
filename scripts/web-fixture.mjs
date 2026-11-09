@@ -6,7 +6,10 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
 
 // AppBot is a separate fixture, not a relaxation of any USER-mode assertion.
-if (process.env.DSH_OCTO_FIXTURE_DEFERRED === '1') {
+if (process.env.DSH_OCTO_FIXTURE_EVENT_RECOVERY === '1') {
+  const { installEventRecoveryFixture } = await import('./event-recovery-fixture.mjs')
+  await installEventRecoveryFixture()
+} else if (process.env.DSH_OCTO_FIXTURE_DEFERRED === '1') {
   const { installDeferredFixture } = await import('./deferred-fixture.mjs')
   await installDeferredFixture()
 } else if (process.env.DSH_OCTO_FIXTURE_APP_BOT === '1') await appBotFixture()
@@ -575,7 +578,7 @@ globalThis.fetch = async (input, init) => {
         }
         return json({ status: 1, results: [...questionEvents.values()].filter(event => BigInt(event.event_id) > cursor) })
       }
-      if (peer) return new Response(null, { status: 403 })
+      if (peer) return json({ status: 1, results: [] })
       if (received < routes.length && received === sent) {
         const m = nextMessage()
         return json({status:1, results:[{event_id:received, message:{

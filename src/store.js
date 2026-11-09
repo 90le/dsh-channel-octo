@@ -3,6 +3,10 @@ import { mkdirSync, lstatSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+function isDecimalInt64(id) {
+  return typeof id === 'string' && /^[1-9]\d{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n
+}
+
 export class Store {
   constructor(dir, identity) {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -65,6 +69,7 @@ export class Store {
           floor_seq INTEGER NOT NULL, checkpoint INTEGER NOT NULL,
           blocked INTEGER NOT NULL DEFAULT 0, checked_ms INTEGER NOT NULL DEFAULT 0,
           retry_ms INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+          since_ms INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(channel_type, channel_id)
         );
         CREATE TABLE IF NOT EXISTS inbox_staged (
@@ -72,13 +77,36 @@ export class Store {
           message_seq INTEGER NOT NULL, event_id TEXT NOT NULL, message TEXT NOT NULL, live INTEGER NOT NULL, question_key TEXT
         );
         CREATE TABLE IF NOT EXISTS inbox_seen (message_id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS event_recovery (
+          id INTEGER PRIMARY KEY CHECK(id=1), ready INTEGER NOT NULL DEFAULT 0,
+          baseline TEXT NOT NULL DEFAULT '0', bootstrap_cursor TEXT NOT NULL DEFAULT '0',
+          failed INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS message_event_acks (
+          event_id TEXT PRIMARY KEY NOT NULL, message_id TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0,
+          attempt INTEGER NOT NULL DEFAULT 0, retry_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS inbox_event_discoveries (
+          event_id TEXT PRIMARY KEY NOT NULL, message_id TEXT NOT NULL,
+          channel_type INTEGER NOT NULL, channel_id TEXT NOT NULL, message_seq INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS inbox_event_discoveries_by_message ON inbox_event_discoveries(message_id);
+        CREATE INDEX IF NOT EXISTS inbox_event_discoveries_by_route
+          ON inbox_event_discoveries(channel_type,channel_id,message_seq);
         CREATE INDEX IF NOT EXISTS jobs_by_route
           ON jobs(channel_type, COALESCE(channel_id, sender), seq) WHERE state IN ('queued','ready','running','sending');
         CREATE INDEX IF NOT EXISTS jobs_route_history ON jobs(channel_type, COALESCE(channel_id, sender), seq);
         CREATE INDEX IF NOT EXISTS jobs_route_order ON jobs(channel_type, COALESCE(channel_id,sender),route_order,seq)
           WHERE state IN ('queued','ready','running','sending');
-        COMMIT;
       `)
+      if (!this.db.prepare('PRAGMA table_info(inbox_routes)').all().some(row => row.name === 'since_ms')) {
+        this.db.exec('ALTER TABLE inbox_routes ADD COLUMN since_ms INTEGER NOT NULL DEFAULT 0')
+      }
+      const ackColumns = new Set(this.db.prepare('PRAGMA table_info(message_event_acks)').all().map(row => row.name))
+      if (!ackColumns.has('attempt')) this.db.exec('ALTER TABLE message_event_acks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0')
+      if (!ackColumns.has('retry_ms')) this.db.exec('ALTER TABLE message_event_acks ADD COLUMN retry_ms INTEGER NOT NULL DEFAULT 0')
+      this.db.prepare('INSERT OR IGNORE INTO event_recovery(id,started_at) VALUES (1,0)').run()
+      this.db.exec('COMMIT')
       this.db.exec("UPDATE jobs SET state='review', issue='interrupted_' || state WHERE state IN ('running','sending')")
     } catch (error) {
       this.close()
@@ -167,6 +195,117 @@ export class Store {
   releaseInbox(route) {
     this.db.prepare(`UPDATE inbox_routes SET blocked=0, failed=0,retry_ms=0,checked_ms=? WHERE channel_type=? AND channel_id=?`)
       .run(Date.now(), route.channel_type, route.channel_id)
+  }
+
+  eventRecovery() {
+    const row = this.db.prepare('SELECT ready,baseline,bootstrap_cursor,failed,started_at FROM event_recovery WHERE id=1').get()
+    return { ready: !!row.ready, baseline: row.baseline, bootstrapCursor: row.bootstrap_cursor,
+      failed: !!row.failed, startedAt: row.started_at }
+  }
+
+  activateEventRecovery(now = Date.now()) {
+    if (!Number.isSafeInteger(now) || now <= 0) return false
+    // Opening a disabled/non-WS account must not establish its recovery boundary.
+    // The first actual recovery start wins, including across later restarts.
+    return this.db.prepare('UPDATE event_recovery SET started_at=? WHERE id=1 AND started_at=0')
+      .run(now).changes > 0
+  }
+
+  advanceEventBootstrap(id) {
+    if (!isDecimalInt64(id)) return false
+    // SQLite compares signed int64 values exactly; JS Number would lose precision.
+    return this.db.prepare(`UPDATE event_recovery SET bootstrap_cursor=?
+      WHERE id=1 AND ready=0 AND CAST(bootstrap_cursor AS INTEGER)<CAST(? AS INTEGER)`).run(id, id).changes > 0
+  }
+
+  finishEventBootstrap() {
+    // Publishing the baseline and marking it ready must be one atomic write.
+    this.db.exec('UPDATE event_recovery SET ready=1,baseline=bootstrap_cursor WHERE id=1 AND ready=0')
+  }
+
+  eventRecoveryFailed(failed) {
+    this.db.prepare('UPDATE event_recovery SET failed=? WHERE id=1').run(failed ? 1 : 0)
+  }
+
+  queueMessageEventAck(eventId, messageId) {
+    if (!isDecimalInt64(eventId) || !isDecimalInt64(messageId)) return false
+    // Receipt validation and insertion share a statement (and any caller transaction).
+    // Keep completed mappings: a duplicate must not reopen an ACK or change its message.
+    return this.db.prepare(`INSERT INTO message_event_acks(event_id,message_id)
+      SELECT ?,? WHERE EXISTS (
+        SELECT 1 FROM jobs WHERE message_id=?
+        UNION ALL SELECT 1 FROM inbox_staged WHERE message_id=?
+        UNION ALL SELECT 1 FROM inbox_seen WHERE message_id=?
+        UNION ALL SELECT 1 FROM inbox_event_discoveries WHERE message_id=?
+      ) ON CONFLICT(event_id) DO UPDATE SET message_id=excluded.message_id
+        WHERE message_event_acks.message_id=excluded.message_id`)
+      .run(eventId, messageId, messageId, messageId, messageId, messageId).changes > 0
+  }
+
+  pendingMessageEventAcks(now = Date.now()) {
+    return this.db.prepare('SELECT event_id FROM message_event_acks WHERE acked=0 AND retry_ms<=? ORDER BY retry_ms,rowid LIMIT 20')
+      .all(now).map(row => row.event_id)
+  }
+
+  messageEventAckDue(id, now = Date.now()) {
+    if (!isDecimalInt64(id)) return false
+    return !!this.db.prepare('SELECT 1 FROM message_event_acks WHERE event_id=? AND (acked=1 OR retry_ms<=?)').get(id, now)
+  }
+
+  messageEventAckFailed(id, now = Date.now()) {
+    if (!isDecimalInt64(id)) return
+    // One failed ACK cannot monopolize the bounded pending batch. Saturate both
+    // the exponent and counter: 1s, 2s, 4s, ... up to 60s, even after a restart.
+    this.db.prepare(`UPDATE message_event_acks SET
+      retry_ms=?+MIN(60000,1000*(1 << MIN(attempt,6))),attempt=MIN(attempt+1,7)
+      WHERE event_id=? AND acked=0`).run(now, id)
+  }
+
+  messageEventAcked(id) {
+    // Only an exact decimal string may complete an existing retry obligation.
+    if (!isDecimalInt64(id)) return
+    this.db.prepare('UPDATE message_event_acks SET acked=1,attempt=0,retry_ms=0 WHERE event_id=?').run(id)
+  }
+
+  pendingInboxDiscoveries(route) {
+    // A stage or remote ACK is not proof that current history was observed.
+    return this.db.prepare(`SELECT event_id,message_id,message_seq FROM inbox_event_discoveries d
+      WHERE channel_type=? AND channel_id=?
+        AND NOT EXISTS (SELECT 1 FROM inbox_seen WHERE message_id=d.message_id)
+        AND NOT EXISTS (SELECT 1 FROM jobs WHERE message_id=d.message_id)
+      ORDER BY message_seq,event_id LIMIT 100`).all(route.channel_type, route.channel_id)
+  }
+
+  seedInboxEvent(eventId, m) {
+    if (!isDecimalInt64(eventId) || !isDecimalInt64(m?.messageId)
+      || !Number.isSafeInteger(m.messageSeq) || m.messageSeq <= 0 || m.messageSeq > 0xffffffff
+      || ![1, 2, 5].includes(m.channelType) || typeof m.channelId !== 'string' || !m.channelId) return false
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const startedAt = this.eventRecovery().startedAt
+      if (!(startedAt > 0)) { this.db.exec('ROLLBACK'); return false }
+      // An event only discovers an unknown route. History must fetch the current
+      // body and apply revocations before any message becomes executable.
+      let enrolled = this.db.prepare(`INSERT INTO inbox_routes(channel_type,channel_id,floor_seq,checkpoint,blocked,checked_ms,since_ms)
+        VALUES (?,?,?,?,1,?,?) ON CONFLICT(channel_type,channel_id) DO NOTHING`)
+        .run(m.channelType, m.channelId, m.messageSeq - 1, m.messageSeq - 1, Date.now(), startedAt).changes > 0
+      // A smaller sequence may arrive after the first discovery. Only these
+      // time-bounded routes can lower their floor; legacy live-route floors stay
+      // intact. Existing message receipts suppress already handled rows.
+      if (!enrolled && !this.inboxSeen(m.messageId)) enrolled = this.db.prepare(`UPDATE inbox_routes
+        SET floor_seq=?,checkpoint=MIN(checkpoint,?),blocked=1,retry_ms=0,checked_ms=0
+        WHERE channel_type=? AND channel_id=? AND since_ms>0 AND floor_seq>=?`)
+        .run(m.messageSeq - 1, m.messageSeq - 1, m.channelType, m.channelId, m.messageSeq).changes > 0
+      const recorded = enrolled && this.db.prepare(`INSERT INTO inbox_event_discoveries
+        (event_id,message_id,channel_type,channel_id,message_seq) VALUES (?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING`)
+        .run(eventId, m.messageId, m.channelType, m.channelId, m.messageSeq).changes > 0
+      if (!recorded || !this.queueMessageEventAck(eventId, m.messageId)) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
   }
 
   rememberAnswer(eventId, message, sessionId) {
@@ -479,8 +618,16 @@ export class Store {
     return { conversations, counts, inbox }
   }
   retirePending() {
-    this.db.prepare("UPDATE jobs SET state='review', issue='account_removed', input='', reply=NULL, metadata=NULL WHERE state IN ('queued','ready')").run()
-    this.db.exec('DELETE FROM inbox_staged; DELETE FROM inbox_routes;')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare("UPDATE jobs SET state='review', issue='account_removed', input='', reply=NULL, metadata=NULL WHERE state IN ('queued','ready')").run()
+      // A staged/discovered message may already be ACKed. Retain its receipt
+      // before retiring it, including for older versions that only consult inbox_seen.
+      // Recovery state and pending/completed ACK mappings deliberately survive.
+      this.db.exec(`INSERT OR IGNORE INTO inbox_seen(message_id) SELECT message_id FROM inbox_staged;
+        INSERT OR IGNORE INTO inbox_seen(message_id) SELECT message_id FROM inbox_event_discoveries;
+        DELETE FROM inbox_staged; DELETE FROM inbox_routes; COMMIT;`)
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
   }
   hasPending() {
     return !!this.db.prepare("SELECT 1 FROM jobs WHERE state IN ('queued','running','ready','sending') LIMIT 1").get()
