@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { sendCard } from './octo-cards.js'
+import { sendCard, createCard } from './octo-cards.js'
 
 const cut = (value, max) => typeof value === 'string'
   ? Array.from(value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').trim()).slice(0, max).join('') : ''
@@ -36,23 +36,52 @@ function presentation(question, index, total) {
 export class QuestionBridge {
   constructor({ api, store, log }) { Object.assign(this, { api, store, log }) }
 
+  async closeCard(binding, summary, signal) {
+    if (!binding?.questionKey) return
+    this.store.finishQuestionCard(binding.messageId, summary)
+    if (signal?.aborted) return
+    try {
+      const title = binding.questionTitle?.replace('DSH 等待你的回答', 'DSH 提问回执') ?? 'DSH 提问回执'
+      const { type: _type, ...frame } = createCard({ title, text: summary })
+      if (typeof this.api.editProgress !== 'function') throw new Error('edit_unavailable')
+      await this.api.editProgress(binding.route, binding.messageId, frame, undefined, false, signal)
+      this.store.questionFeedbackSent(binding.messageId)
+    } catch {
+      if (!signal?.aborted) {
+        try {
+          await this.api.send(binding.route.channel_id, summary, signal, binding.route.channel_type, binding.messageId)
+          this.store.questionFeedbackSent(binding.messageId)
+        } catch { this.log('question_feedback_unconfirmed') }
+      }
+    }
+  }
+
+  async closeInterrupted(signal) {
+    for (const binding of this.store.unfinishedQuestionCards()) {
+      if (signal.aborted) return
+      await this.closeCard(binding, binding.questionSummary
+        ?? 'DSH 服务已重新连接，上次提问的等待已结束。这张旧卡片不能继续提交，请重新发起提问。', signal)
+    }
+  }
+
   async ask(questions, job, config, signal, onWaiting) {
     if (this.current || !Array.isArray(questions) || !questions.length || questions.length > 8
       || questions.some(q => typeof q?.id !== 'string' || typeof q.question !== 'string'
         || (q.options !== undefined && (!Array.isArray(q.options) || q.options.length > 12
           || q.options.some(item => typeof item?.label !== 'string'))))) throw new Error('octo_question_invalid')
     const answers = []
+    const batchSignal = AbortSignal.any([signal, AbortSignal.timeout(15 * 60_000)])
     onWaiting(true)
     try {
       for (const [index, question] of questions.entries()) {
         signal.throwIfAborted()
         const response = Promise.withResolvers()
-        const wait = AbortSignal.any([signal, AbortSignal.timeout(90_000)])
+        const wait = batchSignal
         const stop = () => response.reject(wait.reason)
         wait.addEventListener('abort', stop, { once: true })
         void response.promise.catch(() => {})
         const key = randomUUID()
-        this.current = { key, question, sender: job.sender, sessionId: job.session_id,
+        this.current = { key, question, index, total: questions.length, sender: job.sender, sessionId: job.session_id,
           route: { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }, response, ready: false }
         try {
           const active = this.current
@@ -68,7 +97,8 @@ export class QuestionBridge {
                 title, text, actions: [{ id: 'answer', label: '提交回答' }],
                 choice: { id: 'selection', label: '选择一个选项', options: options.map((row, i) => ({ title: row.label, value: 'q' + (i + 1) })) },
               }, wait)
-              this.store.bindCard({ ...result.binding, questionKey: key })
+              active.binding = { ...result.binding, questionKey: key, questionTitle: title }
+              this.store.bindCard(active.binding)
               sent = true
             } catch {
               if (!wait.aborted) this.log('question_card_fallback')
@@ -83,7 +113,10 @@ export class QuestionBridge {
           answers.push(await response.promise)
         } finally {
           wait.removeEventListener('abort', stop)
+          const active = this.current
           this.current = undefined
+          if (active?.binding) await this.closeCard(active.binding, active.summary
+            ?? '本次提问已结束，未收到完整答案。请重新发起提问；旧卡片不能继续提交。', signal)
         }
       }
       return { answers }
@@ -101,7 +134,12 @@ export class QuestionBridge {
   text(current, input) {
     if (this.current !== current || !current.ready) return false
     current.ready = false
-    current.response.resolve(answer(current.question, input))
+    const result = answer(current.question, input)
+    current.summary = '已收到第 ' + (current.index + 1) + '/' + current.total + ' 题的答案。'
+      + (current.index + 1 < current.total ? '请继续回答下一张提问卡。' : '答案已交给 DSH，正在继续处理。')
+      + '\n' + (result.selected.length ? '已选择：' + result.selected.join('、') : result.custom ? '自定义答案已记录。' : '已跳过。')
+    if (current.binding) this.store.finishQuestionCard(current.binding.messageId, current.summary)
+    current.response.resolve(result)
     return true
   }
 

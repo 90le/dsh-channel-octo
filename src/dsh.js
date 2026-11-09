@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { ruleContext } from './rules.js'
 import { prepareInput } from './dsh-media.js'
 import { sessionExists } from './session-state.js'
+import { RunClock } from './run-clock.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
@@ -25,11 +26,12 @@ export class DshHost {
   exists(sessionId, signal) { return sessionExists(this.ctx, sessionId, signal) }
 
   async run(session, text, onCreated, lifetime, rules, onStage = () => {}, timeoutMs = this.timeoutMs, toolsAllowed = false, extras = {}) {
-    const signal = AbortSignal.any([lifetime, AbortSignal.timeout(timeoutMs)])
-    signal.throwIfAborted()
+    lifetime.throwIfAborted()
     const ctx = this.ctx
     const selected = this.profile.provider ? this.profile : ctx.agentDefaultModel.currentSelection()
     if (!selected?.provider || !selected?.model) throw new Error('missing_host_model')
+    const deadline = new RunClock(timeoutMs)
+    const signal = AbortSignal.any([lifetime, deadline.signal])
     const agentOptions = { provider: selected.provider, model: selected.model,
       ...(this.profile.provider && selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) }
     const permission = toolsAllowed && this.profile.permission !== 'text-only' ? this.profile.permission : null
@@ -64,6 +66,7 @@ export class DshHost {
           if (!authority.active || authority.mixed || request.agent?.id !== session.session_id) return next()
           const askSignal = request.signal ? AbortSignal.any([signal, request.signal]) : signal
           let claim
+          deadline.pause()
           try {
             if (request.wait?.timed) {
               const api = ctx.get?.('userQuestions')
@@ -72,7 +75,7 @@ export class DshHost {
               if ((await claim.next()).done) return next()
             }
             return await extras.onQuestion(request.questions, askSignal)
-          } finally { await claim?.return?.() }
+          } finally { await claim?.return?.(); deadline.resume() }
         }, { prepend: true }))
       }
       if (rules || extras.authorCard || extras.taskContext || extras.channelContext) {
@@ -165,6 +168,7 @@ export class DshHost {
       if (classified.has(error?.message) || error?.name === 'SessionAlreadyOwnedError') throw error
       throw new Error(failure, { cause: error })
     } finally {
+      deadline.close()
       if (handle) await handle.dispose()
       else if (borrowed && cleanup.length) {
         // A timed out request can still be in DSH's inbox. Keep its safety

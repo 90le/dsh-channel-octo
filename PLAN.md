@@ -21,6 +21,8 @@
 
 ## 当前状态
 
+0.6.5 增加提问卡接受、超时与服务重启后的可见反馈。用户等待与模型执行预算分开；原生 DSH 联调使用三题和三个真实格式的卡片事件，校验返回工具的完整答案后再继续写文件。服务重启后不能恢复内存中的等待；关闭旧卡并明确提示重新发起，保留已提交事件的去重记录。
+
 0.6.4 修复删除 DSH 会话后残留的 Octo 路由和列表记录。入站处理前以及列表刷新时，通过宿主持久化元信息确认存在性；只对确认不存在的会话解除映射。恢复与检查之间发生删除时，在模型尚未执行的条件下新建一次会话。隔离验收覆盖删除后图文混排、后续普通文字、原生图片引用和会话回执；实际 Octo 客户端识图效果仍取决于所选模型。
 
 验证记录与待办见 [README](README.md)。参考 [DSH 0.2.1-rc.5](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.5)、[IM Connect 1.0.30 源码](https://github.com/MichengAI/dsh-im-connect/tree/128cd0ce9cacebc6fe57a6f8a47464fff51743a7) 和 [Octo Bot API](https://github.com/Mininglamp-OSS/octo-server/tree/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api)。

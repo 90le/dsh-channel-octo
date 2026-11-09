@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.6.4.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.6.5.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -61,7 +61,7 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
 
-## 0.6.4
+## 0.6.5
 
 账号管理参照 IM Connect 1.0.30。两个插件可共存，各自保留账号、会话与凭据。默认的文字模式可复用已经在 DSH Web 打开的空闲 Octo 会话。同回合混入其他来源的输入时不会向 Octo 转发。
 
@@ -73,7 +73,7 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 - **侧栏 → Octo**：有宿主扩展页签时，显示一个 Octo 页签；没有时，在侧栏底部提供「Octo 频道」入口。私聊、群聊和子区自动归档；可按类型筛选、搜索并打开原生 DSH 会话。原生 Octo 页签的「…」和右键打开同一组宿主会话操作。
 - **删除会话后继续聊天**：频道列表以 DSH 原生会话是否存在为准，正常刷新会移除已删除项。下一条 Octo 消息自动创建新会话，不再尝试恢复已删除的会话；原消息的去重和投递回执保留。宿主读取失败、格式损坏或会话忙不会当成删除。
 - **进度**：长回复优先使用 Octo 推理过程模板，或使用展示卡；卡片不可用时回退到“正在输入”。卡片显示 DSH 的真实步骤、工具执行结果、文件交付数量和耗时，不包含模型原始推理或工具参数。进度失败不阻止正文；明确失败有提示，旧任务不会自动重放。
-
+- **提问与回答**：多题按顺序展示；提交后原卡显示收到的答案并关闭按钮，随后显示下一题。答题期间暂停模型执行计时，整组问题最多等待 15 分钟。服务重启会结束原等待，旧卡改为结束提示，需重新发起提问；不会把旧卡答案误当作新指令执行。
 - **文件**：启用账号的文件选项后，已通过准入的私聊、群聊和子区可以接收文件、图片、GIF、语音和视频附件。图片是否可识别取决于所选模型；其他非文本媒体保留为 DSH 附件，不自动转录。发送仅限已启用工具的授权私聊，且仅发送本轮通过 DSH 正式交付的工作区文件。默认每个文件上限 16 MiB；部署需配置确切的 `mediaDownloadOrigins`、`mediaUploadOrigins` HTTPS 来源。文件上传与消息投递任一步无法确认时不会自动重放。
 - **群聊前文与引用**：触发后补充当前群主区或当前子区的近期可读消息；不把群历史放进私聊。支持原消息引用、内联引用和有界的合并转发解析。富文本按原顺序接收文字、图片和可识别的附件；发送时用 Octo 原生文字加图片格式，普通文件独立发送。详见[消息兼容矩阵](OCTO-COVERAGE.md)。
 - **卡片与安全命令**：在账号的私聊或群聊命令选项开启后，授权操作者可使用 `/help`、`/status`、`/new`、`/card` 和 `/choose`。群聊和子区还要求 Bot 所有者直接 @ Bot。卡片按钮只接受原账号、原会话与指定用户的有效回调。授权用户可直接要求展示卡片；不支持的卡片退回文字。长正文会分段发送。
@@ -87,7 +87,10 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js events
 DSH_OCTO_SMOKE_DELETE=1 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket
+DSH_OCTO_SMOKE_OWNER=1 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket
 npm run smoke:web -- /absolute/path/to/dsh/lib/bin.js websocket /absolute/path/to/playwright-core/index.mjs /absolute/path/to/chrome
 ```
 
 浏览器验收默认与 IM Connect 1.0.30 共存。设置 `DSH_OCTO_SMOKE_CODEX_UI=2.0.19` 或 `DSH_OCTO_SMOKE_AUTOMATION` 可加测指定版本；可选的 `DSH_OCTO_SMOKE_SCREENSHOTS` 指向已存在的截图目录，截图只含测试账号和会话。
+
+0.6.5 验证：90 项自动测试通过；Debian 上 DSH `0.2.1-rc.5` 的隔离宿主验证了连续三题的卡片回调、全部答案进入原生工具结果、逐题回执以及答完后继续写入和交付文件。该检查使用模拟 Octo 和模型；真实客户端的点击体验仍需实际使用确认。

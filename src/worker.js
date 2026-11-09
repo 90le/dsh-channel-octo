@@ -155,7 +155,10 @@ export class Worker {
             const pending = this.questions.match(message)
             if (pending?.key === binding.questionKey && authorizedToolDm(this.config, { sender: message.sender, channel_type: message.channelType })) {
               if (this.store.claimCard(selection, message, pending.sessionId ?? null)) this.questions.card(pending, binding.questionKey, selection.selection)
-            } else this.store.claimCard(selection, message, null) // expired question clicks never become prompts
+            } else if (this.store.claimCard(selection, message, null)) {
+              // A restart or completed wait must visibly retire the old form.
+              await this.questions.closeCard(binding, '这次提问的等待已结束，答案未交给 DSH。请重新发起提问。', signal)
+            }
           } else this.store.claimCard(selection, message)
           await this.api.ack(id, signal)
         } else if (this.store.hasEvent(id)) await this.api.ack(id, signal)
@@ -466,6 +469,7 @@ export class Worker {
     const identity = await this.api.verify(this.config.botUid, this.config.spaceId, signal)
     if (identity?.ownerUid) this.config.ownerUid = identity.ownerUid
     this.log('bot_verified')
+    await this.questions.closeInterrupted(signal)
     if (this.config.transport === 'websocket') return this.runRealtime(signal)
     const stop = new AbortController()
     const lifetime = AbortSignal.any([signal, stop.signal])

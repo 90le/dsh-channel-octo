@@ -360,7 +360,8 @@ export function apply(ctx) {
   }
   if (browserModule && !/dsh_session_reused/.test(output)) throw new Error('Web did not hold the fixture session open during the second turn')
   if (ownerSmoke && (readFileSync(join(home, 'octo-tool-fixture.txt'), 'utf8') !== 'written by native DSH'
-    || !output.includes('FIXTURE_FILE_OK') || !output.includes('FIXTURE_QUESTION_ANSWERED'))) throw new Error('Native write/present/delivery failed: '
+    || !output.includes('FIXTURE_FILE_OK') || !output.includes('FIXTURE_QUESTION_ANSWERED')
+    || [501, 502, 503].some(id => !output.includes('FIXTURE_ANSWER_FEEDBACK=' + id)))) throw new Error('Native write/present/delivery failed: '
       + output.replace(/https?:\/\/\S+/g, '[url]').slice(-1500))
   if (!output.includes('FIXTURE_RICH_IMAGE_DOWNLOADED') || output.includes('FIXTURE_SYNC_SCOPE_WRONG')) throw new Error('Missing scoped rich media/history')
   if (ownerSmoke) {
@@ -370,7 +371,7 @@ export function apply(ctx) {
       if (rows.length !== 2 || !rows[0].result_id || rows[0].result_id !== rows[1].result_id
         || !rows[0].session_id || rows[0].session_id !== rows[1].session_id) throw new Error('File and follow-up did not share one confirmed reply')
     } finally { db.close() }
-    console.log('PASS: file and follow-up shared one round; native question resumed from Octo, then DSH wrote and delivered identical file bytes.')
+    console.log('PASS: three native questions answered by Octo card callbacks with visible feedback; DSH resumed and delivered identical file bytes.')
   }
   if (deleteSmoke) {
     const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })

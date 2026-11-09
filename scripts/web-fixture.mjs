@@ -10,6 +10,8 @@ let openedCard = false
 const ownerSmoke = process.env.DSH_OCTO_FIXTURE_OWNER === '1'
 const deleteSmoke = process.env.DSH_OCTO_FIXTURE_DELETE === '1'
 let ownerStep = 0, uploaded = false, questionAnswered = false
+let questionIndex = 0
+const questionEvents = new Map()
 const browserReady = process.env.DSH_OCTO_BROWSER_READY
 const group = '00112233445566778899aabbccddeeff'
 const thread = '123456789012345678'
@@ -135,6 +137,12 @@ globalThis.fetch = async (input, init) => {
     })
     if (url.pathname.endsWith('/message/edit')) {
       const body = JSON.parse(init.body)
+      if (ownerSmoke && body.content_edit && Number(body.message_id) >= 501 && Number(body.message_id) <= 503) {
+        const frame = JSON.parse(body.content_edit)
+        if (frame.card.actions?.length || !frame.plain.includes('已收到第')) return new Response(null, { status: 400 })
+        console.log('FIXTURE_ANSWER_FEEDBACK=' + body.message_id)
+        return json({})
+      }
       if (body.message_id !== '200' || body.channel_type !== 1 || body.channel_id !== 'fixture-user'
         || body.template_ref?.id !== 'ai.reasoning-process' || body.data.state !== body.state
         || body.state === 'answering' && body.transient !== true
@@ -158,10 +166,13 @@ globalThis.fetch = async (input, init) => {
       }
       if (ownerSmoke && body.payload.profile === 'octo/v2') {
         if (body.channel_id !== 'fixture-user' || body.channel_type !== 1) return new Response(null, { status: 400 })
-        setTimeout(() => peer.send({ messageId: '901', sender: 'fixture-user', channelType: 1,
-          channelId: 'fixture-user', payload: { type: 1, content: '1' } }), 300).unref()
+        const index = ++questionIndex, id = 500 + index, eventId = String(900 + index)
+        setTimeout(() => questionEvents.set(eventId, { event_id: eventId, event_type: 'card_action', event_data: {
+          message_id: String(id), action_id: 'answer', space_id: 'fixture-space', operator_uid: 'fixture-user',
+          channel_id: 'fixture-user', channel_type: 1, inputs: { selection: 'q1' }, data: body.payload.card.actions[0].data,
+        } }), 300).unref()
         console.log('FIXTURE_QUESTION_SENT')
-        return json({ message_id: 299 })
+        return json({ message_id: id })
       }
       if (body.payload.type === 17) {
         if (openedCard || received !== 1 || body.channel_type !== 1 || body.channel_id !== 'fixture-user'
@@ -185,6 +196,7 @@ globalThis.fetch = async (input, init) => {
       return json({ message_id: 100 + sent })
     }
     if (url.pathname.endsWith('/events')) {
+      if (ownerSmoke && peer) { await delay(80); return json({ status: 1, results: [...questionEvents.values()] }) }
       if (peer) return new Response(null, { status: 403 })
       if (received < routes.length && received === sent) {
         const m = nextMessage()
@@ -214,15 +226,22 @@ globalThis.fetch = async (input, init) => {
         return new Response(null, { status: 400 })
       }
       if (step === 1) {
-        questionAnswered = history.includes('Fixture answer one')
+        const result = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+          .find(part => part.type === 'tool_result' && part.tool_use_id === 'toolu_fixture_ask_user_question')
+        const text = typeof result?.content === 'string' ? result.content
+          : (result?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
+        let answers
+        try { answers = JSON.parse(text)?.answers } catch {}
+        questionAnswered = answers?.length === 3 && answers.every((answer, i) =>
+          answer.id === 'fixture-choice-' + (i + 1) && answer.selected?.length === 1 && answer.selected[0] === 'Fixture answer ' + (i + 1))
         if (!questionAnswered) return new Response(null, { status: 400 })
         console.log('FIXTURE_QUESTION_ANSWERED')
       }
       const tool = ['ask_user_question', 'write', 'present'][step]
       const args = [
-        { questions: [{ id: 'fixture-choice', question: 'Which test file?', options: [
-          { label: 'Fixture answer one', description: 'Text file' }, { label: 'Other answer', description: 'Another option' },
-        ] }] },
+        { questions: [1, 2, 3].map(i => ({ id: 'fixture-choice-' + i, question: 'Question ' + i, options: [
+          { label: 'Fixture answer ' + i, description: 'Text file' }, { label: 'Other answer', description: 'Another option' },
+        ] })) },
         { file_path: 'octo-tool-fixture.txt', content: 'written by native DSH' },
         { files: [{ path: 'octo-tool-fixture.txt' }] },
       ][step]

@@ -94,6 +94,20 @@ export class Store {
     return !!this.db.prepare('SELECT 1 FROM card_bindings WHERE expires_ms>? AND claimed=0 LIMIT 1').get(Date.now())
   }
 
+  unfinishedQuestionCards() {
+    return this.db.prepare(`SELECT binding FROM card_bindings
+      WHERE json_extract(binding,'$.questionKey') IS NOT NULL
+      AND COALESCE(json_extract(binding,'$.questionFeedback'),0)=0
+      ORDER BY expires_ms DESC LIMIT 50`).all().map(row => JSON.parse(row.binding))
+  }
+  finishQuestionCard(id, summary) {
+    this.db.prepare(`UPDATE card_bindings SET claimed=1,
+      binding=json_set(binding,'$.questionSummary',?) WHERE message_id=?`).run(summary, id)
+  }
+  questionFeedbackSent(id) {
+    this.db.prepare("UPDATE card_bindings SET binding=json_set(binding,'$.questionFeedback',1) WHERE message_id=?").run(id)
+  }
+
   cardBinding(id) {
     const row = this.db.prepare('SELECT binding FROM card_bindings WHERE message_id=? AND expires_ms>? AND claimed=0')
       .get(id, Date.now())
