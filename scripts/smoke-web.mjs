@@ -20,6 +20,9 @@ const npm = process.env.npm_execpath
 const wire = process.argv[3] !== 'events'
 const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
+const screenshots = process.env.DSH_OCTO_SMOKE_SCREENSHOTS
+const codexUi = process.env.DSH_OCTO_SMOKE_CODEX_UI
+if (codexUi && !/^\d+\.\d+\.\d+$/.test(codexUi)) throw new Error('Set an exact Codex UI version')
 if (browserModule && (!browserExecutable || !wire)) throw new Error('Browser smoke needs WebSocket and an executable path')
 const browserReady = join(home, 'browser-ready')
 const observer = join(home, 'fixture-observer.mjs')
@@ -50,7 +53,8 @@ let child, browser
 try {
   if (node([cli, '--version']).trim() !== '0.2.1-rc.5') throw new Error('Expected DSH 0.2.1-rc.5')
   const [{ filename }] = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
-  for (const spec of [join(home, filename), '@michengai/dsh-im-connect@1.0.30']) {
+  for (const spec of [join(home, filename), '@michengai/dsh-im-connect@1.0.30',
+    ...(codexUi ? ['@michengai/dsh-codex-ui@' + codexUi] : [])]) {
     node([cli, 'plugin', '--profile', 'web', 'add', spec, '--registry=https://registry.npmjs.org/'])
   }
   const q = JSON.stringify
@@ -105,7 +109,7 @@ export function apply(ctx) {
   ], { ...common, stdio: ['ignore', 'pipe', 'pipe'] })
   let output = ''
   for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-12_000) })
-  const deadline = Date.now() + 48_000
+  const deadline = Date.now() + 60_000
   if (browserModule) {
     const { chromium } = await import(pathToFileURL(resolve(browserModule)).href)
     browser = await chromium.launch({ executablePath: browserExecutable, headless: true })
@@ -127,8 +131,12 @@ export function apply(ctx) {
       }
     })
     await page.goto(launch)
-    const shortcut = page.getByRole('button', { name: 'Octo 频道', exact: true })
-    await shortcut.waitFor({ timeout: 15000 })
+    const native = page.getByRole('tab', { name: 'Octo', exact: true })
+    const fallback = page.locator('[data-octo-shortcut]')
+    const shortcut = native.or(fallback).first()
+    try { await shortcut.waitFor({ timeout: 15000 }) } catch (error) {
+      throw new Error('Octo entry did not mount: ' + browserErrors.join(' | '), { cause: error })
+    }
     // A fresh profile presents an explicit preview acknowledgement.
     const proceed = page.getByRole('dialog').getByRole('button', { name: /^(继续|Continue|跳过|Skip|开始使用|Get started)$/i })
       .and(page.locator('button:not(:disabled)')).first()
@@ -136,12 +144,22 @@ export function apply(ctx) {
       if (!await proceed.waitFor({ timeout: 1000 }).then(() => true, () => false)) break
       await proceed.click({ timeout: 2000 })
     }
-    try { await shortcut.click({ timeout: 15000 }) } catch (error) {
+    const entry = await native.isVisible() ? native : fallback
+    try { await entry.click({ timeout: 15000 }) } catch (error) {
       const overlays = (await page.locator('[role=dialog],dialog[open]').allTextContents()).join(' ').slice(0, 450)
       throw new Error('Octo sidebar unavailable: ' + browserErrors.join(' | ') + ' ' + overlays, { cause: error })
     }
-    const channel = page.getByRole('button', { name: /私聊.*fixture-user/ })
+    if (await native.isVisible() && await fallback.count()) throw new Error('Duplicate Octo sidebar entries')
+    const channel = page.locator('.dsho-row').first()
     while (Date.now() < deadline && sentCount() < 1) await delay(150)
+    await channel.waitFor({ timeout: 8000 })
+    if (screenshots) {
+      await page.screenshot({ path: join(screenshots, 'octo-channel.png'), animations: 'disabled' })
+    }
+    const search = page.getByRole('searchbox', { name: '搜索会话', exact: true })
+    await search.fill('this-does-not-match')
+    await page.getByText('没有匹配的会话', { exact: true }).waitFor()
+    await search.fill('fixture-user')
     await channel.click({ timeout: 15000 })
     try { await page.getByText('fixture response 1', { exact: true }).waitFor({ timeout: 12000 }) } catch (error) {
       throw new Error('native session unavailable: ' + (await page.locator('body').innerText()).slice(-550)
@@ -150,6 +168,29 @@ export function apply(ctx) {
     await page.keyboard.press('Control+Alt+,')
     await page.getByRole('button', { name: 'Octo 渠道', exact: true }).click({ timeout: 8000 })
     const config = page.locator('[data-octo-settings]')
+    await config.getByText('Octo Bot', { exact: true }).waitFor({ timeout: 7000 })
+    if (await config.getByText('fixture-bot', { exact: true }).isVisible()) throw new Error('Technical details should start collapsed')
+    if (screenshots) await page.screenshot({ path: join(screenshots, 'octo-account.png'), animations: 'disabled' })
+    await config.getByRole('tablist', { name: 'Octo 设置分类' }).getByRole('tab', { name: '渠道设置', exact: true }).click()
+    if (screenshots) {
+      await config.getByRole('combobox', { name: '进度显示', exact: true }).waitFor({ timeout: 7000 })
+      await page.screenshot({ path: join(screenshots, 'octo-settings.png'), animations: 'disabled' })
+    }
+    if ((await config.innerText()).includes('\uFFFD')) throw new Error('Found a replacement character in the Octo settings')
+    const viewport = page.viewportSize()
+    await page.setViewportSize({ width: 800, height: 760 })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    if (screenshots) await page.screenshot({ path: join(screenshots, 'octo-settings-narrow.png'), animations: 'disabled' })
+    const overflow = await config.evaluate(el => {
+      if (el.scrollWidth <= el.clientWidth + 2) return null
+      const right = el.getBoundingClientRect().right
+      return { width: el.clientWidth, scroll: el.scrollWidth,
+        children: [...el.querySelectorAll('*')].filter(child => child.getBoundingClientRect().right > right + 2)
+          .slice(0, 8).map(child => [child.tagName, String(child.className).slice(0, 65),
+            Math.round(child.getBoundingClientRect().right - right)]) }
+    })
+    if (overflow) throw new Error('Octo settings overflow the panel: ' + JSON.stringify(overflow))
+    if (viewport) await page.setViewportSize(viewport)
     try { await config.getByRole('combobox', { name: '进度显示', exact: true }).selectOption('typing', { timeout: 7000 }) }
     catch (error) { throw new Error('Octo settings missing: ' + (await page.locator('[data-shortcut-modal="settings"]').innerText()).slice(-900), { cause: error }) }
     await config.getByRole('button', { name: '保存设置', exact: true }).click()
@@ -163,9 +204,17 @@ export function apply(ctx) {
     writeFileSync(browserReady, id)
     console.log('PASS: browser channel, existing native session, authenticated settings save.')
   }
-  while (Date.now() < deadline && child.exitCode === null && sentCount() !== 5) await delay(200)
+  // Browser loading, onboarding and screenshots must not consume the post-setup reply budget.
+  const replyDeadline = browserModule ? Date.now() + 30_000 : deadline
+  while (Date.now() < replyDeadline && child.exitCode === null && sentCount() !== 5) await delay(200)
   if (sentCount() !== 5) {
-    throw new Error('expected five delivered replies; fixture diagnostics: ' + output.replace(/https?:\/\/\S+/g, '[url]'))
+    let jobs = []
+    try {
+      const db = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
+      try { jobs = db.prepare('SELECT seq,state,issue FROM jobs ORDER BY seq').all() } finally { db.close() }
+    } catch {}
+    throw new Error('expected five delivered replies; fixture jobs: ' + JSON.stringify(jobs) + '\n'
+      + output.replace(/https?:\/\/\S+/g, '[url]'))
   }
   if (!/FIXTURE_CARD_OPEN/.test(output) || !/FIXTURE_CARD=answering:2/.test(output)
     || !/FIXTURE_CARD=completed:3/.test(output) || /FIXTURE_CARD_.*MISMATCH/.test(output)) {
