@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { decimalId, OctoError } from './octo.js'
+import { ProgressTimeline } from './progress-timeline.js'
+import { safeProgressText } from './progress-events.js'
 
 const labels = {
   queued: '已收到，等待 DSH 开始处理',
@@ -11,7 +13,7 @@ const labels = {
   approval: '等待你批准这次操作',
   completed: '回复已发送',
   stopped: '回复发送待确认',
-  error: '本次回复未完成，请先核对 DSH 执行状态',
+  error: '本次回复未完成，展开查看步骤及原因',
 }
 
 const stages = ['queued', 'running', 'responding', 'delivering']
@@ -95,7 +97,7 @@ function duration(seconds) {
     : minutes ? `${minutes} 分 ${rest} 秒` : `${rest} 秒`
 }
 
-const text = (value, extra = {}) => ({ type: 'TextBlock', text: value, size: 'Small', wrap: true, spacing: 'Small', ...extra })
+const text = (value, extra = {}) => ({ type: 'TextBlock', text: value, size: 'Default', wrap: true, spacing: 'Small', ...extra })
 const column = (width, items) => ({ type: 'Column', width, spacing: 'Small', verticalContentAlignment: 'Center', items })
 const visibility = (elementId, isVisible) => ({ elementId, isVisible })
 const disclosureTargets = (id, expanded) => [
@@ -120,7 +122,7 @@ function chevrons(id, label, targets, double = false) {
 function compactBody(status, summary, tone, phases, stats, note) {
   // Semantic group IDs remain stable when the recent tools window or phase order changes.
   const groups = phases.map(group => ({ ...group,
-    id: 'dsh_progress_' + (group.thought === '工具执行' ? 'tools' : group.thought === '文件交付' ? 'files' : 'session') }))
+    id: group.id ?? 'dsh_progress_' + (group.thought === '工具执行' ? 'tools' : group.thought === '文件交付' ? 'files' : 'session') }))
   const outer = 'dsh_progress', all = 'dsh_progress_all'
   const allTargets = expanded => [
     ...[outer, ...groups.map(group => group.id)].flatMap(id => disclosureTargets(id, expanded)),
@@ -128,28 +130,26 @@ function compactBody(status, summary, tone, phases, stats, note) {
   ]
   return [{ type: 'Container', style: 'emphasis', bleed: true, spacing: 'None', items: [
     { type: 'ColumnSet', spacing: 'None', columns: [
-      column('auto', [text('DSH 回复进度', { weight: 'Bolder', spacing: 'None' })]),
+      column('auto', [text('DSH 回复进度', { weight: 'Bolder', size: 'Medium', spacing: 'None' })]),
       // Only these three outer targets change: child visibility survives an outer close/open in this frame.
       column('auto', chevrons(outer, '详情', expanded => disclosureTargets(outer, expanded))),
       column('stretch', []),
       column('auto', chevrons(all, '全部详情', allTargets, true)),
     ] },
     text(status, { color: tone, spacing: 'None' }),
-    text(summary, { isSubtle: true }),
+    text(summary, { isSubtle: true, size: 'Small' }),
     { type: 'Container', id: outer + '_details', isVisible: false, separator: true, spacing: 'Small', items: [
-      ...(stats.steps ? [text('已进入 ' + stats.steps + ' 个处理步骤', { isSubtle: true })] : []),
+      ...(stats.steps ? [text('已进入 ' + stats.steps + ' 个处理步骤；工具返回不等于目标已完成', { isSubtle: true })] : []),
       ...groups.map(group => ({ type: 'Container', spacing: 'Small', items: [
         { type: 'ColumnSet', spacing: 'None', columns: [
           column('stretch', [text(group.thought, { spacing: 'None' })]),
           column('auto', chevrons(group.id, group.thought, expanded => disclosureTargets(group.id, expanded))),
         ] },
+        ...(group.summary ? [text(group.summary, { isSubtle: true })] : []),
         { type: 'Container', id: group.id + '_details', isVisible: false, spacing: 'Small', items: [
-          ...(group.thought === '工具执行' && stats.calls > 4 ? [text('最近 4 次工具操作', { isSubtle: true })] : []),
-          ...group.actions.map((item, index) => ({ type: 'ColumnSet', spacing: index === 0 ? 'None' : 'Small', columns: [
-            { type: 'Column', width: '8px', items: [] },
-            column('auto', [text(item.statusGlyph, { color: item.statusTone, spacing: 'None' })]),
-            column('auto', [text(item.tool, { spacing: 'None' })]),
-            column('stretch', [text(item.detail, { isSubtle: true, spacing: 'None' })]),
+          ...group.actions.map((item, index) => ({ type: 'Container', spacing: index === 0 ? 'None' : 'Small', items: [
+            text(item.statusGlyph + ' ' + item.tool, { color: item.statusTone, spacing: 'None', weight: 'Bolder' }),
+            text(item.detail, { isSubtle: true, spacing: 'Small' }),
           ] })),
         ] },
       ] })),
@@ -158,43 +158,47 @@ function compactBody(status, summary, tone, phases, stats, note) {
   ] }]
 }
 
-function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
+function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted, pageIndex = 0) {
   const terminal = outcomes.includes(phase)
   const actual = !terminal && stats.approval ? 'approval' : !terminal && stats.waiting ? 'question'
     : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
   const label = interrupted ? '任务已停止' : labels[actual]
   const state = wireStates[actual] ?? actual
   const elapsed = '已用时 ' + duration(seconds)
-  const summary = [elapsed, stats.calls && stats.calls + ' 次工具', stats.files && '已发 ' + stats.files + ' 个文件']
+  const summary = pageIndex ? '步骤记录 · 后续进度见最新卡片' : [elapsed, stats.calls && stats.calls + ' 次工具', stats.files && '已发 ' + stats.files + ' 个文件']
     .filter(Boolean).join(' · ')
   const descriptions = [...stats.recent.values()].slice(-4).map(row =>
     action(row.label, row.status === 'done' ? '已完成' : row.status === 'failed' ? '未完成' : terminal ? '未确认结束' : '执行中', row.status))
-  const note = detail || (stats.failed ? stats.failed + ' 次工具未成功' : '')
-  const phases = []
-  if (descriptions.length) phases.push({ thought: '工具执行', actions: descriptions })
-  if (stats.files) phases.push({ thought: '文件交付', actions: [action('Octo 附件', '已确认发送 ' + stats.files + ' 个文件', 'done')] })
+  const note = safeProgressText(detail, 500) || (stats.failed ? stats.failed + ' 次工具未成功，请展开查看对应步骤；工具返回不等于目标完成。' : '')
+  const phases = stats.timeline?.groups(pageIndex, terminal, interrupted, safeProgressText) ?? []
+  if (!stats.timeline?.pages.length && descriptions.length) phases.push({ thought: '工具执行', actions: descriptions })
+  if (stats.files && pageIndex === 0) phases.push({ thought: '文件交付', actions: [action('Octo 附件', '已确认发送 ' + stats.files + ' 个文件', 'done')] })
   if (!phases.length) phases.push({ thought: stats.steps ? '会话处理' : '请求已接收',
     actions: [action('DSH', terminal ? phase === 'completed' ? '处理已结束' : interrupted ? '已停止执行' : '未确认完成'
       : stats.steps ? '已进入 ' + stats.steps + ' 个处理步骤' : '等待模型开始',
       phase === 'completed' ? 'done' : terminal ? 'failed' : 'active')] })
   const tone = state === 'error' ? 'Attention' : state === 'completed' ? 'Good' : state === 'stopped' ? 'Warning' : 'Accent'
   const current = actual === 'tool' && [...stats.recent.values()].reverse().find(row => row.status === 'active')
-  const status = current ? '正在' + current.label : label
+  const status = pageIndex && !terminal ? '步骤详情' : current ? '正在' + current.label : label
   if (mode === 'compact' || mode === 'display') {
+    const pageLabel = (stats.timeline?.pages.length ?? 0) > 1 ? ` · 第 ${pageIndex + 1} 页` : ''
+    const body = mode === 'compact' ? compactBody(status, summary, tone, phases, stats, note) : [
+      text('DSH 回复进度', { weight: 'Bolder' }), text(status, { color: tone }), text(summary, { isSubtle: true, size: 'Small' }),
+      ...phases.flatMap(group => [text(group.thought, { weight: 'Bolder' }), ...(group.summary ? [text(group.summary)] : []),
+        ...group.actions.map(a => text(a.statusGlyph + ' ' + a.tool + '：' + a.detail))]),
+      ...(note ? [text(note)] : []),
+    ]
+    if (mode === 'compact') body[0].items[0].columns[0].items[0].text += pageLabel
+    else body[0].text += pageLabel
     return { profile: 'octo/v1', card_version: '1.5', plain: status + ' · ' + summary + (note ? ' · ' + note : ''),
-      card: { type: 'AdaptiveCard', version: '1.5', body: mode === 'compact' ? compactBody(status, summary, tone, phases, stats, note) : [
-        text('DSH 回复进度', { weight: 'Bolder' }),
-        text(status, { color: tone, spacing: 'None' }),
-        text(summary, { isSubtle: true }),
-        ...(note ? [text(note)] : []),
-      ] } }
+      card: { type: 'AdaptiveCard', version: '1.5', body } }
   }
   const expanded = false
   return { template_ref: mode, state, data: {
     reasoningId, state, title: 'DSH 回复进度', statusLabel: status, statusTone: tone,
     timerText: elapsed, traceExpanded: expanded, traceCollapsed: !expanded, collapsedSummary: summary,
     progressText: note || (terminal ? summary : label + ' · ' + summary),
-    phases,
+    phases: phases.map(({ thought, summary, actions }) => ({ thought: thought + (summary ? ' · ' + summary : ''), actions })),
     ...(state === 'error' && { errorTitle: '回复未完成', errorMessage: detail || label }),
   } }
 }
@@ -238,12 +242,15 @@ export class Progress {
     const reasoningId = 'dsh-octo-' + (decimalId(job.message_id) ?? randomUUID())
     const started = Date.now()
     let revision = 0
-    const stats = { steps: 0, calls: 0, files: 0, active: 0, failed: 0, waiting: false, recent: new Map(), pending: new Set() }
+    const stats = { steps: 0, calls: 0, files: 0, active: 0, failed: 0, waiting: false, recent: new Map(), pending: new Set(), timeline: new ProgressTimeline() }
     let phase = 'queued', shown, closed = false, blocked = false, timer, flight, finishing, id, format, seq = 1
     let tryCard = mode === 'auto', probeAt = started, dueAt = started + initialDelay
     let editAt, refreshAt, scheduledAt
     const active = () => !closed && !blocked && !signal.aborted
-    const render = (state, detail, interrupted) => frame(format, reasoningId, state, Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail, interrupted)
+    const render = (state, detail, interrupted, page = 0) => frame(format, reasoningId + (page ? '-page-' + page : ''), state,
+      Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail, interrupted, page)
+    const pageCards = new Map()
+    let pageIssue = false
     const clearTimer = () => {
       clearTimeout(timer)
       timer = scheduledAt = undefined
@@ -261,6 +268,29 @@ export class Progress {
       if (blocked || requestSignal.aborted || (!terminal && closed)) throw new Error('progress_closed')
       return fn()
     }, requestSignal)
+    const syncPages = async (state, detail, interrupted, terminal = false, requestSignal = signal) => {
+      let okay = true
+      for (let page = 1; page < stats.timeline.pages.length; page++) {
+        if (requestSignal.aborted || blocked || (!terminal && closed)) return false
+        let entry = pageCards.get(page)
+        if (entry?.uncertain) { okay = false; continue }
+        const payload = render(state, detail, interrupted, page)
+        const serialized = stats.timeline.stamp(page, terminal) + ':' + (terminal ? state : 'active') + ':' + !!interrupted + ':' + (detail ?? '')
+        if (entry?.serialized === serialized) continue
+        let result
+        if (entry?.id) result = await request(() => this.api.editProgress(route, entry.id, payload, ++entry.seq, !terminal, requestSignal), terminal, requestSignal)
+        else result = await request(() => this.api.progressCard(route, payload, requestSignal), terminal, requestSignal)
+        if (result.ok) {
+          if (!entry) { entry = { id: result.value, seq: 1 }; pageCards.set(page, entry) }
+          entry.serialized = serialized
+        } else {
+          okay = false; pageIssue = true
+          if (!entry && result.status !== 429) pageCards.set(page, { uncertain: true })
+          if (result.status === 429) break
+        }
+      }
+      return okay
+    }
     const schedule = () => {
       if (!active() || flight) return
       const when = Math.max(dueAt, this.#retryAt)
@@ -277,7 +307,7 @@ export class Progress {
       if (id) {
         const snapshot = revision
         const result = await request(() => this.api.editProgress(route, id, render(phase), ++seq, true, signal))
-        if (result.ok) shown = snapshot
+        if (result.ok) { shown = snapshot; await syncPages(phase) }
         refreshAt = mayRetry(result.status) ? Date.now() + refreshInterval : Infinity
         editAt = result.ok || result.status === 429 ? Date.now() + editInterval : refreshAt
         // Keep the latest stage pending if a newer one arrived during this request.
@@ -295,6 +325,7 @@ export class Progress {
         const result = await request(() => this.api.progressCard(route, render(phase), signal))
         if (result.ok && result.value) {
           id = result.value
+          await syncPages(phase)
           shown = snapshot
           editAt = Date.now() + editInterval
           refreshAt = Date.now() + refreshInterval
@@ -331,7 +362,9 @@ export class Progress {
       const finishSignal = interrupted && outcome === 'stopped' ? terminalSignal : signal
       if (!id || blocked || finishSignal.aborted || !outcomes.includes(outcome)) return false
       const deadline = Date.now() + terminalWaitBudget
-      const payload = render(outcome, detail, interrupted)
+      const pagesOkay = await syncPages(outcome, detail, interrupted, true, finishSignal)
+      const warning = pageIssue ? '部分步骤卡未确认送达，记录可能不完整。' : ''
+      const payload = render(outcome, [detail, warning].filter(Boolean).join(' '), interrupted)
       const terminalSeq = ++seq
       for (let attempt = 0; attempt < 2; attempt++) {
         let when = Math.max(this.#retryAt, attempt ? Date.now() + editInterval : 0)
@@ -343,7 +376,7 @@ export class Progress {
         if (finishSignal.aborted) return false
         // Identical payload and sequence make a retry safe if the previous edit landed.
         const result = await request(() => this.api.editProgress(route, id, payload, terminalSeq, false, finishSignal), true, finishSignal)
-        if (result.ok) return true
+        if (result.ok) return pagesOkay
         if (blocked) return false
         if (!mayRetry(result.status)) return false
       }
@@ -370,6 +403,12 @@ export class Progress {
       },
       trace(event) {
         if (!active()) return
+        if (event?.kind === 'note') {
+          const value = safeProgressText(event.text, 800)
+          if (!value) return
+          stats.timeline.observe({ ...event, text: value }); changed(); return
+        }
+        if (event?.kind === 'step-end') { stats.timeline.observe(event); changed(); return }
         if (event?.kind === 'step') stats.steps = Math.min(999, stats.steps + 1)
         else if (event?.kind === 'question-open' || event?.kind === 'question-closed') {
           const waiting = event.kind === 'question-open'
@@ -381,7 +420,7 @@ export class Progress {
           stats.calls = Math.min(999, stats.calls + 1)
           stats.pending.add(event.id)
           stats.active = stats.pending.size
-          stats.recent.set(event.id, { label: toolLabels.get(event.name) ?? '调用工具', status: 'active' })
+          stats.recent.set(event.id, { label: safeProgressText(event.title, 100) || toolLabels.get(event.name) || '调用工具', status: 'active' })
           if (stats.recent.size > 4) stats.recent.delete(stats.recent.keys().next().value)
         } else if (event?.kind === 'tool-end' && stats.pending.delete(event.id)) {
           stats.active = stats.pending.size
@@ -390,6 +429,7 @@ export class Progress {
           if (row) row.status = event.failed ? 'failed' : 'done'
         } else if (event?.kind === 'file-sent') stats.files = Math.min(5, stats.files + 1)
         else return
+        stats.timeline.observe(event, safeProgressText(event.title, 100) || toolLabels.get(event.name) || '调用工具')
         changed()
       },
       finish: (outcome, options) => finishing ??= finish(outcome, options),

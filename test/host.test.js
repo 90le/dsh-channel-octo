@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { DshHost } from '../src/dsh.js'
 import { OCTO_STOP } from '../src/im-controls.js'
 
-function fakeHost({ toolGuard = true, reason = 'completed' } = {}) {
+function fakeHost({ toolGuard = true, reason = 'completed', onPrompt } = {}) {
   const events = new EventEmitter()
   const calls = []
   const agentId = 'session-unique'
@@ -15,6 +15,7 @@ function fakeHost({ toolGuard = true, reason = 'completed' } = {}) {
       followup(message) {
         calls.push(['prompt', message.content[0].text])
         const emit = (id, type, data) => events.emit('session/event', { id }, { type, data })
+        if (onPrompt) return onPrompt({ agent: this, message, emit, events })
         const content = (text, turn = 2) => ({ turn, message: { content: [{ type: 'text', text }] } })
         events.emit('agent/inbox/claimed', { agent: this, message: { id: 'different' }, turn: 1 })
         emit(agentId, 'assistant/message', content('unrelated', 1))
@@ -59,6 +60,130 @@ test('DSH scopes tools and only forwards the result of the claimed turn', async 
   calls.length = 0
   await host.run({ ...session, created: 1 }, 'hello again', () => assert.fail('should resume'), signal)
   assert.deepEqual(calls[0], ['resume', agentId])
+})
+
+test('progress is scoped to the claimed turn, preserves final text and clears call metadata between runs', async () => {
+  let runNumber = 0
+  const trace = []
+  const final = 'Final **answer** [link](https://example.test)'
+  const { ctx, agentId, events } = fakeHost({ onPrompt({ agent, message, emit, events }) {
+    runNumber++
+    const send = (type, data = {}, turn = 2, id = agent.id) => emit(id, type, { turn, step: 7, ...data })
+    const tool = { callId: 'same-id', name: 'bash', arguments: JSON.stringify({ description: 'Check files', command: 'PRIVATE COMMAND' }) }
+    const output = { message: { toolCallId: 'same-id', content: [{ type: 'text', text: 'PRIVATE OUTPUT\n[exit code: 17]' }] } }
+    send('tool/call', tool) // Unclaimed.
+    events.emit('agent/inbox/claimed', { agent, message, turn: 2 })
+    send('tool/call', tool, 1)
+    send('tool/call', tool, 2, 'other-session')
+    send('tool/result', output) // Foreign/unclaimed calls must not populate the map.
+    if (runNumber === 1) {
+      send('step/start')
+      send('assistant/message', { message: { content: [
+        { type: 'text', text: 'Checking now.' }, { type: 'reasoning', text: 'PRIVATE REASONING' },
+        { type: 'tool-call', arguments: 'PRIVATE ARGS' },
+      ] } })
+      send('assistant/message', { interrupted: true, message: { content: [{ type: 'text', text: 'PRIVATE INTERRUPTED' }] } })
+      send('tool/call', tool)
+      send('tool/result', output, 1)
+      send('tool/result', output, 2, 'other-session')
+      send('tool/result', output)
+      send('step/end')
+    }
+    send('assistant/message', { message: { content: [{ type: 'text', text: final }] } })
+    send('turn/end', { reason: { kind: 'completed' } })
+    send('tool/call', { ...tool, callId: 'after-end' })
+    send('assistant/message', { message: { content: [{ type: 'text', text: 'PRIVATE LATE' }] } })
+  } })
+  const host = new DshHost(ctx, '/fixture', 1000)
+  const run = () => host.run({ session_id: agentId, created: runNumber > 0 }, 'hello', () => {}, new AbortController().signal,
+    undefined, undefined, 1000, false, { onTrace: item => trace.push(item) })
+  assert.equal(await run(), final)
+  assert.deepEqual(trace.slice(0, 5), [
+    { kind: 'step', step: 7 }, { kind: 'note', text: 'Checking now.' },
+    { kind: 'tool-start', id: 'same-id', name: 'bash', title: 'Check files' },
+    { kind: 'tool-end', id: 'same-id', failed: true, summary: '退出码：17' }, { kind: 'step-end', step: 7 },
+  ])
+  assert.equal(trace.length, 6)
+  assert.doesNotMatch(JSON.stringify(trace), /PRIVATE/)
+  trace.length = 0
+  assert.equal(await run(), final)
+  assert.equal(trace.length, 1)
+  assert.equal(trace[0].kind, 'note')
+  assert.equal(events.eventNames().length, 0)
+})
+
+test('mixed turns suppress progress, and a throwing presentation observer cannot alter the final answer', async () => {
+  for (const mixed of [true, false]) {
+    const trace = []
+    const { ctx, agentId } = fakeHost({ onPrompt({ agent, message, emit, events }) {
+      events.emit('agent/inbox/claimed', { agent, message, turn: 2 })
+      if (mixed) events.emit('agent/inbox/claimed', { agent, message: { id: 'foreign' }, turn: 2 })
+      emit(agent.id, 'step/start', { turn: 2, step: 1 })
+      emit(agent.id, 'tool/call', { turn: 2, callId: 'mixed', name: 'read', arguments: '{}' })
+      emit(agent.id, 'tool/result', { turn: 2, message: { toolCallId: 'mixed' } })
+      emit(agent.id, 'assistant/message', { turn: 2, message: { content: [{ type: 'text', text: 'answer' }] } })
+      emit(agent.id, 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+    } })
+    const response = new DshHost(ctx, '/fixture', 1000).run({ session_id: agentId, created: 0 }, 'hello', () => {},
+      new AbortController().signal, undefined, undefined, 1000, false,
+      { onTrace(item) { trace.push(item); throw new Error('renderer failed') } })
+    if (mixed) { await assert.rejects(response, /shared_turn_not_forwarded/); assert.deepEqual(trace, []) }
+    else { assert.equal(await response, 'answer'); assert.equal(trace.length, 4) }
+  }
+})
+
+test('aborted turns suppress late progress and cannot lend call metadata to a later run', async () => {
+  const controller = new AbortController(), trace = []
+  let first = true
+  const { ctx, agentId, events } = fakeHost({ onPrompt({ agent, message, emit, events }) {
+    events.emit('agent/inbox/claimed', { agent, message, turn: 2 })
+    if (first) {
+      emit(agent.id, 'tool/call', { turn: 2, callId: 'unfinished', name: 'bash', arguments: '{}' })
+      controller.abort(OCTO_STOP)
+      first = false
+    }
+    emit(agent.id, 'tool/result', { turn: 2, message: { toolCallId: 'unfinished',
+      content: [{ type: 'text', text: 'PRIVATE\n[exit code: 13]' }] } })
+    emit(agent.id, 'assistant/message', { turn: 2, message: { content: [{ type: 'text', text: 'answer' }] } })
+    emit(agent.id, 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  } })
+  const host = new DshHost(ctx, '/fixture', 1000)
+  const run = signal => host.run({ session_id: agentId, created: 0 }, 'hello', () => {}, signal,
+    undefined, undefined, 1000, false, { onTrace: item => trace.push(item) })
+  await assert.rejects(run(controller.signal), error => error === OCTO_STOP)
+  assert.deepEqual(trace, [{ kind: 'tool-start', id: 'unfinished', name: 'bash' }])
+  trace.length = 0
+  assert.equal(await run(new AbortController().signal), 'answer')
+  assert.deepEqual(trace, [{ kind: 'note', text: 'answer' }])
+  assert.equal(events.eventNames().length, 0)
+})
+
+test('host traces native step zero, redacts Octo tokens and emits Chinese failure diagnoses', async () => {
+  const trace = []
+  const { ctx, agentId } = fakeHost({ onPrompt({ agent, message, emit, events }) {
+    events.emit('agent/inbox/claimed', { agent, message, turn: 0 })
+    const send = (type, data = {}) => emit(agent.id, type, { turn: 0, step: 0, ...data })
+    send('step/start')
+    send('tool/call', { callId: 'read-1', name: 'read', arguments: JSON.stringify({ path: '/root/private/a.md' }) })
+    send('tool/result', { message: { toolCallId: 'read-1', content: [{ type: 'text', text: 'PRIVATE CONTENT' }] },
+      error: { code: 'permission_denied', reason: 'PRIVATE REASON bf_secret app_secret' } })
+    send('tool/call', { callId: 'exec-1', name: 'exec', arguments: JSON.stringify({ description: '检查 bf_secret app_secret', command: 'PRIVATE COMMAND' }) })
+    send('tool/result', { message: { toolCallId: 'exec-1' }, error: {} })
+    send('assistant/message', { message: { content: [{ type: 'text', text: '公开说明 bf_secret app_secret' }] } })
+    send('step/end')
+    send('turn/end', { reason: { kind: 'completed' } })
+  } })
+  const final = await new DshHost(ctx, '/fixture', 1000).run({ session_id: agentId, created: 0 }, 'hello', () => {},
+    new AbortController().signal, undefined, undefined, 1000, false, { onTrace: item => trace.push(item) })
+  // Progress filtering must not rewrite the existing final-forwarding path.
+  assert.equal(final, '公开说明 bf_secret app_secret')
+  assert.deepEqual(trace[0], { kind: 'step', step: 0 })
+  assert.equal(trace[1].title, '读取文件 · a.md')
+  assert.deepEqual(trace[2], { kind: 'tool-end', id: 'read-1', failed: true, summary: '工具报告错误（permission_denied）：权限不足' })
+  assert.deepEqual(trace[4], { kind: 'tool-end', id: 'exec-1', failed: true, summary: '工具报告错误' })
+  assert.equal(trace[5].kind, 'note')
+  assert.deepEqual(trace[6], { kind: 'step-end', step: 0 })
+  assert.doesNotMatch(JSON.stringify(trace), /bf_secret|app_secret|PRIVATE|\/root/)
 })
 
 test('only a confirmed missing native session permits recovery without replaying a turn', async () => {

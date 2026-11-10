@@ -22,7 +22,7 @@ const template = {
 const compact = { ...template, elements: ['TextBlock', 'Container', 'ColumnSet', 'Image'], actions: ['Action.ToggleVisibility'] }
 const labels = {
   queued: '已收到，等待 DSH 开始处理', running: 'DSH 正在处理', responding: '正在生成回复',
-  completed: '回复已发送', error: '本次回复未完成，请先核对 DSH 执行状态', stopped: '回复发送待确认',
+  completed: '回复已发送', error: '本次回复未完成，展开查看步骤及原因', stopped: '回复发送待确认',
 }
 
 function clock(t) {
@@ -385,7 +385,7 @@ test('compact progress keeps three visible lines, resets each frame, and edits t
   assert.match(JSON.stringify(editing.frame.card), /执行中/)
   const edited = localCard(editing.frame.card)
   edited.expanded('dsh_progress', false)
-  edited.expanded('dsh_progress_tools', false)
+  edited.expanded('dsh_progress_step_1_page_0', false)
   handle.trace({ kind: 'tool-end', id: 'read' })
   handle.trace({ kind: 'file-sent' })
   await tick(3_600_000)
@@ -405,10 +405,10 @@ test('outer and group arrows preserve siblings while bulk arrows set every discl
   handle.trace({ kind: 'file-sent' })
   await tick(450)
   const frame = f.calls.at(-1).frame, local = localCard(frame.card), count = f.calls.length
-  const outer = 'dsh_progress', tools = outer + '_tools', files = outer + '_files'
+  const outer = 'dsh_progress', tools = outer + '_step_1_page_0', files = outer + '_files'
   for (const id of [outer, tools, files]) local.expanded(id, false)
   const details = local.byId.get('dsh_progress_details')
-  assert.match(JSON.stringify(details), /工具执行.*文件交付/)
+  assert.match(JSON.stringify(details), /第 1 步.*文件交付/)
   local.click(outer + '_open')
   local.expanded(tools, false)
   local.expanded(files, false)
@@ -436,7 +436,7 @@ test('outer and group arrows preserve siblings while bulk arrows set every discl
   await handle.finish('completed')
 })
 
-test('group IDs stay stable, tool history is bounded to four, and compact idle refresh remains 15 seconds', async t => {
+test('group IDs stay stable, all six tools remain visible, and idle refresh remains 15 seconds', async t => {
   const tick = clock(t), f = fixture({ profile: () => compact })
   const handle = f.progress.start(job, 'auto', new AbortController().signal)
   handle.trace({ kind: 'file-sent' })
@@ -450,18 +450,15 @@ test('group IDs stay stable, tool history is bounded to four, and compact idle r
   await tick(800)
   const frame = f.calls.at(-1).frame, local = localCard(frame.card)
   assert.deepEqual([...local.byId.keys()].filter(id => id.includes('_files_')), fileIds)
-  const items = local.byId.get('dsh_progress_tools_details').items
-  assert.equal(items[0].text, '最近 4 次工具操作')
-  assert.equal(items.length, 5)
-  const columns = items.at(-1).columns
-  assert.deepEqual(columns.map(column => column.width), ['8px', 'auto', 'auto', 'stretch'])
-  assert.equal(columns[1].items[0].color, 'Attention')
-  assert.equal(columns[2].items[0].text, '调用工具')
-  assert.equal(columns[2].items[0].color, undefined)
-  assert.equal(columns[3].items[0].text, '未完成')
-  assert.equal(columns[3].items[0].isSubtle, true)
-  assert.equal(columns[3].items[0].color, undefined)
-  assert.doesNotMatch(JSON.stringify(items), /读取文件|写入文件/)
+  const items = local.byId.get('dsh_progress_step_1_page_0_details').items
+  assert.equal(items.filter(row => row.type === 'Container').length, 6)
+  const last = items.at(-1).items
+  assert.equal(last[0].color, 'Attention')
+  assert.equal(last[0].text, '! 调用工具')
+  assert.match(last[1].text, /未成功/)
+  assert.equal(last[1].isSubtle, true)
+  assert.match(JSON.stringify(items), /读取文件/)
+  assert.match(JSON.stringify(items), /写入文件/)
   assert.doesNotMatch(JSON.stringify(f.calls), /private-/)
   const ids = [...local.byId.keys()]
   local.click('dsh_progress_all_open')
@@ -472,7 +469,7 @@ test('group IDs stay stable, tool history is bounded to four, and compact idle r
   const refreshed = localCard(f.calls.at(-1).frame.card)
   assert.equal(f.calls.filter(c => c.type === 'edit').length, count + 1)
   assert.deepEqual([...refreshed.byId.keys()], ids)
-  for (const id of ['dsh_progress', 'dsh_progress_tools', 'dsh_progress_files']) refreshed.expanded(id, false)
+  for (const id of ['dsh_progress', 'dsh_progress_step_1_page_0', 'dsh_progress_files']) refreshed.expanded(id, false)
   await handle.finish('error')
   assert.equal(f.calls.at(-1).frame.card.body[0].items[1].color, 'Attention')
 })
@@ -562,4 +559,57 @@ test('a rejected compact card falls back to a basic card and continues editing i
   assert.equal(await handle.finish('completed'), true)
   assert.equal(f.calls.at(-1).id, '456')
   assert.ok(f.calls.at(-1).frame.card.body.every(e => e.type === 'TextBlock'))
+})
+
+
+test('long progress pages preserve every step, title and public note and finish all cards', async t => {
+  const tick = clock(t); let count = 0
+  const f = fixture({ profile: () => compact, create: () => String(500 + ++count) })
+  const h = f.progress.start(job, 'auto', new AbortController().signal)
+  for (let i = 1; i <= 24; i++) {
+    h.trace({ kind: 'step', step: i })
+    h.trace({ kind: 'tool-start', id: 'task-' + i, name: 'bash', title: '核对项目 ' + i })
+    h.trace({ kind: 'tool-end', id: 'task-' + i, summary: i === 4 ? '退出码：2' : '已返回检查结果', failed: i === 4 })
+    h.trace({ kind: 'note', text: '阶段记录 ' + i })
+    h.trace({ kind: 'step-end', step: i })
+  }
+  await tick(450)
+  assert.equal(await h.finish('completed'), true)
+  const final = new Map(f.calls.filter(c => c.type === 'edit').map(c => [c.id, c.frame]))
+  assert.equal(final.size, count)
+  const serialized = JSON.stringify([...final.values()])
+  for (let i = 1; i <= 24; i++) { assert.ok(serialized.includes('核对项目 ' + i)); assert.ok(serialized.includes('阶段记录 ' + i)) }
+  assert.match(serialized, /退出码：2/)
+  for (const f of final.values()) {
+    assert.ok(elements(f.card).length < 180, 'below the server 200-node limit including actions')
+    localCard(f.card).click('dsh_progress_all_open')
+    assert.match(f.plain, /回复已发送/)
+  }
+})
+
+test('late parallel results update their original page and missing page deliveries are explicit', async t => {
+  const tick = clock(t); let count = 0
+  const f = fixture({ profile: () => compact, create: () => String(500 + ++count) })
+  const h = f.progress.start(job, 'auto', new AbortController().signal)
+  h.trace({ kind: 'step', step: 1 })
+  for (let i = 0; i < 26; i++) h.trace({ kind: 'tool-start', id: ''+i, name: 'read', title: '读取项目 '+i })
+  await tick(450)
+  h.trace({ kind: 'tool-end', id: '0', summary: '文件已读取' })
+  h.trace({ kind: 'step-end', step: 1 })
+  assert.equal(await h.finish('stopped', { interrupted: true }), true)
+  const first = f.calls.filter(c => c.type === 'edit' && c.id === '501').at(-1).frame
+  assert.match(JSON.stringify(first), /文件已读取/)
+  assert.match(JSON.stringify(first), /结果未确认/)
+  assert.doesNotMatch(JSON.stringify(first), /步骤已结束/)
+})
+
+test('an uncertain continuation-card create is never duplicated and warns about incomplete records', async t => {
+  const tick = clock(t); let count = 0
+  const f = fixture({ profile: () => compact, create: () => { if (++count === 2) throw new OctoError('unconfirmed', 503); return '501' } })
+  const h = f.progress.start(job, 'auto', new AbortController().signal)
+  for (let i = 0; i < 15; i++) h.trace({ kind: 'tool-start', id: ''+i, name: 'read' })
+  await tick(450)
+  assert.equal(await h.finish('completed'), false)
+  assert.equal(count, 2)
+  assert.match(JSON.stringify(f.calls.at(-1).frame), /记录可能不完整/)
 })

@@ -8,6 +8,7 @@ import { mountApprovalAdapter } from './approval.js'
 import { OCTO_STOP } from './im-controls.js'
 import { resolveOctoQuoteOrder } from './octo-quote.js'
 import { assistantInstructions } from './assistants.js'
+import { createProgressEvents } from './progress-events.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
@@ -178,6 +179,10 @@ export class DshHost {
             : channelNames.size ? 'This turn can use ONLY its listed Octo current-channel tools. Use those tools for real group/member/thread/message operations, not DSH Agent Team operations. You cannot use workspace, terminal or file-generation tools. Complete the requested actions with the actual tools before the final answer; a plan is not a result. Report every denial or unsupported action honestly, without saying you will execute unavailable tools.'
               : 'This Octo turn is in text-only mode. No tools or workspace actions are available. Do not claim that you checked, created, edited, or sent a file. Explain the limitation when asked to perform an action.',
         }))
+        if (extras.taskContext) cleanup.push(prompt.context({
+          name: 'dsh-channel-octo.public-progress', order: 50, interpolate: false,
+          text: 'For multi-step work, give concise user-facing progress notes at meaningful stage boundaries, using the conversation language. Give tool calls concrete purpose descriptions when supported. Summarize only observed results and actual blockers; distinguish tool completion from task completion. Do not publish internal reasoning, credentials, or raw sensitive output. Continue the work after a progress note; it is not the final answer. Avoid redundant notes for simple replies.',
+        }))
         if (extras.channelTools) cleanup.push(prompt.context({
           name: 'dsh-channel-octo.channel-tools', order: 53, interpolate: false, required: true,
           text: extras.channelTools.guidance,
@@ -282,6 +287,7 @@ export class DshHost {
     let claimedTurn, attempt, finalText = '', open = true
     const steering = new Map()
     const otherTurns = new Set(), deliverables = new Set(), pendingCalls = new Set()
+    const progress = createProgressEvents()
     const dispose = []
     try {
       return await new Promise((resolve, reject) => {
@@ -337,17 +343,19 @@ export class DshHost {
         }, { global: true }))
         dispose.push(this.ctx.on('session/event', (session, event) => {
           if (session?.id !== agent.id || claimedTurn === undefined || event?.data?.turn !== claimedTurn) return
+          if (open && authority.active && !authority.mixed && !signal.aborted) {
+            const item = progress.extract(event)
+            // Presentation observers must not change final-answer semantics.
+            if (item) { try { trace(item) } catch {} }
+          } else progress.clear()
           if (event.type === 'step/start') {
             finalText = ''
-            trace({ kind: 'step' })
           } else if (event.type === 'tool/call') {
             finalText = ''
             pendingCalls.add(event.data.callId)
-            trace({ kind: 'tool-start', id: event.data.callId, name: event.data.name })
           } else if (event.type === 'tool/result') {
-            const { toolCallId: callId, isError } = event.data.message ?? {}
+            const { toolCallId: callId } = event.data.message ?? {}
             pendingCalls.delete(callId)
-            trace({ kind: 'tool-end', id: callId, failed: !!(isError || event.data.error) })
           } else if (event.type === 'assistant/message') {
             const parts = event.data.message?.content
             const text = Array.isArray(parts)
@@ -394,6 +402,7 @@ export class DshHost {
         })
       })
     } finally {
+      progress.clear()
       open = false
       authority.active = false
       authority.turn = undefined
