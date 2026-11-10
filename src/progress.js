@@ -13,7 +13,7 @@ const labels = {
   approval: '等待你批准这次操作',
   completed: '回复已发送',
   stopped: '回复发送待确认',
-  error: '本次回复未完成，展开查看步骤及原因',
+  error: '本次回复未完成',
 }
 
 const stages = ['queued', 'running', 'responding', 'delivering']
@@ -139,57 +139,48 @@ function compactBody(status, summary, tone, phases, stats, note) {
     text(status, { color: tone, spacing: 'None' }),
     text(summary, { isSubtle: true, size: 'Small' }),
     { type: 'Container', id: outer + '_details', isVisible: false, separator: true, spacing: 'Small', items: [
-      ...(stats.steps ? [text('已进入 ' + stats.steps + ' 个处理步骤；工具返回不等于目标已完成', { isSubtle: true })] : []),
+
       ...groups.map(group => ({ type: 'Container', spacing: 'Small', items: [
         { type: 'ColumnSet', spacing: 'None', columns: [
           column('stretch', [text(group.thought, { spacing: 'None' })]),
+          ...(group.status ? [column('auto', [text(group.status, { color: group.tone ?? 'Default', isSubtle: true, spacing: 'None', size: 'Small' })])] : []),
           column('auto', chevrons(group.id, group.thought, expanded => disclosureTargets(group.id, expanded))),
         ] },
         ...(group.summary ? [text(group.summary, { isSubtle: true })] : []),
         { type: 'Container', id: group.id + '_details', isVisible: false, spacing: 'Small', items: [
           ...group.actions.map((item, index) => ({ type: 'Container', spacing: index === 0 ? 'None' : 'Small', items: [
-            text(item.statusGlyph + ' ' + item.tool, { color: item.statusTone, spacing: 'None', weight: 'Bolder' }),
-            text(item.detail, { isSubtle: true, spacing: 'Small' }),
+            text(item.detail, { isSubtle: true, spacing: 'None' }),
           ] })),
         ] },
       ] })),
-      ...(note ? [text(note, { color: stats.failed ? 'Warning' : tone })] : []),
+      ...(note ? [text(note, { isSubtle: true })] : []),
     ] },
   ] }]
 }
 
-function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted, pageIndex = 0) {
+function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   const terminal = outcomes.includes(phase)
   const actual = !terminal && stats.approval ? 'approval' : !terminal && stats.waiting ? 'question'
     : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
   const label = interrupted ? '任务已停止' : labels[actual]
   const state = wireStates[actual] ?? actual
   const elapsed = '已用时 ' + duration(seconds)
-  const summary = pageIndex ? '步骤记录 · 后续进度见最新卡片' : [elapsed, stats.calls && stats.calls + ' 次工具', stats.files && '已发 ' + stats.files + ' 个文件']
-    .filter(Boolean).join(' · ')
-  const descriptions = [...stats.recent.values()].slice(-4).map(row =>
-    action(row.label, row.status === 'done' ? '已完成' : row.status === 'failed' ? '未完成' : terminal ? '未确认结束' : '执行中', row.status))
-  const note = safeProgressText(detail, 500) || (stats.failed ? stats.failed + ' 次工具未成功，请展开查看对应步骤；工具返回不等于目标完成。' : '')
-  const phases = stats.timeline?.groups(pageIndex, terminal, interrupted, safeProgressText) ?? []
-  if (!stats.timeline?.pages.length && descriptions.length) phases.push({ thought: '工具执行', actions: descriptions })
-  if (stats.files && pageIndex === 0) phases.push({ thought: '文件交付', actions: [action('Octo 附件', '已确认发送 ' + stats.files + ' 个文件', 'done')] })
-  if (!phases.length) phases.push({ thought: stats.steps ? '会话处理' : '请求已接收',
-    actions: [action('DSH', terminal ? phase === 'completed' ? '处理已结束' : interrupted ? '已停止执行' : '未确认完成'
-      : stats.steps ? '已进入 ' + stats.steps + ' 个处理步骤' : '等待模型开始',
-      phase === 'completed' ? 'done' : terminal ? 'failed' : 'active')] })
+  const summary = [elapsed, stats.files && '已发 ' + stats.files + ' 个文件'].filter(Boolean).join(' · ')
+  const view = stats.timeline.view(terminal, interrupted, safeProgressText)
+  const note = [view.notice, phase !== 'completed' && safeProgressText(detail, 160)].filter(Boolean).join(' · ')
+  const phases = view.groups
+  if (stats.files) phases.push({ id: 'dsh_progress_files', thought: '文件交付', status: '已完成', actions: [action('Octo 附件', '已发送 ' + stats.files + ' 个文件', 'done')] })
+  if (!phases.length) phases.push({ id: 'dsh_progress_session', thought: '处理状态', actions: [action('DSH', label)] })
   const tone = state === 'error' ? 'Attention' : state === 'completed' ? 'Good' : state === 'stopped' ? 'Warning' : 'Accent'
   const current = actual === 'tool' && [...stats.recent.values()].reverse().find(row => row.status === 'active')
-  const status = pageIndex && !terminal ? '步骤详情' : current ? '正在' + current.label : label
+  const status = current ? '正在' + current.label : label
   if (mode === 'compact' || mode === 'display') {
-    const pageLabel = (stats.timeline?.pages.length ?? 0) > 1 ? ` · 第 ${pageIndex + 1} 页` : ''
     const body = mode === 'compact' ? compactBody(status, summary, tone, phases, stats, note) : [
       text('DSH 回复进度', { weight: 'Bolder' }), text(status, { color: tone }), text(summary, { isSubtle: true, size: 'Small' }),
       ...phases.flatMap(group => [text(group.thought, { weight: 'Bolder' }), ...(group.summary ? [text(group.summary)] : []),
         ...group.actions.map(a => text(a.statusGlyph + ' ' + a.tool + '：' + a.detail))]),
       ...(note ? [text(note)] : []),
     ]
-    if (mode === 'compact') body[0].items[0].columns[0].items[0].text += pageLabel
-    else body[0].text += pageLabel
     return { profile: 'octo/v1', card_version: '1.5', plain: status + ' · ' + summary + (note ? ' · ' + note : ''),
       card: { type: 'AdaptiveCard', version: '1.5', body } }
   }
@@ -247,10 +238,8 @@ export class Progress {
     let tryCard = mode === 'auto', probeAt = started, dueAt = started + initialDelay
     let editAt, refreshAt, scheduledAt
     const active = () => !closed && !blocked && !signal.aborted
-    const render = (state, detail, interrupted, page = 0) => frame(format, reasoningId + (page ? '-page-' + page : ''), state,
-      Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail, interrupted, page)
-    const pageCards = new Map()
-    let pageIssue = false
+    const render = (state, detail, interrupted) => frame(format, reasoningId, state,
+      Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail, interrupted)
     const clearTimer = () => {
       clearTimeout(timer)
       timer = scheduledAt = undefined
@@ -268,29 +257,6 @@ export class Progress {
       if (blocked || requestSignal.aborted || (!terminal && closed)) throw new Error('progress_closed')
       return fn()
     }, requestSignal)
-    const syncPages = async (state, detail, interrupted, terminal = false, requestSignal = signal) => {
-      let okay = true
-      for (let page = 1; page < stats.timeline.pages.length; page++) {
-        if (requestSignal.aborted || blocked || (!terminal && closed)) return false
-        let entry = pageCards.get(page)
-        if (entry?.uncertain) { okay = false; continue }
-        const payload = render(state, detail, interrupted, page)
-        const serialized = stats.timeline.stamp(page, terminal) + ':' + (terminal ? state : 'active') + ':' + !!interrupted + ':' + (detail ?? '')
-        if (entry?.serialized === serialized) continue
-        let result
-        if (entry?.id) result = await request(() => this.api.editProgress(route, entry.id, payload, ++entry.seq, !terminal, requestSignal), terminal, requestSignal)
-        else result = await request(() => this.api.progressCard(route, payload, requestSignal), terminal, requestSignal)
-        if (result.ok) {
-          if (!entry) { entry = { id: result.value, seq: 1 }; pageCards.set(page, entry) }
-          entry.serialized = serialized
-        } else {
-          okay = false; pageIssue = true
-          if (!entry && result.status !== 429) pageCards.set(page, { uncertain: true })
-          if (result.status === 429) break
-        }
-      }
-      return okay
-    }
     const schedule = () => {
       if (!active() || flight) return
       const when = Math.max(dueAt, this.#retryAt)
@@ -307,7 +273,7 @@ export class Progress {
       if (id) {
         const snapshot = revision
         const result = await request(() => this.api.editProgress(route, id, render(phase), ++seq, true, signal))
-        if (result.ok) { shown = snapshot; await syncPages(phase) }
+        if (result.ok) { shown = snapshot }
         refreshAt = mayRetry(result.status) ? Date.now() + refreshInterval : Infinity
         editAt = result.ok || result.status === 429 ? Date.now() + editInterval : refreshAt
         // Keep the latest stage pending if a newer one arrived during this request.
@@ -325,7 +291,6 @@ export class Progress {
         const result = await request(() => this.api.progressCard(route, render(phase), signal))
         if (result.ok && result.value) {
           id = result.value
-          await syncPages(phase)
           shown = snapshot
           editAt = Date.now() + editInterval
           refreshAt = Date.now() + refreshInterval
@@ -362,9 +327,7 @@ export class Progress {
       const finishSignal = interrupted && outcome === 'stopped' ? terminalSignal : signal
       if (!id || blocked || finishSignal.aborted || !outcomes.includes(outcome)) return false
       const deadline = Date.now() + terminalWaitBudget
-      const pagesOkay = await syncPages(outcome, detail, interrupted, true, finishSignal)
-      const warning = pageIssue ? '部分步骤卡未确认送达，记录可能不完整。' : ''
-      const payload = render(outcome, [detail, warning].filter(Boolean).join(' '), interrupted)
+      const payload = render(outcome, detail, interrupted)
       const terminalSeq = ++seq
       for (let attempt = 0; attempt < 2; attempt++) {
         let when = Math.max(this.#retryAt, attempt ? Date.now() + editInterval : 0)
@@ -376,7 +339,7 @@ export class Progress {
         if (finishSignal.aborted) return false
         // Identical payload and sequence make a retry safe if the previous edit landed.
         const result = await request(() => this.api.editProgress(route, id, payload, terminalSeq, false, finishSignal), true, finishSignal)
-        if (result.ok) return pagesOkay
+        if (result.ok) return true
         if (blocked) return false
         if (!mayRetry(result.status)) return false
       }

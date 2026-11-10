@@ -158,7 +158,8 @@ export function createProgressEvents() {
           text += part.text.slice(0, INPUT_LIMIT + 1) + '\n'
           if (text.length > INPUT_LIMIT) break
         }
-        const publicText = safeProgressText(text)
+        const line = text.split(/\r?\n/).map(v => v.trim()).find(v => v && !/^(?:[|]|```|~~~)/.test(v)) ?? ''
+        const publicText = safeProgressText(line.replace(/^[#>*\s]+/, '').replace(/\*\*/g, ''), 120)
         // The renderer labels this as 过程说明; only public text blocks enter it.
         if (publicText) return { kind: 'note', text: publicText }
       }

@@ -113,7 +113,7 @@ test('public assistant text is extracted for the renderer label; interrupted mes
     { type: 'text', text: 'Next I will compare totals.' },
   ] }, stream: [{ text: 'PRIVATE STREAM' }] }
   assert.deepEqual(progress.extract(event('assistant/message', data)), {
-    kind: 'note', text: 'Checking the report. Next I will compare totals.',
+    kind: 'note', text: 'Checking the report.',
   })
   assert.equal(progress.extract(event('assistant/message', { ...data, interrupted: true })), undefined)
   assert.equal(progress.extract(event('assistant/attempt', data)), undefined)
