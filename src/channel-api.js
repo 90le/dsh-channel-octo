@@ -168,6 +168,7 @@ export const CHANNEL_API_OPERATIONS = freeze([
   // visibility checks; a group admin role cannot authorize other groups.
   spec('groups.discover', 'Cross-group discovery requires a separate owner context with requester visibility checks.', schema(), false, 'separate_owner_context_required'),
   spec('rules.read', 'Read the current parent group rules.'),
+  spec('group.mention_preference', 'Diagnose whether this group allows replies without an @mention. In a topic, reads its parent group policy. Reports the live Octo decision and the local DSH trigger mode. A policy permitting no-@ does not authorize a specific sender or message.'),
   spec('rules.edit', 'Update/clear parent group rules; requester must be group owner/admin and server must grant bot_admin.',
     schema({ content: { type: 'string', maxLength: 10240 } }, ['content']), true),
   spec('group.edit', 'Update parent group name/notice; requester must be group owner/admin and server must grant bot_admin.',
@@ -210,6 +211,9 @@ export const CHANNEL_API_OPERATIONS = freeze([
       all: { type: 'boolean' } }, ['text']), true),
   spec('messages.edit', 'Edit a bot-authored plain text message in this channel; group requester must be owner/admin.',
     schema({ message_id: messageID, text }, ['message_id', 'text']), true),
+  { ...spec('messages.send_richtext', 'Send one native rich-text message with ordered text and images to the current conversation on explicit user request. Images must be explicitly supplied public HTTPS URLs with their actual dimensions, and file handling must be enabled. Use DSH present for workspace files. No raw payloads, quotes, mentions, callbacks or automatic retries. Summarize the outcome without repeating the message.', schema({
+    blocks: richtextBlocks, confirm_send: { type: 'boolean', const: true },
+  }, ['blocks', 'confirm_send']), true), requiresHostTools: true },
   spec('messages.edit_richtext', 'Replace an already-sent bot-authored type-14 richtext message in the current conversation. Group requester must be owner/admin. Supply ordered text/image blocks; images require public HTTPS URLs and dimensions. Max 20 blocks, 8 KiB total UTF-8 content, 24 KiB payload. No uploads, mentions or raw payload. Returns only a confirmed edit receipt; never retry an unconfirmed write automatically.',
     schema({ message_id: messageID, blocks: richtextBlocks }, ['message_id', 'blocks']), true),
   spec('messages.edit_display_card', 'Replace an already-sent bot-authored octo/v1 display card in the current conversation. Group requester must be owner/admin. Uses the same bounded title/blocks and live capability negotiation as octo_display_card. No progress, question, callback, v2 or Registry cards; no raw actions. Max 6 block levels, 200 objects, 8 KiB UTF-8 content and 24 KiB payload. Returns only a confirmed receipt; still provide a short final summary. Never retry an unconfirmed edit automatically.',
@@ -231,7 +235,7 @@ const specs = new Map(CHANNEL_API_OPERATIONS.map(value => [value.name, value]))
 // directory, delegated search or voice operations and let the model discover
 // their incompatibility by issuing failing mutations.
 const appOperations = new Set(['inspect', 'messages.recent', 'messages.read', 'messages.user_info', 'messages.users_batch',
-  'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.edit_richtext', 'messages.edit_display_card',
+  'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.send_richtext', 'messages.edit_richtext', 'messages.edit_display_card',
   'messages.clear_card_revisions', ...registryOperations])
 const errorHints = Object.freeze({
   account_configuration_changed: '账号配置已变更，此次旧配置下的操作已停止。请基于当前配置重新确认；已经发出的写请求不会自动重试。',
@@ -489,6 +493,7 @@ export class ChannelApi {
     this.#config = {
       botUid: config.botUid, spaceId: config.spaceId, botKind: config.botKind,
       senderPolicy: config.senderPolicy ?? 'octo', channelPolicy: config.channelPolicy ?? 'joined',
+      mentionPolicy: config.mentionPolicy ?? 'required', transport: config.transport, allowFiles: config.allowFiles === true,
       allowed: new Set(config.allowed ?? []), groups: new Set(config.groups ?? []), threads: new Set(config.threads ?? []),
     }
     if (!['octo', 'allowlist'].includes(this.#config.senderPolicy)
@@ -1302,6 +1307,31 @@ export class ChannelApi {
     const definition = specs.get(operation)
     if (!definition) fail('unknown_operation')
     if (this.#config.botKind === 'app' && !this.supports(operation)) fail('api_unsupported')
+    if (operation === 'messages.send_richtext') {
+      if (!object(args) || ![Object.prototype, null].includes(Object.getPrototypeOf(args))
+        || Reflect.ownKeys(args).length !== 2) fail('invalid_arguments')
+      const fields = Object.getOwnPropertyDescriptors(args)
+      if (!Object.hasOwn(fields, 'blocks') || !Object.hasOwn(fields.blocks, 'value')
+        || !Object.hasOwn(fields, 'confirm_send') || !Object.hasOwn(fields.confirm_send, 'value')) fail('invalid_arguments')
+      if (fields.confirm_send.value !== true) fail('explicit_confirmation_required')
+      const content = displayWork(() => normalizeRichtextBlocks(fields.blocks.value))
+      if (content.some(block => block.type === 'image') && !this.#config.allowFiles) fail('files_disabled')
+      if (!(signal instanceof AbortSignal)) fail('invalid_arguments')
+      signal = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
+      const scope = this.#scope(route)
+      if (typeof runtime?.richtextActive !== 'function' || typeof runtime?.authorizeRichtext !== 'function'
+        || runtime.richtextActive() !== true) fail('requester_not_allowed')
+      await this.#access(scope, sender, true, signal, true)
+      if (scope.thread) await this.#activeSendTopic(scope, sender, signal)
+      if (await runtime.authorizeRichtext(signal) !== true || runtime.richtextActive() !== true || signal.aborted || this.#revoked) {
+        fail('requester_not_allowed')
+      }
+      const raw = await this.#mutation('/v1/bot/sendMessage', { ...scope.route, payload: { type: 14, content } }, signal)
+      const message_id = id(raw?.message_id)
+      if (!message_id) fail('mutation_unconfirmed')
+      return { ok: true, message_id, format: 'richtext', requiresFinalSummary: true,
+        ...(raw.authority_changed === true && { authority_changed: true }) }
+    }
     if (isOctoDiscoveryOperation(operation)) {
       if (!this.#discovery) fail('api_unsupported')
       return this.#discovery.dispatch(route, sender, operation, args, signal)
@@ -1404,6 +1434,20 @@ export class ChannelApi {
     const thread = operation.startsWith('thread.') ? this.#threadPath(scope, args) : undefined
     const access = await this.#access(scope, sender, definition.mutating, signal, scopedRead || delegatedSearch || proactive)
     const requireAdmin = () => { if (scope.group && !admin(access.actor)) fail('requester_admin_required') }
+
+    if (operation === 'group.mention_preference') {
+      await this.#currentReadScope(scope, access, signal)
+      const raw = await this.#call(scope.root + '/mention_pref', undefined, signal)
+      const bit = value => [true, false, 0, 1].includes(value)
+      const effective = raw?.effective ?? raw?.no_mention
+      const groupAllows = raw?.group_allow_no_mention
+      if (!object(raw) || !bit(effective) || groupAllows !== undefined && !bit(groupAllows)) fail('invalid_api_response')
+      const serverNoMention = flag(effective) && (groupAllows === undefined || flag(groupAllows))
+      const pluginFollowsOcto = this.#config.mentionPolicy === 'octo' && this.#config.transport === 'websocket'
+      return { group_no: scope.group, source: scope.thread ? 'parent_group' : 'group', server_no_mention: serverNoMention,
+        group_allows_no_mention: groupAllows === undefined ? null : flag(groupAllows),
+        plugin_follows_octo: pluginFollowsOcto, requires_mention: !serverNoMention || !pluginFollowsOcto }
+    }
 
     if (delegatedSearch) return this.#authorizedSearch(scope, sender, operation, args, signal)
     if (proactive) return this.#proactive(scope, sender, operation, args, signal, prepared, runtime)

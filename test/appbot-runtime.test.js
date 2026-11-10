@@ -132,7 +132,7 @@ test('App interaction stays bound to the exact Bot, peer, operator, message and 
 test('App channel tools expose only current DM operations and reject unsupported calls before network access', async () => {
   const f = fixture(() => { throw new Error('unsupported operations must never reach the network') })
   const allowed = ['inspect', 'messages.recent', 'messages.read', 'messages.user_info', 'messages.users_batch',
-    'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.edit_richtext', 'messages.edit_display_card',
+    'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.send_richtext', 'messages.edit_richtext', 'messages.edit_display_card',
     'messages.clear_card_revisions', 'cards.registry.list', 'cards.registry.send', 'cards.registry.edit']
   assert.deepEqual(CHANNEL_API_OPERATIONS.filter(s => f.api.channel.supports(s.name)).map(s => s.name).sort(), allowed.sort())
   for (const operation of CHANNEL_API_OPERATIONS.filter(s => !allowed.includes(s.name))) {

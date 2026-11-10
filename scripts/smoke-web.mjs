@@ -103,11 +103,11 @@ async function assertAppBotSmoke(child, output, deadline) {
   const markers = ['REGISTER_OK', 'WIRE_ACK_OK', 'HUMAN_OK=fixture-user', 'HUMAN_OK=fixture-owner',
     'FRIEND_OK=fixture-user', 'FRIEND_OK=fixture-owner', 'NONOWNER_TEXT_ONLY_OK', 'ORDINARY_OK',
     'MESSAGE_GET_OK=fixture-user:1', 'MESSAGE_GET_OK=fixture-owner:2', 'MESSAGE_GET_OK=fixture-owner:720',
-    'CHANNEL_TOOLS_OK=14',
+    'CHANNEL_TOOLS_OK=15',
     'QUESTION_CARD_OK', 'INVALID_CALLBACKS_IGNORED', 'CALLBACK_ACK_OK', 'QUESTION_FEEDBACK_OK',
-    'UPLOAD_OK', 'FILE_OK', 'FULL_CAPTION_OK', 'DISPLAY_OK', 'FINAL_OK',
-    ...[0, 1, 2, 3, 4, 5].map(step => 'TOOL_SCOPE_OK=' + step),
-    ...[1, 2, 3, 4, 5].map(step => 'NATIVE_TOOL_OK=' + step)].map(marker => 'FIXTURE_APP_' + marker)
+    'UPLOAD_OK', 'FILE_OK', 'FULL_CAPTION_OK', 'DISPLAY_OK', 'RICHTEXT_OK', 'FINAL_OK',
+    ...[0, 1, 2, 3, 4, 5, 6].map(step => 'TOOL_SCOPE_OK=' + step),
+    ...[1, 2, 3, 4, 5, 6].map(step => 'NATIVE_TOOL_OK=' + step)].map(marker => 'FIXTURE_APP_' + marker)
   const complete = () => sentCount() === 2 && markers.every(marker => output().includes(marker))
   while (Date.now() < deadline && child.exitCode === null && !complete() && !output().includes('FIXTURE_APP_FAIL=')) await delay(100)
   if (!complete() || output().includes('FIXTURE_APP_FAIL=')) {
@@ -154,7 +154,7 @@ async function assertAppBotSmoke(child, output, deadline) {
   console.log('PASS: native AppBot register identity and cached encrypted WebSocket; no verify-bot or invented Space.')
   console.log('PASS: active-human batch lookup and friendship sync; ordinary DM text-only, registered owner native workspace tools; isolated DM sessions.')
   console.log('PASS: official person-message GET verified both DM triggers and the stored question card against their exact peers and IDs.')
-  console.log('PASS: owner menu contains exactly 14 App DM channel operations plus display-card, waiting-form and deferred publish/manage tools; native Registry discovery safely reports no catalog.')
+  console.log('PASS: owner menu contains exactly 15 App DM channel operations plus display-card, waiting-form and deferred publish/manage tools; native Registry discovery safely reports no catalog.')
   console.log('PASS: native question-card callback with server Space, wrong operator/route/message/nonce rejection, write/present, file plus full Markdown caption, display receipt and final.')
   console.log('PASS: group/topic inputs rejected; unavailable group/search/proactive/voice tools absent; fake local APIs only.')
 }

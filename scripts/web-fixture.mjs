@@ -941,6 +941,9 @@ async function appBotFixture() {
     + '- 原生 DSH 已接收卡片答案，并写入和展示文件。\n- 展示卡回执：730。\n\n'
     + '保留段落、Markdown、中文和表情；文件与说明均在当前私聊交付。✅\n\nAPPBOT-CAPTION-END'
   const display = { title: 'AppBot result', blocks: [{ type: 'text', text: 'Native file prepared.' }] }
+  const mixed = { confirm_send: true, blocks: [{ type: 'text', text: 'Before the image.' },
+    { type: 'image', url: 'https://files-fixture.invalid/appbot-picture.png', width: 2, height: 3 },
+    { type: 'text', text: 'After the image.' }] }
   const operations = [
     ['ask_user_question', { questions: [{ id: 'appbot-choice', question: 'Prepare the fixture file?', options: [
       { label: 'AppBot answer', description: 'Write and present the file' },
@@ -950,16 +953,17 @@ async function appBotFixture() {
     ['present', { files: [{ path: fileName }] }],
     ['octo_display_card', display],
     ['octo_cards_registry_list', {}],
+    ['octo_messages_send_richtext', mixed],
   ]
   const channelTools = ['inspect', 'messages.recent', 'messages.read', 'messages.user_info', 'messages.users_batch',
-    'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.edit_richtext', 'messages.edit_display_card',
+    'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.send_richtext', 'messages.edit_richtext', 'messages.edit_display_card',
     'messages.clear_card_revisions', 'cards.registry.list', 'cards.registry.send', 'cards.registry.edit']
     .map(name => 'octo_' + name.replaceAll('.', '_'))
   const peer = await wirePeer({ bot, token: 'fixture-app-im-secret' })
   const realFetch = globalThis.fetch
   const checked = new Map(), synced = new Map(), events = new Map()
   const messages = new Map()
-  let registrations = 0, sent = 0, received = 0, step = 0, uploaded = false, fileSent = false
+  let registrations = 0, sent = 0, received = 0, step = 0, uploaded = false, fileSent = false, richtextSent = false
   let validEvent, validReleased = false, feedback = false, displaySent = false, finalReady = false, wireAcked = false
   const fail = reason => {
     console.error('FIXTURE_APP_FAIL=' + reason)
@@ -1123,6 +1127,12 @@ async function appBotFixture() {
           console.log('FIXTURE_APP_DISPLAY_OK')
           return sentMessage('730')
         }
+        if (payload.type === 14) {
+          if (step !== 6 || richtextSent || !isDeepStrictEqual(payload, { type: 14, content: mixed.blocks })) return fail('RICHTEXT_PAYLOAD')
+          richtextSent = true
+          console.log('FIXTURE_APP_RICHTEXT_OK')
+          return sentMessage('731')
+        }
         if (payload.type === 8) {
           if (!finalReady || !uploaded || fileSent || !isDeepStrictEqual(payload, { type: 8, name: fileName,
             url: 'https://files-fixture.invalid/appbot.txt', size: Buffer.byteLength(fileText) })) return fail('FILE_PAYLOAD')
@@ -1187,6 +1197,11 @@ async function appBotFixture() {
         if (step === 5) {
           let catalog; try { catalog = JSON.parse(text) } catch {}
           if (!isDeepStrictEqual(catalog, { available: false, templates: [] })) return fail('REGISTRY_DISCOVERY')
+        }
+        if (step === 6) {
+          let result; try { result = JSON.parse(text) } catch {}
+          if (!richtextSent || !isDeepStrictEqual(result,
+            { ok: true, message_id: '731', format: 'richtext', requiresFinalSummary: true })) return fail('RICHTEXT_RECEIPT')
         }
         console.log('FIXTURE_APP_NATIVE_TOOL_OK=' + step)
       }

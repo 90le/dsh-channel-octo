@@ -946,6 +946,11 @@ export class Worker {
                         authorizeRegistry: async active => !active.aborted && allowed()
                           && await this.api.allowsMessage(sourceConfig, job, active) && !active.aborted && allowed(),
                       }),
+                      ...(operation.name === 'messages.send_richtext' && {
+                        richtextActive: () => !toolSignal?.aborted && allowed(),
+                        authorizeRichtext: async active => !active.aborted && allowed()
+                          && await this.api.allowsMessage(sourceConfig, job, active) && !active.aborted && allowed(),
+                      }),
                       ...(operation.requiresFiles && { prepareFile: async (path, authorize, mediaSignal) => {
                       await check()
                       const file = await readDeliverable(config.cwd, path, mediaSignal)
@@ -961,7 +966,8 @@ export class Worker {
                     // the unrelated "present was not called" heuristic.
                     if (operation.requiresFiles) targetFileAttempted = true
                     const result = await sourceChannel.dispatch(route, job.sender, operation.name, args, toolSignal, runtime)
-                    const acknowledgedTarget = (operation.name.startsWith('messages.send_target') || operation.name === 'cards.registry.send')
+                    const acknowledgedTarget = (operation.name.startsWith('messages.send_target')
+                      || operation.name === 'cards.registry.send' || operation.name === 'messages.send_richtext')
                       && decimalId(result?.message_id)
                     if (acknowledgedTarget) {
                       // Preserve mutation evidence before a later admission
