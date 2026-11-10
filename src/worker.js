@@ -93,7 +93,7 @@ const textCommands = {
 const hostIssues = new Set(['session_busy', 'session_timeout', 'session_preset_conflict',
   'deferred_session_unavailable', 'deferred_configuration_changed',
   'delivery_access_changed',
-  'missing_host_model', 'shared_turn_not_forwarded', 'prompt_discarded', 'no_confirmed_final_text',
+  'missing_host_model', 'shared_turn_not_forwarded', 'prompt_discarded', 'no_confirmed_final_text', 'background_reply_pending',
   'session_missing', 'session_open_failed', 'session_flush_failed', 'session_turn_failed', 'missing_scoped_rule_context',
   'missing_scoped_tool_controls', 'missing_host_permission', 'session_requires_owned_writer', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable'])
 
@@ -110,6 +110,7 @@ const failureDetails = {
   dsh_attachment_storage_unavailable: 'DSH 附件存储暂不可用，请检查服务状态。',
   attachment_unavailable: '本条附件未能读取，请核对附件是否仍可下载。',
   no_confirmed_final_text: 'DSH 没有提交可确认的最终回复。请先在 DSH 查看执行结果，避免重复操作。',
+  background_reply_pending: 'DSH 的后台结果暂未触发主对话续跑。本次没有发送最终结果，请在 DSH 核查执行记录与自动唤醒设置。',
   shared_turn_not_forwarded: '此回合混入了其他来源的输入，回复保留在 DSH 中，请在那里查看。',
   api_permission_denied: 'Octo 拒绝了此次访问，请检查 Bot 的成员身份和当前频道权限。',
   api_authentication_failed: 'Octo 令牌认证失败，请在账号设置中重新验证令牌。',

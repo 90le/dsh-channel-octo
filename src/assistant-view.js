@@ -1,4 +1,62 @@
 
+// Standalone guide in an already-served UI module; no account data or API access.
+// Installation commands verified against the official README on 2026-11-11.
+export function createCliGuide(React, { Button }) {
+  const { createElement: h, useState } = React
+  const repository = 'https://github.com/Mininglamp-OSS/octo-cli'
+  const methods = {
+    npm: 'npm install -g @mininglamp-oss/octo-cli',
+    Bun: 'bun install -g @mininglamp-oss/octo-cli',
+    pnpm: 'pnpm add -g @mininglamp-oss/octo-cli',
+    Go: 'go install github.com/Mininglamp-OSS/octo-cli/cmd/octo-cli@latest',
+  }
+  const link = (label, suffix) => h('a', { href: repository + suffix, target: '_blank', rel: 'noopener noreferrer' }, label)
+  function Command({ label, command }) {
+    const [feedback, setFeedback] = useState('')
+    const copy = async () => {
+      try {
+        await navigator.clipboard.writeText(command)
+        setFeedback('已复制')
+      } catch { setFeedback('无法自动复制，请选中命令手动复制。') }
+    }
+    return h('div', { className: 'dsho-cli-command' },
+      h('div', { className: 'dsho-actions' }, h('span', null, label),
+        h(Button, { type: 'button', size: 'sm', variant: 'outline', onClick: copy, 'aria-label': '复制' + label }, '复制命令')),
+      h('pre', { tabIndex: 0, 'aria-label': label }, h('code', null, command)),
+      h('p', { className: 'dsho-muted', role: 'status', 'aria-live': 'polite' }, feedback))
+  }
+  return function CliGuide() {
+    const [method, setMethod] = useState('npm')
+    return h('section', { className: 'dsho-panel dsho-cli-guide', 'aria-label': 'Octo CLI 使用指南' },
+      h('style', null, `
+.dsho-cli-guide .dsho-cli-command { display:grid; gap:8px; min-width:0; font-size:13px; }
+.dsho-cli-guide pre { margin:0; padding:12px; border:1px solid var(--dsho-edge); border-radius:8px; background:var(--dsho-row); white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.65; user-select:text; }
+.dsho-cli-guide code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+.dsho-cli-guide .dsho-cli-links { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; }
+.dsho-cli-guide a { color:inherit; text-underline-offset:3px; }
+.dsho-cli-guide a:focus-visible,.dsho-cli-guide pre:focus-visible { outline:2px solid var(--dsw-alias-brand-primary,#4b7cff); outline-offset:3px; }
+`),
+      h('div', { className: 'dsho-card dsho-panel' },
+        h('h3', null, 'Octo CLI'),
+        h('p', { className: 'dsho-muted' }, 'Octo 官方命令行工具，让 Agent 或脚本操作消息、文档、网盘与 Loop 任务，返回结构化 JSON。'),
+        h('div', { className: 'dsho-cli-links' }, link('官方仓库', ''), link('安装文档', '#installation'), link('下载发行版', '/releases'))),
+      h('div', { className: 'dsho-card dsho-panel' },
+        h('h3', null, '1 · 安装到运行环境'),
+        h('p', { className: 'dsho-muted' }, '在实际执行命令的电脑或服务器终端安装；如供 DSH Agent 使用，请安装到它的运行环境，并确保命令在 PATH 中可用。'),
+        h('label', { className: 'dsho-field' }, h('span', null, '安装方式'),
+          h('select', { value: method, onChange: event => setMethod(event.target.value) },
+            ...Object.keys(methods).map(value => h('option', { key: value, value }, value === 'npm' ? 'npm（需 Node.js 与 npm）' : value)))),
+        h(Command, { key: method, label: method + ' 安装命令', command: methods[method] }),
+        h('p', { className: 'dsho-muted' }, '选择已安装的包管理器，执行一种方式即可。也可从发行版下载对应系统与架构的文件；Windows 压缩包同样为 .tar.gz。')),
+      h('div', { className: 'dsho-card dsho-panel' },
+        h('h3', null, '2 · 查看可用命令'),
+        h(Command, { label: '离线命令目录', command: 'octo-cli schema --list' }),
+        h('p', { className: 'dsho-muted' }, '此命令使用内置接口定义，无需配置凭据即可查看命令目录。实际业务操作的认证方式请参阅官方快速开始。'),
+        h('div', { className: 'dsho-cli-links' }, link('快速开始与认证', '#quick-start'))),
+      h('p', { className: 'dsho-muted' }, '本页仅提供说明与复制命令，不执行安装，也不读取或传递 Bot 凭据。安装说明核对于 2026-11-11，最新内容以官方文档为准。'))
+  }
+}
+
 const zh = {
   title: '助理配置', intro: '每个 Bot 可绑定一位助理。工作区、模型、预设和权限在此统一管理。',
   add: '新建助理', edit: '编辑', unbound: '暂不绑定', bind: '绑定 Bot', name: '助理名称', cwd: '工作区',

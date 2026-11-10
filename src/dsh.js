@@ -9,12 +9,13 @@ import { OCTO_STOP } from './im-controls.js'
 import { resolveOctoQuoteOrder } from './octo-quote.js'
 import { assistantInstructions } from './assistants.js'
 import { createProgressEvents } from './progress-events.js'
+import { RunContinuations } from './run-continuations.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
   'missing_scoped_tool_controls', 'missing_scoped_rule_context', 'missing_host_permission', 'session_requires_owned_writer',
   'shared_turn_not_forwarded', 'no_confirmed_final_text', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable',
-  'deferred_configuration_changed'])
+  'deferred_configuration_changed', 'background_reply_pending'])
 const modelIdentity = selected => createHash('sha256').update(JSON.stringify([
   selected?.provider ?? null, selected?.model ?? null, selected?.reasoningEffort ?? null,
 ])).digest('hex')
@@ -272,7 +273,17 @@ export class DshHost {
       else if (borrowed && cleanup.length) {
         // A timed out request can still be in DSH's inbox. Keep its safety
         // controls until the Web-owned driver has settled; never cancel Web work.
-        const settled = Promise.resolve().then(() => borrowed.whenIdle()).catch(() => {}).then(release)
+        const settled = (async () => {
+          const children = ctx.get?.('subagents')
+          const join = authority.continuation?.children.size ? children?.waitForTreeWork ?? children?.waitForChildren : undefined
+          while (true) {
+            await borrowed.whenIdle()
+            if (!join) return
+            const seq = borrowed.session?.seq
+            const joined = join ? await join.call(children, borrowed) : false
+            if (!joined && borrowed.status === 'idle' && borrowed.session?.seq === seq) return
+          }
+        })().catch(() => {}).then(release)
         this.#borrowed.set(borrowed, settled)
         void settled.finally(() => {
           if (this.#borrowed.get(borrowed) === settled) this.#borrowed.delete(borrowed)
@@ -285,20 +296,56 @@ export class DshHost {
     const requestId = randomUUID()
     authority.requestId = requestId
     let claimedTurn, attempt, finalText = '', open = true
+    let turnEnded = false, terminalReason, settlement, epoch = 0, contaminated = false
     const steering = new Map()
-    const otherTurns = new Set(), deliverables = new Set(), pendingCalls = new Set()
+    const otherTurns = new Set(), deliverables = new Set(), pendingCalls = new Set(), ownedCalls = new Set()
     const progress = createProgressEvents()
+    const observing = new AbortController()
+    const observationSignal = AbortSignal.any([signal, observing.signal])
+    const continuation = new RunContinuations(this.ctx, agent,
+      () => open && authority.active && !authority.mixed && !signal.aborted, owned, ownedCalls)
+    authority.continuation = continuation
+    let draining
     const dispose = []
     try {
       return await new Promise((resolve, reject) => {
+        const settle = () => {
+          if (settlement) return
+          settlement = (async () => {
+            while (open) {
+              await wait(agent.whenIdle?.(), observationSignal)
+              const seq = agent.session?.seq, revision = epoch
+              const subagents = this.ctx.get?.('subagents')
+              const join = owned || continuation.children.size ? subagents?.waitForTreeWork ?? subagents?.waitForChildren : undefined
+              if (continuation.children.size || continuation.pendingJobs) onStage('background')
+              const children = join ? await wait(join.call(subagents, agent), observationSignal) : false
+              const jobs = await continuation.waitForJobs(observationSignal)
+              if (!open) return
+              if (children || jobs || epoch !== revision || agent.session?.seq !== seq
+                || typeof agent.whenIdle === 'function' && agent.status === 'running') continue
+              open = false
+              authority.active = false
+              authority.turn = undefined
+              if (contaminated || otherTurns.has(claimedTurn)) throw new Error('shared_turn_not_forwarded')
+              if (continuation.hasParkedReply()) throw new Error('background_reply_pending')
+              if ([...steering.values()].some(item => !item.claimed)) throw new Error('prompt_discarded')
+              if (!turnEnded || terminalReason?.kind !== 'completed' || pendingCalls.size
+                || (!finalText.trim() && !deliverables.size)) throw new Error('no_confirmed_final_text')
+              if (deliverables.size) onDeliverables([...deliverables])
+              resolve(finalText.trim() ? finalText : '已生成文件。')
+              return
+            }
+          })().catch(reject)
+        }
         const aborted = () => {
-          if (signal.reason === OCTO_STOP) {
+          {
             // Remove just our pending messages. A borrowed writer may have
             // independently queued Web input; leave that inbox intact.
             const cancelTurn = open && (owned || claimedTurn !== undefined && !authority.mixed)
             open = false
             authority.active = false
             authority.approval?.revoke()
+            continuation.stop()
             for (const id of [requestId, ...steering.keys()]) {
               try { agent.inbox?.remove?.(id) } catch {}
             }
@@ -306,6 +353,15 @@ export class DshHost {
             // cancel a borrowed turn that also claimed another source's input.
             if (cancelTurn) {
               try { agent.cancel?.({ kind: 'user' }, { keepInbox: true }) } catch {}
+              const subagents = this.ctx.get?.('subagents')
+              // Managed descendants belong to this active request. Their late
+              // completion must not wake a stopped parent task.
+              if (owned || continuation.children.size) {
+                try {
+                  draining = Promise.resolve(owned ? subagents?.drainDescendants?.([agent])
+                    : subagents?.drainChildren?.(agent, [...continuation.directChildren])).catch(() => {})
+                } catch {}
+              }
             }
           }
           reject(signal.reason)
@@ -313,14 +369,33 @@ export class DshHost {
         signal.addEventListener('abort', aborted, { once: true })
         dispose.push(() => signal.removeEventListener('abort', aborted))
         const matches = (payload) => payload?.agent?.id === agent.id && payload?.message?.id === requestId
+        dispose.push(this.ctx.on('agent/inbox/inserted', payload => {
+          if (signal.aborted && payload?.agent === agent && continuation.accepts(payload.message)) {
+            // Teardown publishes child-settled notices before it resolves. Do
+            // not let those notices wake a stopped task on a Web-owned writer.
+            agent.inbox?.remove?.(payload.message.id)
+          } else continuation.inserted(payload)
+        }, { global: true }))
         dispose.push(this.ctx.on('agent/inbox/claimed', (payload) => {
           if (payload?.agent?.id !== agent.id || !Number.isSafeInteger(payload.turn)) return
           if (matches(payload)) {
             claimedTurn = payload.turn
+            epoch++
             authority.turn = claimedTurn
             authority.active = true
             authority.mixed = otherTurns.has(claimedTurn)
             if (authority.mixed) authority.approval?.revoke()
+            onStage('running')
+          }
+          else if (claimedTurn !== undefined && continuation.accepts(payload.message) && !contaminated) {
+            if (payload.turn !== claimedTurn) {
+              claimedTurn = payload.turn; authority.turn = claimedTurn
+              progress.clear(); pendingCalls.clear(); attempt = undefined
+            }
+            epoch++; turnEnded = false; terminalReason = undefined; finalText = ''
+            authority.active = true
+            authority.mixed = otherTurns.has(claimedTurn)
+            if (authority.mixed) { contaminated = true; authority.approval?.revoke() }
             onStage('running')
           }
           else if (payload.turn === claimedTurn && steering.has(payload?.message?.id)) {
@@ -328,7 +403,9 @@ export class DshHost {
             steering.get(payload.message.id).claimed = true
           } else if (payload?.message?.source?.kind !== 'runtime-context') {
             otherTurns.add(payload.turn)
-            if (payload.turn === claimedTurn) { authority.mixed = true; authority.approval?.revoke() }
+            if (claimedTurn !== undefined && payload.turn >= claimedTurn) {
+              contaminated = true; authority.mixed = true; authority.approval?.revoke()
+            }
           }
         }, { global: true }))
         dispose.push(this.ctx.on('agent/inbox/discarded', (payload) => {
@@ -336,13 +413,15 @@ export class DshHost {
           if (steering.has(payload?.message?.id)) reject(new Error('prompt_discarded'))
         }, { global: true }))
         dispose.push(this.ctx.on('agent/assistant-stream', ({ agent: owner, frame } = {}) => {
-          if (owner?.id !== agent.id || claimedTurn === undefined) return
+          if (owner?.id !== agent.id || claimedTurn === undefined || turnEnded || !open) return
           if (frame?.type === 'start' && frame.turn === claimedTurn) attempt = frame.attemptId
           if (attempt !== undefined && frame?.type === 'chunk' && frame.attemptId === attempt
             && frame.chunk?.type === 'text-delta' && (frame.chunk.text || frame.chunk.delta)) onStage('responding')
         }, { global: true }))
         dispose.push(this.ctx.on('session/event', (session, event) => {
+          continuation.observe(session, event)
           if (session?.id !== agent.id || claimedTurn === undefined || event?.data?.turn !== claimedTurn) return
+          if (turnEnded || !open) return
           if (open && authority.active && !authority.mixed && !signal.aborted) {
             const item = progress.extract(event)
             // Presentation observers must not change final-answer semantics.
@@ -353,6 +432,7 @@ export class DshHost {
           } else if (event.type === 'tool/call') {
             finalText = ''
             pendingCalls.add(event.data.callId)
+            ownedCalls.add(event.data.callId)
           } else if (event.type === 'tool/result') {
             const { toolCallId: callId } = event.data.message ?? {}
             pendingCalls.delete(callId)
@@ -367,16 +447,10 @@ export class DshHost {
               if (typeof file?.path === 'string' && deliverables.size < 5) deliverables.add(file.path)
             }
           } else if (event.type === 'turn/end') {
-            open = false
-            authority.active = false
-            authority.turn = undefined
-            if ([...steering.values()].some(item => !item.claimed)) reject(new Error('prompt_discarded'))
-            else if (otherTurns.has(claimedTurn)) reject(new Error('shared_turn_not_forwarded'))
-            else if (event.data.reason?.kind === 'completed' && pendingCalls.size === 0 && (finalText.trim() || deliverables.size)) {
-              if (deliverables.size) onDeliverables([...deliverables])
-              resolve(finalText.trim() ? finalText : '已生成文件。')
-            }
-            else reject(new Error('no_confirmed_final_text'))
+            turnEnded = true; terminalReason = event.data.reason; epoch++
+            // A native turn is only a boundary. Child/job notifications can
+            // start another turn before the entire user request is finished.
+            settle()
           }
         }, { global: true }))
         if (onSteer && typeof agent.steer === 'function') {
@@ -402,6 +476,9 @@ export class DshHost {
         })
       })
     } finally {
+      observing.abort()
+      await draining
+      continuation.dispose()
       progress.clear()
       open = false
       authority.active = false

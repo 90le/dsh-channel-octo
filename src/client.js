@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
     const words = {
       settings: ['Octo 渠道', 'Octo channel'], shortcut: ['Octo 频道', 'Octo conversations'],
       subtitle: ['管理 Octo 机器人、消息规则和会话。', 'Manage your Octo bot, message rules and conversations.'],
-      account: ['Bot 账号', 'Bot account'], rules: ['消息规则', 'Message rules'], sessions: ['频道会话', 'Conversations'],
+      account: ['Bot 账号', 'Bot account'], rules: ['消息规则', 'Message rules'], cli: ['Octo CLI', 'Octo CLI'], sessions: ['频道会话', 'Conversations'],
       conversationType: ['会话类型', 'Conversation type'], assistants: ['助理', 'Assistants'],
       railNav: ['侧栏', 'Sidebar'], tasks: ['任务', 'Tasks'], openChannel: ['打开频道', 'Open channel'], mainArea: ['主区', 'Main area'],
       ungroupedTopics: ['未归组子区', 'Ungrouped topics'], advanced: ['高级设置', 'Advanced settings'],
@@ -92,6 +92,7 @@ window.__ModuleLoader__.load({
       session_requires_owned_writer: ['会话权限与账号配置不一致', 'The session permission does not match the account'],
       file_delivery_not_confirmed: ['文件发送未确认', 'File delivery was not confirmed'],
       no_confirmed_final_text: ['没有可发送的正文', 'No reply text to send'],
+      background_reply_pending: ['子任务已回传，等待继续处理', 'Background results are waiting to be processed'],
       shared_turn_not_forwarded: ['本次包含其他来源的输入', 'This turn includes input from another source'],
       rulesIssue: ['群聊或子区规则读取失败', 'Could not read the group or topic rules'],
       accessIssue: ['未能核验接入权限', 'Could not verify access'],
@@ -817,6 +818,27 @@ window.__ModuleLoader__.load({
           lang: locale()?.startsWith('zh') ? 'zh' : 'en' }) : hint(t('loading'))
       }
 
+      function CliGuide({ version }) {
+        const [View, setView] = useState(null)
+        const [failed, setFailed] = useState(false)
+        const [attempt, retry] = useState(0)
+        useEffect(() => {
+          let stopped = false
+          setFailed(false)
+          const url = new URL(path + '/assistant-view.js', document.baseURI)
+          if (version) url.searchParams.set('v', version)
+          if (attempt) url.searchParams.set('retry', attempt)
+          import(url.href).then(module => {
+            if (!stopped) setView(() => module.createCliGuide(React, primitives))
+          }).catch(() => { if (!stopped) setFailed(true) })
+          return () => { stopped = true }
+        }, [version, attempt])
+        if (failed) return h('div', { className: 'dsho-panel' },
+          h('p', { role: 'alert', className: 'dsho-muted' }, '安装指南加载失败，请重试。'),
+          h(Button, { type: 'button', size: 'sm', variant: 'outline', onClick: () => retry(value => value + 1) }, '重新加载'))
+        return View ? h(View) : hint('正在加载安装指南…')
+      }
+
       function Settings({ close }) {
         const t = useT()
         const data = useSyncExternalStore(subscribe, read)
@@ -824,7 +846,7 @@ window.__ModuleLoader__.load({
         const [selected, setSelected] = useState('')
         const accounts = data.accounts ?? []
         const current = accounts.find(account => account.id === selected) ?? accounts[0]
-        const sections = ['account', 'rules']
+        const sections = ['account', 'rules', 'cli']
         const panel = (key, content) => h('div', { id: 'dsho-panel-' + key, role: 'tabpanel',
           'aria-labelledby': 'dsho-tab-' + key, hidden: page !== key, key }, content)
         return h('div', { className: 'dsho-root', 'data-octo-settings': true },
@@ -844,7 +866,8 @@ window.__ModuleLoader__.load({
                 h('select', { id: 'dsho-select-account', value: current?.id ?? '', onChange: e => setSelected(e.target.value) },
                   ...accounts.map(account => h('option', { key: account.id, value: account.id }, account.label)))),
               current?.config ? h(Config, { key: current.id, config: current.config, revision: current.revision, accountId: current.id, t })
-                : h(Empty, { title: t('notConfigured'), note: t('deployHint') }))))
+                : h(Empty, { title: t('notConfigured'), note: t('deployHint') }))),
+          panel('cli', page === 'cli' && h(CliGuide, { version: data.accountUiVersion })))
       }
       function ChannelShortcut({ wide }) {
         const t = useT()

@@ -6,6 +6,7 @@ import { safeProgressText, progressToolName } from './progress-events.js'
 const labels = {
   queued: '已收到，等待 DSH 开始处理',
   running: 'DSH 正在处理',
+  background: '等待子任务完成',
   responding: '正在生成回复',
   delivering: '正在发送回复与交付文件',
   tool: '正在执行工具',
@@ -16,9 +17,9 @@ const labels = {
   error: '本次回复未完成',
 }
 
-const stages = ['queued', 'running', 'responding', 'delivering']
+const stages = ['queued', 'running', 'responding', 'delivering', 'background']
 const outcomes = ['completed', 'stopped', 'error']
-const wireStates = { queued: 'reasoning', running: 'reasoning', responding: 'answering', delivering: 'answering', tool: 'reasoning', question: 'reasoning', approval: 'reasoning' }
+const wireStates = { queued: 'reasoning', running: 'reasoning', background: 'reasoning', responding: 'answering', delivering: 'answering', tool: 'reasoning', question: 'reasoning', approval: 'reasoning' }
 const templateStates = ['reasoning', 'answering', ...outcomes]
 const initialDelay = 450
 const editInterval = 800
@@ -364,6 +365,9 @@ export class Progress {
         if (next === 'approval') { if (!stats.approval) { stats.approval = true; changed() }; return }
         if (next === 'running' && stats.approval) { stats.approval = false; changed() }
         if (next === 'answering') next = 'responding'
+        if (stages.includes(next) && next !== phase && (next === 'background' || phase === 'background')) {
+          phase = next; changed(); return
+        }
         if (!active() || stages.indexOf(next) <= stages.indexOf(phase)) return
         phase = next
         changed()

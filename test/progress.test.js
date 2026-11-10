@@ -9,6 +9,30 @@ import { createProgressEvents } from '../src/progress-events.js'
 
 const job = { message_id: '123', sender: 'member', channel_id: 'thread', channel_type: 5 }
 
+test('child wait and resumed work keep one live card with heartbeat until final delivery', async t => {
+  const tick = clock(t), f = fixture({ profile: () => compact })
+  const h = f.progress.start(job, 'auto', new AbortController().signal, undefined, undefined, 'all')
+  h.stage('running')
+  h.trace({ kind: 'tool-start', id: 'spawn', name: 'spawn_agent', title: '分派测试子任务' })
+  h.trace({ kind: 'tool-end', id: 'spawn', summary: '已创建子任务' })
+  await tick(450)
+  h.stage('background'); await tick(800)
+  assert.match(f.calls.at(-1).frame.plain, /等待子任务完成/)
+  const old = f.calls.at(-1).frame.plain
+  await tick(5000)
+  assert.notEqual(f.calls.at(-1).frame.plain, old)
+  assert.equal(localCard(f.calls.at(-1).frame.card).byId.get('dsh_progress_details').isVisible, true)
+  h.stage('running'); await tick(800)
+  assert.match(f.calls.at(-1).frame.plain, /DSH 正在处理/)
+  h.trace({ kind: 'tool-start', id: 'read', name: 'read', title: '读取子任务结果' })
+  h.trace({ kind: 'tool-end', id: 'read', summary: '已读取结果' })
+  h.stage('delivering'); await tick(800)
+  assert.match(f.calls.at(-1).frame.plain, /正在发送回复/)
+  await h.finish('completed')
+  assert.equal(localCard(f.calls.at(-1).frame.card).byId.get('dsh_progress_details').isVisible, false)
+  assert.match(f.calls.at(-1).frame.plain, /2 次工具/)
+})
+
 test('live host tool events preserve purpose, identity and cause while heartbeat changes only total time', async t => {
  const tick=clock(t), f=fixture({profile:()=>compact}), events=createProgressEvents()
  const h=f.progress.start(job,'auto',new AbortController().signal,undefined,undefined,'all')

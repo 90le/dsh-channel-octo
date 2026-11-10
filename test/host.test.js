@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { DshHost } from '../src/dsh.js'
 import { OCTO_STOP } from '../src/im-controls.js'
+import { setImmediate as tick } from 'node:timers/promises'
 
 function fakeHost({ toolGuard = true, reason = 'completed', onPrompt } = {}) {
   const events = new EventEmitter()
@@ -44,6 +45,134 @@ function fakeHost({ toolGuard = true, reason = 'completed', onPrompt } = {}) {
   }
   return { ctx, calls, events, agentId }
 }
+
+// Mirror native dispatch: publish the call before tools/execute, then publish
+// its result after the awaited body (and its lifecycle events) has completed.
+async function dispatchTool({ agent, emit, events }, name, callId, body) {
+  emit(agent.id, 'tool/call', { turn: 1, callId, name, arguments: '{}' })
+  const exec = { agent, name, callId, rootCallId: callId, token: Symbol(callId) }
+  const next = events.listeners('tools/execute').reduceRight((next, hook) => () => hook(exec, next), async () => body())
+  await next()
+  emit(agent.id, 'tool/result', { turn: 1, message: { toolCallId: callId } })
+}
+
+for (const api of ['waitForChildren', 'waitForTreeWork']) {
+  test(`joins ${api}, two child callbacks and the final parent turn before delivery`, { timeout: 2000 }, async () => {
+    let current, joined, release
+    const gate = new Promise(resolve => { release = resolve })
+    const trace = [], stages = []
+    const f = fakeHost({ async onPrompt(args) {
+      current = args
+      args.agent.status = 'idle'; args.agent.whenIdle = async () => {}
+      args.agent.session.seq = 1
+      args.events.emit('agent/inbox/claimed', { agent: args.agent, message: args.message, turn: 1 })
+      await dispatchTool(args, 'subagent', 'delegate', () => {
+        for (const childId of ['child-a', 'child-b']) args.emit(args.agent.id, 'subagent/catalog', { childId })
+      })
+      args.emit(args.agent.id, 'assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'Waiting for children, not final' }] } })
+      args.emit(args.agent.id, 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+    } })
+    f.ctx.get = name => name === 'subagents' ? { [api]: async root => {
+      assert.equal(root, current.agent)
+      if (joined) return false
+      joined = true; await gate; return true
+    } } : undefined
+    let resolved = false
+    const result = new DshHost(f.ctx, '/fixture', 1500).run({ session_id: f.agentId, created: 0 }, 'delegate', () => {},
+      new AbortController().signal, undefined, x => stages.push(x), 1500, false, { onTrace: x => trace.push(x) })
+      .then(value => { resolved = true; return value })
+    await tick()
+    assert.equal(joined, true); assert.equal(resolved, false); assert.ok(!f.calls.includes('dispose'))
+    const { agent, events, emit } = current
+    for (const [turn, child] of [[2, 'child-b'], [3, 'child-a']]) {
+      events.emit('agent/inbox/claimed', { agent, turn, message: { id: 'notice-' + turn,
+        source: { kind: turn === 2 ? 'agent-message' : 'subagent-settled', senderSessionId: child } } })
+      emit(agent.id, 'tool/call', { turn, callId: 'call-' + turn, name: 'read', arguments: '{}' })
+      emit(agent.id, 'tool/result', { turn, message: { toolCallId: 'call-' + turn } })
+      emit(agent.id, 'assistant/message', { turn, message: { content: [{ type: 'text', text: turn === 3 ? 'Final combined result' : 'First child received' }] } })
+      agent.session.seq++
+      emit(agent.id, 'turn/end', { turn, reason: { kind: 'completed' } })
+      await tick(); assert.equal(resolved, false)
+    }
+    release()
+    assert.equal(await result, 'Final combined result')
+    assert.equal(trace.filter(x => x.kind === 'tool-start').length, 3)
+    assert.ok(stages.includes('background'))
+    assert.equal(f.calls.filter(x => x === 'dispose').length, 1)
+    assert.equal(f.events.eventNames().length, 0)
+  })
+}
+
+test('an unrelated agent notice cannot become an Octo continuation', { timeout: 2000 }, async () => {
+  let current, release
+  const gate = new Promise(resolve => { release = resolve })
+  const f = fakeHost({ async onPrompt(args) {
+    current = args
+    args.events.emit('agent/inbox/claimed', { agent: args.agent, message: args.message, turn: 1 })
+    await dispatchTool(args, 'subagent', 'delegate', () => args.emit(args.agent.id, 'subagent/catalog', { childId: 'owned-child' }))
+    args.emit(args.agent.id, 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  } })
+  let once = false
+  f.ctx.get = () => ({ waitForChildren: async () => { if (once) return false; once = true; await gate; return true } })
+  const result = new DshHost(f.ctx, '/fixture', 1000).run({ session_id: f.agentId, created: 0 }, 'delegate', () => {}, new AbortController().signal)
+  const rejected = assert.rejects(result, /shared_turn_not_forwarded/)
+  await tick()
+  const { agent, events, emit } = current
+  events.emit('agent/inbox/claimed', { agent, turn: 2, message: { id: 'foreign', source: { kind: 'agent-message', senderSessionId: 'other-agent' } } })
+  emit(agent.id, 'assistant/message', { turn: 2, message: { content: [{ type: 'text', text: 'PRIVATE OTHER TASK' }] } })
+  emit(agent.id, 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  release(); await rejected
+  assert.equal(f.events.eventNames().length, 0)
+})
+
+test('stop while children run cancels the managed tree and never delivers a late answer', { timeout: 2000 }, async () => {
+  let release, drained = 0, cancelled = 0
+  const gate = new Promise(resolve => { release = resolve })
+  const controller = new AbortController()
+  const f = fakeHost({ async onPrompt(args) {
+    const { agent, events, message, emit } = args
+    agent.cancel = () => { cancelled++ }
+    events.emit('agent/inbox/claimed', { agent, message, turn: 1 })
+    await dispatchTool(args, 'subagent', 'delegate', () => emit(agent.id, 'subagent/catalog', { childId: 'child' }))
+    emit(agent.id, 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  } })
+  f.ctx.get = () => ({ waitForChildren: () => gate, drainDescendants: async () => { drained++; release(false) } })
+  const result = new DshHost(f.ctx, '/fixture', 1000).run({ session_id: f.agentId, created: 0 }, 'delegate', () => {}, controller.signal)
+  const rejected = assert.rejects(result, error => error === OCTO_STOP)
+  await tick(); controller.abort(OCTO_STOP); await rejected
+  assert.equal(drained, 1); assert.equal(cancelled, 1)
+  assert.equal(f.events.eventNames().length, 0)
+})
+
+test('background job completion is observed passively and its native wakeup supplies the final reply', { timeout: 2000 }, async () => {
+  const jobs = new EventEmitter()
+  let current
+  const f = fakeHost({ async onPrompt(args) {
+    current = args
+    const { agent, emit, events, message } = args
+    events.emit('agent/inbox/claimed', { agent, message, turn: 1 })
+    await dispatchTool(args, 'bash', 'call', () => {
+      emit(agent.id, 'job/registered', { jobId: 'job', owner: agent.id, toolCall: { callId: 'call' } })
+      jobs.emit('event', { type: 'registered', job: { id: 'job', owner: agent.id } })
+    })
+    emit(agent.id, 'assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'Background started' }] } })
+    emit(agent.id, 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  } })
+  f.ctx.get = name => name === 'jobs' ? { list: () => [],
+    events: { subscribe(_filter, fn) { jobs.on('event', fn); return () => jobs.off('event', fn) } },
+    wait() { assert.fail('do not consume native job wakeup') }, read() { assert.fail('do not consume job output') } } : undefined
+  let done = false
+  const reply = new DshHost(f.ctx, '/fixture', 1000).run({ session_id: f.agentId, created: 0 }, 'job', () => {}, new AbortController().signal)
+    .then(value => { done = true; return value })
+  await tick(); assert.equal(done, false)
+  const { agent, emit, events } = current
+  jobs.emit('event', { type: 'settled', job: { id: 'job', owner: agent.id } })
+  events.emit('agent/inbox/claimed', { agent, turn: 2, message: { id: 'job-notice', source: { kind: 'tool-jobs' } } })
+  emit(agent.id, 'assistant/message', { turn: 2, message: { content: [{ type: 'text', text: 'Actual background result' }] } })
+  emit(agent.id, 'turn/end', { turn: 2, reason: { kind: 'completed' } })
+  assert.equal(await reply, 'Actual background result')
+  assert.equal(jobs.eventNames().length, 0)
+})
 
 test('DSH scopes tools and only forwards the result of the claimed turn', async () => {
   const { ctx, calls, events, agentId } = fakeHost()
