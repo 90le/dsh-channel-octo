@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { DshHost } from '../src/dsh.js'
 import { OctoClient } from '../src/octo.js'
 import { ruleContext } from '../src/rules.js'
@@ -35,6 +36,7 @@ const t = (markdown, version = 21) => ({ kind: 'thread', version, status: 'prese
 const requests = []
 const titleRequests = []
 const fixtureRoutes = []
+let concurrentGate
 const textOf = content => typeof content === 'string' ? content : (content ?? []).map(part => part.text ?? '').join('')
 const isTitle = body => textOf(body.system).includes('Create a concise title for an AI coding-assistant session')
 const presets = ['octo-text', 'standard', 'minimal']
@@ -52,7 +54,13 @@ if (process.env.DSH_OCTO_RULES_CHILD === '1') {
     assert.ok(url.pathname.endsWith('/messages') && request.method === 'POST')
     const body = await request.json()
     if (isTitle(body)) titleRequests.push(body)
-    else requests.push(body)
+    else {
+      requests.push(body)
+      if (concurrentGate && textOf(body.messages.at(-1).content).includes('NATIVE_PARALLEL_GROUP')) {
+        concurrentGate.entered.resolve()
+        await concurrentGate.release.promise
+      }
+    }
     const frames = [
       { type: 'message_start', message: { id: 'synthetic', model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
       { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
@@ -94,6 +102,10 @@ if (process.env.DSH_OCTO_RULES_CHILD === '1') {
       const evidence = output.match(/^OCTO_NATIVE_RULES_OK=(.+)$/m)
       assert.ok(evidence)
       test.diagnostic(evidence[1])
+      if (preset === 'standard') {
+        assert.match(output, /^OCTO_NATIVE_PARALLEL_OK=group,dm,topic$/m)
+        test.diagnostic('Native group blocked while independent DM and topic completed with separate prompts.')
+      }
     } finally { rmSync(home, { recursive: true, force: true }) }
   })
 }
@@ -297,6 +309,46 @@ async function exercise(ctx) {
       .filter(input => input.includes(heading) || /\b(?:PARENT|TOPIC)_RULE_\w+\b/.test(input) || input.includes(legacyRule))
       .map(input => /Synthetic Octo request: ([\w-]+)/.exec(input)?.[1] ?? 'unknown turn')
     assert.deepEqual(titlesWithRules, [], 'title prompt received channel rules')
+    if (agentPreset === 'standard') {
+      concurrentGate = { entered: Promise.withResolvers(), release: Promise.withResolvers() }
+      const lifetime = new AbortController()
+      const add = (label, channelType, channelId) => {
+        const messageId = String(++seq)
+        worker.acceptInbound(messageId, { messageId, channelType, channelId, sender: 'alice', text: label })
+        return messageId
+      }
+      const state = id => store.db.prepare('SELECT state,session_id FROM jobs WHERE message_id=?').get(id)
+      const main = add('NATIVE_PARALLEL_GROUP', 2, group)
+      const draining = worker.drain(lifetime.signal).catch(error => { if (error.name !== 'AbortError') throw error })
+      try {
+        await Promise.race([concurrentGate.entered.promise, delay(4000, undefined, { signal: lifetime.signal })
+          .then(() => assert.fail('the group did not reach the native provider'))])
+        const dm = add('NATIVE_PARALLEL_DM', 1, 'alice')
+        const thread = add('NATIVE_PARALLEL_TOPIC', 5, address(topic))
+        const started = Date.now()
+        while ([dm, thread].some(id => state(id)?.state !== 'sent') && Date.now() - started < 5000) await delay(20)
+        assert.equal(state(main).state, 'running', 'main group must still be held by the provider')
+        assert.deepEqual([dm, thread].map(id => state(id).state), ['sent', 'sent'])
+        assert.equal(new Set([main, dm, thread].map(id => state(id).session_id)).size, 3)
+        for (const marker of ['GROUP', 'DM', 'TOPIC']) {
+          const key = 'NATIVE_PARALLEL_' + marker
+          const body = requests.find(body => textOf(body.messages.at(-1).content).includes(key))
+          assert.ok(body, key + ': missing native request')
+          assert.deepEqual(JSON.stringify(body.messages).match(/NATIVE_PARALLEL_(?:GROUP|DM|TOPIC)/g), [key],
+            'another lane’s prompt appeared in the native session')
+        }
+        concurrentGate.release.resolve()
+        const released = Date.now()
+        while (state(main).state === 'running' && Date.now() - released < 5000) await delay(20)
+        assert.equal(state(main).state, 'sent')
+        console.log('OCTO_NATIVE_PARALLEL_OK=group,dm,topic')
+      } finally {
+        concurrentGate.release.resolve()
+        lifetime.abort()
+        await draining
+        concurrentGate = undefined
+      }
+    }
     return { turns: verified, titlesWithRules }
   } finally { off(); store.close() }
 }

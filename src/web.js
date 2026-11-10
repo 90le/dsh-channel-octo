@@ -16,7 +16,7 @@ const modules = new Map([[path + '/account-editor.js', editor],
   [path + '/account-view.js', view.replace('./account-editor.js', './account-editor.js?v=' + uiVersion)
     .replace('./webhook-view.js', './webhook-view.js?v=' + uiVersion)]])
 const editable = ['senderPolicy', 'channelPolicy', 'mentionPolicy', 'threadRuleMode',
-  'allowedUids', 'allowedGroupIds', 'allowedThreadIds', 'progress', 'timeoutMs']
+  'allowedUids', 'allowedGroupIds', 'allowedThreadIds', 'progress', 'timeoutMs', 'maxConcurrentTurns']
 
 function overrides(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -43,10 +43,10 @@ export function loadSettings(base, stateDir, token, validate = () => {}, admissi
     validate(config)
     return config
   }
-  const config = resolve(saved)
+  let config = resolve(saved)
   let revision = randomUUID()
   return {
-    config,
+    get config() { return config },
     revision: () => revision,
     save(input, expected) {
       if (expected !== revision) throw new Error('settings_changed')
@@ -58,7 +58,7 @@ export function loadSettings(base, stateDir, token, validate = () => {}, admissi
         writeFileSync(pending, JSON.stringify(changes, null, 2) + '\n', { mode: 0o600, flag: 'wx', flush: true })
         renameSync(pending, file)
       } finally { try { unlinkSync(pending) } catch {} }
-      Object.assign(config, candidate)
+      config = candidate
       saved = changes
       revision = randomUUID()
     },
@@ -68,9 +68,9 @@ export function loadSettings(base, stateDir, token, validate = () => {}, admissi
 export function channelView(config) {
   if (!config) return null
   const { botUid, spaceId, apiBase, cwd, transport, senderPolicy, channelPolicy,
-    mentionPolicy, threadRuleMode, progress, timeoutMs, allowed, groups, threads } = config
+    mentionPolicy, threadRuleMode, progress, timeoutMs, maxConcurrentTurns, allowed, groups, threads } = config
   return { botUid, spaceId, ...(config.botKind === 'app' && { botKind: 'app' }), apiBase, cwd, transport, senderPolicy, channelPolicy,
-    mentionPolicy, threadRuleMode, progress, timeoutMs,
+    mentionPolicy, threadRuleMode, progress, timeoutMs, maxConcurrentTurns,
     allowedUids: [...allowed], allowedGroupIds: [...groups], allowedThreadIds: [...threads] }
 }
 
@@ -92,7 +92,7 @@ const accountErrors = {
   invalid_account: 400, invalid_bot_token: 400, bot_identity_mismatch: 400, bot_verification_failed: 400,
   workspace_unavailable: 400, model_unavailable: 400, reasoning_unavailable: 400, permission_unavailable: 400,
   permission_requires_allowlist: 400, settings_changed: 409, channel_not_configured: 409,
-  transport_managed_by_host: 400, invalid_settings: 400, settings_not_saved: 500,
+  transport_managed_by_host: 400, invalid_settings: 400, invalid_concurrent_turns: 400, settings_not_saved: 500,
   invalid_bot_commands: 400, bot_commands_failed: 502,
   app_bot_operation_unavailable: 400,
 }

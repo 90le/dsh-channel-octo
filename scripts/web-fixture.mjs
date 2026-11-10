@@ -194,7 +194,7 @@ globalThis.fetch = async (input, init) => {
     }
     if (ownerSmoke && url.pathname.endsWith('/file/download/chat/fixture/note.txt')) {
       setTimeout(() => peer.send({ messageId: '902', sender: 'fixture-user', channelType: 1,
-        channelId: 'fixture-user', payload: { type: 1, content: 'fixture prompt 1 send a file' } }), 100).unref()
+        channelId: 'fixture-user', seq: 11, payload: { type: 1, content: 'fixture prompt 1 send a file' } }), 100).unref()
       await delay(450)
       return new Response('INPUT-FILE-FIXTURE', { headers: { 'Content-Type': 'text/plain' } })
     }

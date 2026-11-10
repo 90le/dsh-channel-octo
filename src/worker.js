@@ -120,6 +120,10 @@ const failureDetails = {
 }
 const unknownFailure = '本次回复未完成。请先在 DSH 查看执行状态，再决定是否继续，避免重复操作。'
 
+const jobRoute = job => [job.channel_type, job.channel_id ?? job.sender]
+const routeKey = route => JSON.stringify(route)
+const messageRoute = message => [message.channelType, message.channelId ?? message.sender]
+
 export class Worker {
   constructor({ api, store, host, config, log, attach, isArchived, proposeWebhookChat }) {
     Object.assign(this, { api, store, host, config, log, attach, isArchived, proposeWebhookChat })
@@ -127,15 +131,24 @@ export class Worker {
     this.questions = new QuestionBridge({ api, store, log })
     this.cursor = '0'
     this.steering = new Set()
+    this.activeByRoute = new Map()
+    this.followups = new Map()
+    this.appIntakes = new Map()
+    this.ambientChecks = new Set()
     this.stopControls = new Set()
     this.inbox = new InboxRecovery({ api, store, log, config: () => this.config,
-      questionKey: message => this.questions.match(message, { textOnly: true })?.key,
+      questionKey: message => this.questionsFor(message).match(message, { textOnly: true })?.key,
       accept: (id, message, options) => this.acceptInbound(id, message, options) })
   }
 
   reconfigure(config, host) {
     this.revokeApproval?.()
     this.oboReview?.abort()
+    for (const active of this.activeByRoute.values()) {
+      active.revokeApproval?.()
+      active.oboReview?.abort()
+    }
+    this.followups.clear()
     config.ownerUid = this.config.ownerUid
     this.api.configureChannel?.(config)
     this.config = config
@@ -188,7 +201,12 @@ export class Worker {
   pause(stopIntake = false) {
     this.paused = true
     this.stopIntake = stopIntake
-    return this.inFlight
+    const active = [...this.activeByRoute.values()].map(lane => lane.work)
+    return active.length ? Promise.allSettled(active) : this.inFlight
+  }
+
+  questionsFor(message) {
+    return this.activeByRoute.get(routeKey(messageRoute(message)))?.questions ?? this.questions
   }
 
   acceptInbound(eventId, message, { historical = false, delayed = false, questionKey, appVerified = false } = {}) {
@@ -222,7 +240,7 @@ export class Worker {
       // Persist before the synchronous WS ACK. Serialize live authorization so
       // a question answer or steering input cannot skip the server Space guard.
       if (!channelSequence(message.messageSeq)) return this.store.add(eventId, message)
-      const capturedQuestion = questionKey ?? this.questions.match(message, { textOnly: true })?.key ?? null
+      const capturedQuestion = questionKey ?? this.questionsFor(message).match(message, { textOnly: true })?.key ?? null
       this.store.stageInbox(eventId, message, !historical, capturedQuestion)
       const config = this.config
       const work = async () => {
@@ -241,34 +259,67 @@ export class Worker {
           return false
         }
       }
-      this.appIntake = (this.appIntake ?? Promise.resolve()).then(work, work)
-      return this.appIntake
+      const key = routeKey(messageRoute(message))
+      const request = (this.appIntakes.get(key) ?? Promise.resolve()).then(work, work).finally(() => {
+        if (this.appIntakes.get(key) === request) this.appIntakes.delete(key)
+      })
+      this.appIntakes.set(key, request)
+      return request
     }
+    const bridge = this.questionsFor(message)
     const question = !historical && !message.attachment && !message.attachments?.length && !message.command && message.text.trim()
-      && this.questions.match(message, { textOnly: true })
+      && bridge.match(message, { textOnly: true })
     if (question && (!delayed && !appVerified || question.key === questionKey) && this.config.toolPermission !== 'text-only'
       && permitsRoute(this.config, message.sender, message.channelType, message.channelId)
       && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
-      if (this.store.rememberAnswer(eventId, message, question.sessionId)) this.questions.text(question, message.text)
+      if (this.store.rememberAnswer(eventId, message, question.sessionId)) bridge.text(question, message.text)
       return true
     }
     if (this.stopIntake) return false
     const inserted = this.store.add(eventId, message)
-    const active = this.steerActive?.job ?? this.currentJob
-    if (inserted.changes && !historical && !delayed && !this.paused && active && this.config.sendMode === 'steer'
-      && message.channelType === active.channel_type && message.sender === active.sender
-      && message.channelId === (active.channel_id ?? active.sender)
-      && !message.command && !message.parts && !message.attachment && !message.attachments?.length
-      && message.text.trim() && this.steering.size < 32) {
-      this.steering.add(message.messageId)
-      this.oboReview?.abort()
-      this.attemptSteering()
+    const key = routeKey(messageRoute(message))
+    const lane = this.activeByRoute.get(key)
+    const active = lane?.job ?? this.steerActive?.job ?? this.currentJob
+    if (inserted.changes && !historical && !delayed && !this.paused && this.config.sendMode === 'steer'
+      && !message.command && !message.parts && !message.attachment && !message.attachments?.length && !message.quoteId
+      && message.text.trim()) {
+      const config = this.config
+      const register = () => {
+        if (this.config !== config || this.paused || this.stopIntake) return
+        const sameTurn = active && active.sender === message.sender && routeKey(jobRoute(active)) === key
+          && (!lane || this.activeByRoute.get(key) === lane)
+        if (config.transport === 'websocket') {
+        // Only locally observed live text can be coalesced. Untracked, delayed
+        // and replayed messages remain ordinary durable queue entries.
+          if (this.followups.size >= 512) this.followups.delete(this.followups.keys().next().value)
+          this.followups.set(message.messageId, { anchor: sameTurn ? active.seq : undefined })
+        }
+        if (sameTurn) {
+          if (!lane && this.steering.size < 32) this.steering.add(message.messageId)
+          const state = lane ?? this
+          state.oboReview?.abort()
+          this.attemptSteering(lane)
+        }
+      }
+      if (!message.ambient) register()
+      else if (this.intakeSignal && !this.intakeSignal.aborted && this.ambientChecks.size < 8) {
+        // An @-triggered turn does not authorize the next unmentioned message.
+        // Until the same ambient gate passes, keep it in the regular queue.
+        const signal = AbortSignal.any([this.intakeSignal, AbortSignal.timeout(5000)])
+        const check = Promise.resolve().then(async () => {
+          const [channel_type, channel_id] = messageRoute(message)
+          if (await this.api.allowsMessage(config, { sender: message.sender, channel_type, channel_id, ambient: true,
+            message_id: message.messageId }, signal) && !signal.aborted) register()
+        }).catch(() => {}).finally(() => this.ambientChecks.delete(check))
+        this.ambientChecks.add(check)
+      }
     }
     return true
   }
 
   handleStop(message) {
-    const active = this.activeWork, config = this.config
+    const key = routeKey(messageRoute(message))
+    const active = this.activeByRoute.get(key), config = this.config
     const request = { sender: message.sender, channel_type: message.channelType, channel_id: message.channelId,
       message_id: message.messageId, ambient: message.ambient }
     const authorized = () => this.config === config && !this.stopIntake && safeCommand(config, request)
@@ -290,9 +341,9 @@ export class Worker {
         && (!message.stopSentAt || message.stopSentAt * 1000 + 999 >= active.startedAt)
         && (!message.messageSeq || !target.message_seq || message.messageSeq > target.message_seq)
       let stopped = false
-      if (matching && this.activeWork === active && !active.controller.signal.aborted
+      if (matching && this.activeByRoute.get(key) === active && !active.controller.signal.aborted
         && this.store.stopWork(target.seq, active.merged)) {
-        active.question = this.questions.current?.binding
+        active.question = active.questions.current?.binding
         active.controller.abort(OCTO_STOP)
         this.log('stopped_by_user')
         stopped = true
@@ -306,31 +357,48 @@ export class Worker {
   }
 
   async drain(signal) {
-    while (!signal.aborted) {
-      const job = !this.paused && this.store.next(Date.now())
-      if (!job) { await delay(150, undefined, { signal }); continue }
-      this.currentJob = job
-      const active = { job, controller: new AbortController(), startedAt: Date.now(), terminalSignal: signal, merged: [] }
-      this.activeWork = active
-      const work = this.process(job, AbortSignal.any([signal, active.controller.signal]), active)
-      this.inFlight = work
-      try { await work }
-      catch (error) {
-        if (active.controller.signal.reason !== OCTO_STOP || error !== OCTO_STOP) throw error
-      } finally {
-        if (active.controller.signal.reason === OCTO_STOP && !signal.aborted) {
-          try {
-            if (active.question && await active.authorizeTerminal?.()) {
-              await this.questions.closeCard(active.question, '任务已停止，旧卡片不能继续提交。', signal)
+    const shutdown = new AbortController()
+    const lifetime = AbortSignal.any([signal, shutdown.signal])
+    let failed = false, failure
+    try {
+      while (!lifetime.aborted && !failed) {
+        const cap = this.config.maxConcurrentTurns ?? 4
+        while (!this.paused && !failed && !lifetime.aborted && this.activeByRoute.size < cap) {
+          const job = this.store.next(Date.now(), [...this.activeByRoute.values()].map(active => jobRoute(active.job)))
+          if (!job) break
+          const key = routeKey(jobRoute(job))
+          if (this.activeByRoute.has(key)) throw new Error('octo_lane_already_active')
+          const active = { job, key, config: this.config, controller: new AbortController(),
+            startedAt: Date.now(), terminalSignal: lifetime, merged: [],
+            questions: new QuestionBridge({ api: this.api, store: this.store, log: this.log }) }
+          this.activeByRoute.set(key, active)
+          this.followups.delete(job.message_id)
+          active.work = Promise.resolve().then(async () => {
+            try { await this.process(job, AbortSignal.any([lifetime, active.controller.signal]), active) }
+            catch (error) {
+              if (!(active.controller.signal.reason === OCTO_STOP && error === OCTO_STOP) && !lifetime.aborted && !failed) {
+                failed = true
+                failure = error
+              }
+            } finally {
+              if (active.controller.signal.reason === OCTO_STOP && !lifetime.aborted) {
+                try {
+                  if (active.question && await active.authorizeTerminal?.()) {
+                    await active.questions.closeCard(active.question, '任务已停止，旧卡片不能继续提交。', lifetime)
+                  }
+                  await active.progress?.finish('stopped', { interrupted: true, detail: '收到 /stop，已停止本次任务。' })
+                } catch { this.log('stop_feedback_unconfirmed') }
+              }
+              this.activeByRoute.delete(key)
             }
-            await active.progress?.finish('stopped', { interrupted: true, detail: '收到 /stop，已停止本次任务。' })
-          } catch { this.log('stop_feedback_unconfirmed') }
+          })
         }
-        this.activeWork = undefined
-        this.currentJob = undefined
-        this.steering.clear()
-        if (this.inFlight === work) this.inFlight = undefined
+        if (!failed) await delay(150, undefined, { signal: lifetime })
       }
+      if (failed) throw failure
+    } finally {
+      shutdown.abort()
+      await Promise.allSettled([...this.activeByRoute.values()].map(active => active.work))
     }
   }
 
@@ -465,12 +533,13 @@ export class Worker {
             continue
           }
           if (binding.questionKey) {
-            const pending = this.questions.match(message)
+            const bridge = this.questionsFor(message)
+            const pending = bridge.match(message)
             if (pending?.key === binding.questionKey && this.config.toolPermission !== 'text-only'
               && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
               if (this.store.claimCard(selection, message, pending.sessionId ?? null)) {
-                if (selection.invalidInputs) await this.questions.rejectCard(pending)
-                else this.questions.card(pending, binding.questionKey, selection.selection, selection)
+                if (selection.invalidInputs) await bridge.rejectCard(pending)
+                else bridge.card(pending, binding.questionKey, selection.selection, selection)
               }
             } else if (this.store.claimCard(selection, message, null)) {
               // A restart or completed wait must visibly retire the old form.
@@ -538,18 +607,27 @@ export class Worker {
     }
   }
 
-  attemptSteering() {
-    const active = this.steerActive
-    if (!active || this.config.sendMode !== 'steer' || this.questions.current
+  attemptSteering(lane) {
+    const state = lane ?? this
+    const active = state.steerActive
+    if (!active || this.paused || this.config.sendMode !== 'steer' || state.questions.current
       || this.config.sessionProfile !== active.profile
-      || !authorizedTools(this.config, active.job)) return
-    const next = this.store.steerCandidate(active.job)
-    if (!next || !this.steering.has(next.message_id) || next.sender !== active.job.sender || next.metadata || !next.input) return
-    active.offer(next.input, () => {
-      this.store.running(next.seq, active.sessionId)
-      active.merged.push(next.seq)
-      this.steering.delete(next.message_id)
-    })
+      || lane && (lane.config !== this.config || lane.controller.signal.aborted || this.activeByRoute.get(lane.key) !== lane)
+      || !permitsRoute(this.config, active.job.sender, ...jobRoute(active.job))) return
+    for (let i = 0; i < 4; i++) {
+      const next = this.store.steerCandidate(active.job)
+      if (!next || next.sender !== active.job.sender || next.metadata || !next.input
+        || !(lane ? this.followups.get(next.message_id)?.anchor === lane.job.seq : this.steering.has(next.message_id))) return
+      let reserved = false
+      const accepted = active.offer(next.input, () => {
+        this.store.running(next.seq, active.sessionId)
+        active.merged.push(next.seq)
+        this.followups.delete(next.message_id)
+        this.steering.delete(next.message_id)
+        reserved = true
+      })
+      if (!reserved || accepted === false) return
+    }
   }
 
   async channelContext(config, route, job, meta, signal) {
@@ -586,6 +664,9 @@ export class Worker {
   }
 
   async process(job, signal, activeWork) {
+    const state = activeWork ?? this
+    const bridge = state.questions
+    signal.throwIfAborted()
     const sourceConfig = this.config
     const sourceChannel = this.api.channel
     const config = { ...sourceConfig }
@@ -711,17 +792,28 @@ export class Worker {
           this.store.running(job.seq, session.session_id)
           const isFileOnly = attachments.length > 0 && !job.input.trim()
           const canMerge = () => !meta.deferredForm && config.transport === 'websocket' && !this.paused && this.config.sendMode === 'steer'
-            && this.config.sessionProfile === config.sessionProfile && authorizedTools(this.config, job)
+            && this.config === sourceConfig && permitsRoute(this.config, job.sender, channelType, recipient)
+          const nextSupplement = () => {
+            // Collect only adjacent same-sender jobs at startup. Text sent
+            // while a file-only turn is downloading can guide that turn.
+            const head = activeWork ? this.store.followupHead(job) : this.store.steerCandidate(job)
+            if (!activeWork) return head && this.steering.has(head.message_id) ? head : undefined
+            if (head?.state === 'queued' && head.sender === job.sender && this.followups.has(head.message_id)) return head
+            if (!isFileOnly) return
+            const next = this.store.steerCandidate(job)
+            if (next && this.followups.get(next.message_id)?.anchor === activeWork.job.seq) return next
+          }
           // A file sent without a caption is often followed by its instructions
           // in a separate message. Give that text a short chance to join.
-          if (isFileOnly && canMerge() && !this.steering.size) await delay(1000, undefined, { signal })
+          if (isFileOnly && canMerge() && !nextSupplement()) await delay(1000, undefined, { signal })
           const instructions = []
           if (canMerge()) {
             for (let i = 0; i < 4; i++) {
-              const next = this.store.steerCandidate(job)
-              if (!next || next.sender !== job.sender || next.metadata || !this.steering.has(next.message_id)) break
+              const next = nextSupplement()
+              if (!next || next.sender !== job.sender || next.metadata || !next.input) break
               this.store.running(next.seq, session.session_id)
               this.steering.delete(next.message_id)
+              this.followups.delete(next.message_id)
               merged.push(next.seq)
               instructions.push(next.input)
             }
@@ -735,7 +827,8 @@ export class Worker {
           const authorCard = safeCommand(config, job) && !attachments.length
             && /卡片|\bcard\b/iu.test(input)
           const availableOperation = spec => operationAvailable(spec, { config, job, channel: sourceChannel, toolsAllowed })
-          const oboActive = () => !signal.aborted && !this.stopIntake && this.currentJob === job
+          const oboActive = () => !signal.aborted && !this.stopIntake
+            && (activeWork ? this.activeByRoute.get(activeWork.key) === activeWork : this.currentJob === job)
             && this.config === sourceConfig && this.api.channel === sourceChannel
             && this.liveToolAllowed(job, sourceConfig) && this.config.toolPermission !== 'read-only'
           const oboSend = channelType === 1 && !meta.deferredForm && config.botKind !== 'app'
@@ -753,9 +846,9 @@ export class Worker {
               confirm: async (review, active) => {
                 if (!oboActive()) throw new Error('octo_access_denied')
                 const controller = new AbortController()
-                this.oboReview = controller
+                state.oboReview = controller
                 try {
-                  const answer = await this.questions.form({
+                  const answer = await bridge.form({
                     title: '确认以你的 Octo 身份发送',
                     text: ['发送者：' + review.operatorUid, '目标（频道类型 / ID）：' + review.destination.channel_type
                       + ' / ' + review.destination.channel_id, '消息原文（JSON 字符串）：', JSON.stringify(review.text)].join('\n'),
@@ -765,7 +858,7 @@ export class Worker {
                   waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), oboActive, { cardOnly: true })
                   const decision = answer.action === 'allow' && answer.values?.confirm === true ? 'allow' : 'cancel'
                   return { id: review.id, operatorUid: review.operatorUid, decision }
-                } finally { if (this.oboReview === controller) this.oboReview = undefined }
+                } finally { if (state.oboReview === controller) state.oboReview = undefined }
               } })
           const run = async () => {
             if (job.directoryRecovery) await authorizeDelivery()
@@ -781,7 +874,7 @@ export class Worker {
             phase => {
               if (phase === 'reused') this.log('dsh_session_reused')
               else progress.stage(phase)
-              if (phase === 'running') queueMicrotask(() => this.attemptSteering())
+              if (phase === 'running') queueMicrotask(() => this.attemptSteering(activeWork))
             }, config.timeoutMs, toolsAllowed,
             { attachments, order: inputOrder, authorCard, channelContext, taskContext: true, onTrace: trace => progress.trace(trace),
               ...((channelType !== 1 || toolsAllowed) && config.toolPermission !== 'text-only' && this.api.channel && { channelTools: {
@@ -814,7 +907,7 @@ export class Worker {
                     args: structuredClone(args), authorize: () => this.liveToolAccess(job, toolSignal) })
                   if (name === formToolSpec.name) return (async () => {
                     const current = await this.liveToolAccess(job, toolSignal)
-                    const answer = await this.questions.form(args, { ...job, session_id: session.session_id }, current, toolSignal,
+                    const answer = await bridge.form(args, { ...job, session_id: session.session_id }, current, toolSignal,
                       waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), () => this.liveToolAllowed(job, current))
                     await this.liveToolAccess(job, toolSignal)
                     return answer
@@ -897,18 +990,18 @@ export class Worker {
               } }),
               ...(toolsAllowed && { approval: { runId: String(job.seq), requester: job.sender },
                 authorizeTools: () => this.liveToolAllowed(job, sourceConfig),
-                onApprovalControl: revoke => { this.revokeApproval = revoke },
+                onApprovalControl: revoke => { state.revokeApproval = revoke },
                 onQuestion: async (questions, askSignal) => {
                 const current = await this.liveToolAccess(job, askSignal)
-                const answer = await this.questions.ask(questions, { ...job, session_id: session.session_id }, current, askSignal,
+                const answer = await bridge.ask(questions, { ...job, session_id: session.session_id }, current, askSignal,
                   waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), () => this.liveToolAllowed(job, current))
                 await this.liveToolAccess(job, askSignal)
                 return answer
               } }),
               ...(meta.deferredForm && { expectedModel: meta.deferredForm.model }),
               ...(toolsAllowed && config.allowFiles && { onDeliverables: files => { deliverables = files } }),
-              ...(toolsAllowed && !meta.deferredForm && config.transport === 'websocket'
-                && { onSteer: offer => { this.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })
+              ...(!meta.deferredForm && config.transport === 'websocket'
+                && { onSteer: offer => { state.steerActive = offer ? { job, offer, merged, sessionId: session.session_id, profile: config.sessionProfile } : undefined } }) })
           }
           try { reply = await run() }
           catch (error) {
@@ -1099,7 +1192,10 @@ export class Worker {
     const receiving = this.poll(lifetime)
     const recovery = this.inbox.run(lifetime)
     try { await Promise.all([receiving, draining, recovery]) }
-    finally { stop.abort(); await Promise.allSettled([receiving, draining, recovery, ...this.stopControls]) }
+    finally {
+      stop.abort()
+      await Promise.allSettled([receiving, draining, recovery, ...this.stopControls, ...this.appIntakes.values(), ...this.ambientChecks])
+    }
   }
 
   async poll(signal) {
@@ -1176,7 +1272,7 @@ export class Worker {
     } finally {
       stop.abort()
       await Promise.allSettled([receiving, draining, cardEvents, recovery, discovery, ...this.stopControls])
-      await this.appIntake
+      await Promise.allSettled([...this.appIntakes.values(), ...this.ambientChecks])
     }
   }
 }

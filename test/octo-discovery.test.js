@@ -54,6 +54,32 @@ function fixture({ config: overrides, handle, verify } = {}) {
   return { api, dispatch, calls, verifications }
 }
 
+test('owner DM reads exact group info and paginated roles; a missing group role or route prevents disclosure', async () => {
+  let role = 1
+  const f = fixture({ handle(path) {
+    if (path === '/v1/bot/groups') return [groupRow(a)]
+    if (path === groupPath(a)) return groupDetail(a, { internal_field: 'never disclose' })
+    if (path === groupPath(a) + '/members') return [
+      { uid: owner, name: 'Owner', role, robot: 0 },
+      { uid: bot, name: 'Robot', role: 0, robot: 1, owner_uid: owner, created_at: 'never disclose' },
+      { uid: 'removed', name: 'Removed', role: 0, robot: 0, is_deleted: 1 },
+    ]
+  } })
+  assert.deepEqual(await f.dispatch('groups.info_joined', { group_no: a }), {
+    group: { ...candidate(a), notice: 'private notice' },
+  })
+  assert.deepEqual(await f.dispatch('groups.members_joined', { group_no: a, page: 2, limit: 1 }), {
+    group_no: a, members: [{ uid: bot, name: 'Robot', role: 0, robot: 1 }], page: 2, more: false,
+  })
+  const detailCalls = () => f.calls.filter(url => url.pathname === groupPath(a)).length
+  const before = detailCalls()
+  role = 0
+  await assert.rejects(f.dispatch('groups.info_joined', { group_no: a }), { code: 'discovery_target_not_allowed' })
+  assert.equal(detailCalls(), before)
+  await assert.rejects(f.dispatch('groups.members_joined', { group_no: foreign }), { code: 'discovery_target_not_allowed' })
+  assert.ok(!f.calls.some(url => url.pathname.startsWith(groupPath(foreign))))
+})
+
 test('discovery is opt-in, read-only, and rejects non-owner, shared, App Bot and forged scope inputs before I/O', async () => {
   const f = fixture()
   assert.ok(octoDiscoverySpecs.every(row => row.available && !row.mutating && row.privateOnly && row.ownerOnly && row.dmAvailable))

@@ -44,6 +44,8 @@ export const octoDiscoverySpecs = freeze([
     + 'No profile, contact information, or channel access is implied.', { uid }, ['uid']),
   spec('groups.list_joined', 'List one page of ordinary groups the Bot can access in this Space and the account allows. '
     + 'Pages are checked live and can be short; this is Bot metadata, not the requester’s own group list.', { page, limit }),
+  spec('groups.info_joined', 'Read the name and notice of one exact active group in the Bot’s Space. Both the Bot and the requester must be members; the requester must be a current group owner or manager.', { group_no: group }, ['group_no']),
+  spec('groups.members_joined', 'Read one page of members of one exact active group in the Bot’s Space. Requires current group owner or manager authority. Returns only UID, display name, role and bot flag.', { group_no: group, page, limit }, ['group_no']),
   spec('groups.resolve_targets', 'Find named group/topic candidates within the Bot’s current Space and route policy. '
     + 'Results can be partial; refine the name or ask the user to disambiguate. Does not authorize sending or message reads.',
   { name: keyword, kind, limit }, ['name']),
@@ -226,12 +228,46 @@ export class OctoDiscovery {
     return result
   }
 
-  async #group(id, ctx) {
+  async #group(id, ctx, notice = false) {
     const raw = await this.#get(groupRoot(id), ctx, unavailableGroup)
     if (raw === undefined) return null
     if (!object(raw) || raw.group_no !== id || typeof raw.name !== 'string' || ![0, 1, 2].includes(raw.status)) invalid()
     if (raw.status !== 1) return null
-    return { kind: 'group', channel_id: id, channel_type: 2, group_no: id, name: label(raw.name) }
+    return { kind: 'group', channel_id: id, channel_type: 2, group_no: id, name: label(raw.name),
+      ...(notice && { notice: typeof raw.notice === 'string'
+        ? raw.notice.slice(0, 4000).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cf}]/gu, '') : '' }) }
+  }
+
+  async #groupRoster(id, ctx) {
+    const raw = await this.#get(groupRoot(id) + '/members', ctx, unavailableGroup)
+    if (raw == null) fail('discovery_target_not_allowed')
+    const seen = new Set(), rows = []
+    for (const row of array(raw, maxGroups)) {
+      if (!object(row) || !pathUid(row.uid) || typeof row.name !== 'string'
+        || ![0, 1, 2].includes(row.role) || ![0, 1].includes(row.robot)) invalid()
+      unique(seen, row.uid.toLowerCase())
+      if (row.status !== undefined && row.status !== 1
+        || row.is_deleted !== undefined && row.is_deleted !== 0 && row.is_deleted !== false) continue
+      rows.push({ uid: row.uid, name: label(row.name) || row.uid, role: row.role, robot: row.robot })
+    }
+    if (!rows.some(row => row.uid === this.#config.botUid && row.robot === 1)
+      || !rows.some(row => row.uid === ctx.sender && row.robot === 0 && [1, 2].includes(row.role))) {
+      fail('discovery_target_not_allowed')
+    }
+    return rows
+  }
+
+  async #inspectGroup(args, ctx, roster) {
+    const id = args.group_no
+    if (!this.#allows(2, id) || !(await this.#groups(ctx)).has(id)) fail('discovery_target_not_allowed')
+    await this.#groupRoster(id, ctx)
+    const group = await this.#group(id, ctx, !roster)
+    if (!group || !(await this.#groups(ctx)).has(id)) fail('discovery_target_not_allowed')
+    const fresh = await this.#groupRoster(id, ctx)
+    if (!roster) return { group }
+    // Use the final roster; never expose owner metadata or creation timestamps.
+    const page = args.page ?? 1, limit = args.limit ?? defaultLimit
+    return { group_no: id, members: fresh.slice((page - 1) * limit, page * limit), page, more: page * limit < fresh.length }
   }
 
   async #threadPage(id, page, size, ctx) {
@@ -350,6 +386,8 @@ export class OctoDiscovery {
       case 'space.members.list': result = await this.#members(args, ctx); break
       case 'space.principals.get': result = { principal: await this.#principal(args.uid, ctx) }; break
       case 'groups.list_joined': result = await this.#joined(args, ctx); break
+      case 'groups.info_joined': result = await this.#inspectGroup(args, ctx, false); break
+      case 'groups.members_joined': result = await this.#inspectGroup(args, ctx, true); break
       case 'groups.resolve_targets': result = await this.#resolve(args, ctx); break
       case 'groups.threads.list': result = await this.#threads(args, ctx); break
       case 'obo.scopes.list': result = await this.#scopes(ctx); break

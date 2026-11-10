@@ -49,7 +49,10 @@ window.__ModuleLoader__.load({
       appScope: ['Octo 管理的私聊范围', 'Octo-managed DM scope'],
       threadRule: ['子区规则', 'Topic rules'], threadOnly: ['只用子区规则', 'Use only topic rules'],
       threadInherit: ['继承群规则，子区优先', 'Inherit group rules; topic rules take priority'],
-      response: ['回复体验', 'Replies'], responseHint: ['设置回复进度和执行时限。', 'Choose how reply progress is shown and how long a reply can run.'],
+      response: ['回复体验', 'Replies'], responseHint: ['设置并行会话、回复进度和执行时限。', 'Set conversation concurrency, progress and reply timeout.'],
+      concurrentTurns: ['并行会话数', 'Concurrent conversations'],
+      concurrentTurnsHint: ['不同私聊、群聊和子区可同时处理。同一会话一次处理一项任务。', 'Direct chats, groups and topics can run in parallel. Each conversation runs one task at a time.'],
+      invalid_concurrent_turns: ['并行会话数须为 1 至 8。', 'Choose between 1 and 8 concurrent conversations.'],
       progress: ['进度显示', 'Reply progress'], card: ['优先使用 Octo 进度卡', 'Prefer Octo progress cards'],
       typing: ['仅显示正在输入', 'Typing indicator only'], off: ['关闭进度', 'Turn off progress'],
       cardHint: ['卡片不可用时自动显示「正在输入」。', 'Falls back to a typing indicator when cards are unavailable.'],
@@ -400,6 +403,7 @@ window.__ModuleLoader__.load({
           : (ms > 600_000 && ['days', 'hours', 'minutes'].find(unit => ms % timeoutUnits[unit] === 0)) || 'seconds'
         return { ...Object.fromEntries(Object.keys(choices).map(key => [key, config[key]])),
           ...Object.fromEntries(listKeys.map(key => [key, config[key].join('\n')])),
+          maxConcurrentTurns: config.maxConcurrentTurns ?? 4,
           timeoutUnit, timeout: timeoutUnit === 'unlimited' ? '' : ms / timeoutUnits[timeoutUnit] }
       }
       function Config({ config, revision, accountId, t }) {
@@ -458,6 +462,7 @@ window.__ModuleLoader__.load({
               settings[key] = inactive ? [] : [...new Set(draft[key].split('\n').map(x => x.trim()).filter(Boolean))]
             }
             settings.timeoutMs = timeoutMs
+            settings.maxConcurrentTurns = Number(draft.maxConcurrentTurns)
             const next = await api(accountId ? '/accounts/' + accountId + '/settings' : '/settings', { method: 'PUT', headers: {
               'Content-Type': 'application/json', 'x-dsh-octo-client': '1',
             }, body: JSON.stringify({ settings, revision: base.current }) })
@@ -477,7 +482,10 @@ window.__ModuleLoader__.load({
             draft.channelPolicy === 'allowlist' && multi('allowedThreadIds', 'threads', 'threadFormat')),
           !app && card('triggers', 'triggersHint', select('mentionPolicy', config.transport !== 'websocket' && 'requiresWebSocket'),
             select('threadRuleMode')),
-          card('response', 'responseHint', select('progress', draft.progress === 'auto' && 'cardHint'), timeoutControl),
+          card('response', 'responseHint', select('progress', draft.progress === 'auto' && 'cardHint'), timeoutControl,
+            field('maxConcurrentTurns', 'concurrentTurns', h('select', { id: 'dsho-maxConcurrentTurns',
+              value: draft.maxConcurrentTurns, onChange: e => set('maxConcurrentTurns', e.target.value) },
+            ...Array.from({ length: 8 }, (_, i) => h('option', { key: i + 1, value: i + 1 }, i + 1))), 'concurrentTurnsHint')),
           (feedback || stale) && h('p', { className: 'dsho-alert', role: stale ? 'alert' : feedback[0] },
             t(stale ? 'settings_changed' : feedback[1])),
           h('div', { className: 'dsho-actions dsho-savebar' },

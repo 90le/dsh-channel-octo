@@ -147,7 +147,7 @@ test('specs are immutable ordinary JSON schemas with no model-supplied route, UR
     assert.ok(Object.isFrozen(entry.parameters))
     assert.ok(!['url', 'host', 'channel_id', 'sender', 'on_behalf_of'].some(k => k in entry.parameters.properties))
     if ('group_no' in entry.parameters.properties) {
-      assert.equal(entry.name, 'groups.threads.list')
+      assert.ok(['groups.threads.list', 'groups.info_joined', 'groups.members_joined'].includes(entry.name))
       assert.equal(entry.privateOnly && entry.ownerOnly && !entry.mutating, true)
     }
     if ('path' in entry.parameters.properties) {

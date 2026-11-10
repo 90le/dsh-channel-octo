@@ -70,6 +70,10 @@ export function resolveConfig(config, env = process.env) {
   const waitSeconds = config.waitSeconds ?? 15
   const timeoutMs = config.timeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS
   const progress = config.progress ?? 'auto'
+  const maxConcurrentTurns = config.maxConcurrentTurns ?? 4
+  if (!Number.isInteger(maxConcurrentTurns) || maxConcurrentTurns < 1 || maxConcurrentTurns > 8) {
+    throw new Error('invalid_concurrent_turns')
+  }
   const oboSendContract = config.oboSendContract
   if (oboSendContract !== undefined && (typeof oboSendContract !== 'string' || !/^octo-server:[a-f0-9]{40}$/.test(oboSendContract))) {
     throw new Error('invalid_obo_send_contract')
@@ -82,7 +86,7 @@ export function resolveConfig(config, env = process.env) {
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
     ...identity, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
-    senderPolicy, channelPolicy, mentionPolicy, transport, progress, toolScope,
+    senderPolicy, channelPolicy, mentionPolicy, transport, progress, toolScope, maxConcurrentTurns,
     oboSendContract,
     mediaDownloadOrigins: config.mediaDownloadOrigins, mediaUploadOrigins: config.mediaUploadOrigins,
     mediaMaxBytes: config.mediaMaxBytes, mediaTimeoutMs: config.mediaTimeoutMs,

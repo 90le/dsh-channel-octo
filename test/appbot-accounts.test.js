@@ -389,12 +389,13 @@ test('channel settings keep App response controls usable and omit hidden group s
     if (app) assert.match(textOf(tree), /Octo-managed DM scope/)
     nodes(tree).find(node => node?.props?.id === 'dsho-progress').props.onChange({ target: { value: 'typing' } })
     nodes(tree).find(node => node?.props?.id === 'dsho-timeout').props.onChange({ target: { value: '6' } })
+    nodes(tree).find(node => node?.props?.id === 'dsho-maxConcurrentTurns').props.onChange({ target: { value: '3' } })
     tree = ui.render(Settings, {})
     await nodes(tree).find(node => node?.type === 'form' && node.props['aria-label'] === 'Channel settings').props.onSubmit({ preventDefault() {} })
     assert.equal(requests.length, 1)
     assert.equal(requests[0].revision, 'original')
-    if (app) assert.deepEqual(requests[0].settings, { progress: 'typing', timeoutMs: 6000 })
-    else assert.deepEqual(requests[0].settings, { progress: 'typing', timeoutMs: 6000, channelPolicy: 'allowlist',
+    if (app) assert.deepEqual(requests[0].settings, { progress: 'typing', timeoutMs: 6000, maxConcurrentTurns: 3 })
+    else assert.deepEqual(requests[0].settings, { progress: 'typing', timeoutMs: 6000, maxConcurrentTurns: 3, channelPolicy: 'allowlist',
       mentionPolicy: 'required', threadRuleMode: 'thread-only', allowedGroupIds: [], allowedThreadIds: [] })
   }
 })

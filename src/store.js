@@ -686,15 +686,25 @@ export class Store {
   }
 
   steerCandidate(job) {
-    return this.db.prepare(`SELECT * FROM jobs WHERE state='queued' AND seq>?
-      AND channel_type=? AND COALESCE(channel_id,sender)=? AND sender=? ORDER BY seq LIMIT 1`)
-      .get(job.seq, job.channel_type, job.channel_id ?? job.sender, job.sender)
+    return this.db.prepare(`SELECT * FROM jobs WHERE state='queued'
+      AND channel_type=? AND COALESCE(channel_id,sender)=? AND sender=?
+      AND (route_order>? OR route_order=? AND seq>?) ORDER BY route_order,seq LIMIT 1`)
+      .get(job.channel_type, job.channel_id ?? job.sender, job.sender, job.route_order, job.route_order, job.seq)
   }
 
-  next(now) {
+  followupHead(job) {
+    return this.db.prepare(`SELECT * FROM jobs WHERE state IN ('queued','ready')
+      AND channel_type=? AND COALESCE(channel_id,sender)=?
+      AND (route_order>? OR route_order=? AND seq>?) ORDER BY route_order,seq LIMIT 1`)
+      .get(job.channel_type, job.channel_id ?? job.sender, job.route_order, job.route_order, job.seq)
+  }
+
+  next(now, busy = []) {
     // Keep per-conversation reply order when an earlier send was rate-limited.
     return this.db.prepare(`
       SELECT j.* FROM jobs j WHERE j.state IN ('queued','ready') AND j.next_ms <= ?
+        AND NOT EXISTS (SELECT 1 FROM json_each(?) lane WHERE json_extract(lane.value,'$[0]')=j.channel_type
+          AND json_extract(lane.value,'$[1]')=COALESCE(j.channel_id,j.sender))
         AND NOT EXISTS (SELECT 1 FROM inbox_routes r WHERE r.channel_type=j.channel_type
           AND r.channel_id=COALESCE(j.channel_id,j.sender) AND r.blocked=1)
         AND NOT EXISTS (
@@ -704,7 +714,7 @@ export class Store {
             AND prior.state IN ('queued','ready','running','sending')
         )
       ORDER BY j.seq LIMIT 1
-    `).get(now)
+    `).get(now, JSON.stringify(busy))
   }
 
   session(sender, idleMinutes = 0, now = Date.now(), rotate = false) {

@@ -164,3 +164,13 @@ test('steering candidate also distinguishes identical address strings with diffe
   f.store.db.prepare("UPDATE jobs SET channel_id=NULL WHERE message_id IN ('5','7')").run()
   assert.equal(f.store.steerCandidate({ ...dm, channel_id: null }).message_id, '7')
 })
+
+test('a live frame with an older channel sequence is not a steering supplement', t => {
+  const f = fixture(t, cases[0])
+  f.store.add('1', { messageId: '1', sender: 'alice', text: 'active', channelType: 2, channelId: group, messageSeq: 10 })
+  const job = f.store.next(Date.now())
+  f.store.running(job.seq)
+  f.store.add('2', { messageId: '2', sender: 'alice', text: 'late frame', channelType: 2, channelId: group, messageSeq: 9 })
+  assert.equal(f.store.steerCandidate(job), undefined)
+  assert.equal(f.rows().find(row => row.message_id === '2').state, 'queued')
+})

@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.22.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.23.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -60,6 +60,12 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 需要为测试 profile 设置可用的 DSH 模型。使用独立 Bot，不与其他连接程序同时消费其事件；启用后会确认该 Bot 收到的事件，超出当前支持范围的事件不进入模型。暂停时将 `enabled` 改回 `false` 并按环境流程重载 Web；本地状态和会话保留。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
+
+## 0.23.0
+
+- 每个 Bot 默认最多同时处理 4 个会话，可在「渠道设置 → 回复体验 → 并行会话数」设为 1–8。每个私聊对端、群主区和子区独立排队；同一群或子区一次只运行一个回合。群内同一权限范围沿用频道会话，工作区工具权限不同的回合仍使用独立 DSH 会话。
+- WebSocket 插话模式下，只允许当前发起人的实时普通文字进入正在运行的回合。其他成员按顺序排队；相邻的同一人普通补充可合并入自己的回合。命令、引用、附件和恢复消息单独处理。每条会话独立绑定问题、表单、审批、进度和 `/stop`。并行会话若选了同一工作区，仍会使用同一个目录。
+- 新增 `octo_groups_info_joined` 与 `octo_groups_members_joined`。Bot 所有者在自己的私聊可查询指定群资料和分页成员，需要是该群的当前群主或管理员。
 
 ## 0.22.0
 

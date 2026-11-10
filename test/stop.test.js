@@ -110,7 +110,7 @@ test('a stop during delivery retains a late confirmed receipt and suppresses rem
     await sent.promise
     f.stop(21)
     release.resolve()
-    await until(() => !f.worker.activeWork)
+    await until(() => f.worker.activeByRoute.size === 0)
     assert.equal(f.state(20).state, 'stopped')
     assert.equal(f.state(20).result_id, '201')
     assert.ok(!f.output.some(row => row.text.startsWith('B') || row.text.startsWith('C')))

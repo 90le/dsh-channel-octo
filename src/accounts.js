@@ -217,8 +217,15 @@ export class Accounts {
       try {
         const registry = this.ctx.get('workspaceRegistry')
         if (!registry || registry.archivedSessionIds?.includes(sessionId)) return
-        let workspace = workspaces.get(cwd)
-        if (!workspace) { workspace = await registry.create(cwd, 'Octo'); workspaces.set(cwd, workspace) }
+        let opening = workspaces.get(cwd)
+        if (!opening) {
+          opening = Promise.resolve().then(() => registry.create(cwd, 'Octo')).catch(error => {
+            if (workspaces.get(cwd) === opening) workspaces.delete(cwd)
+            throw error
+          })
+          workspaces.set(cwd, opening)
+        }
+        const workspace = await opening
         await workspace.attachSession(sessionId)
       } catch { this.log.info('workspace_attach_failed') }
     }
@@ -559,6 +566,10 @@ export class Accounts {
       // The account editor owns sender admission after that field is edited.
       if (record.senderPolicy) { delete next.senderPolicy; delete next.allowedUids }
       runtime.settings.save(next, input?.revision)
+      if (runtime.worker) {
+        const config = this.runtimeConfig(record, runtime.settings.config)
+        runtime.worker.reconfigure(config, new DshHost(this.ctx, config.cwd, config.timeoutMs, record))
+      }
       return { config: channelView(runtime.settings.config), revision: runtime.settings.revision(), overview: this.overview() }
     })
   }
