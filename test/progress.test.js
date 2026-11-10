@@ -626,3 +626,42 @@ test('tool count and visual hierarchy distinguish titles, summaries and details 
  assert.equal(toolDetail.items[0].columns[1].items[0].size,'Small')
  local.click('dsh_progress_all_open');local.click('dsh_progress_all_close')
 })
+
+
+test('per-task expansion survives waiting states and every terminal state collapses all sections', async t => {
+ const tick=clock(t)
+ for (const expansion of ['collapsed','list','all']) for (const outcome of ['completed','error','stopped','timeout']) {
+  const f=fixture({profile:()=>compact}), task=new AbortController(), terminal=new AbortController()
+  const h=f.progress.start(job,'auto',task.signal,undefined,terminal.signal,expansion)
+  h.trace({kind:'tool-start',id:'one',name:'read'})
+  await tick(450)
+  const check=()=>{
+   const local=localCard(f.calls.at(-1).frame.card)
+   local.expanded('dsh_progress',expansion!=='collapsed')
+   local.expanded('dsh_progress_item_1',expansion==='all')
+   assert.equal(local.byId.get('dsh_progress_all_close').isVisible,expansion==='all')
+  }
+  check()
+  h.trace({kind:'question-open'});await tick(800);check()
+  h.trace({kind:'question-closed'});h.stage('approval');await tick(800);check()
+  if(outcome==='stopped')task.abort()
+  await h.finish(outcome==='timeout'?'error':outcome,{interrupted:outcome==='stopped',detail:outcome==='timeout'?'处理超时':undefined})
+  const local=localCard(f.calls.at(-1).frame.card)
+  local.expanded('dsh_progress',false);local.expanded('dsh_progress_item_1',false)
+  assert.equal(local.byId.get('dsh_progress_all_close').isVisible,false)
+  assert.equal(f.calls.filter(c=>c.type==='create').length,1)
+ }
+})
+
+test('simultaneous Bots keep their own card expansion and registry fallback collapses on completion', async t=>{
+ const tick=clock(t),a=fixture({profile:()=>compact}),b=fixture({profile:()=>compact})
+ const first=a.progress.start(job,'auto',new AbortController().signal,undefined,undefined,'all')
+ const second=b.progress.start(job,'auto',new AbortController().signal,undefined,undefined,'collapsed')
+ await tick(450)
+ localCard(a.calls.at(-1).frame.card).expanded('dsh_progress',true)
+ localCard(b.calls.at(-1).frame.card).expanded('dsh_progress',false)
+ await first.finish('completed');await second.finish('completed')
+ const f=fixture(),h=f.progress.start(job,'auto',new AbortController().signal,undefined,undefined,'list')
+ await tick(450);assert.equal(f.calls.at(-1).frame.data.traceExpanded,true)
+ await h.finish('error');assert.equal(f.calls.at(-1).frame.data.traceExpanded,false)
+})

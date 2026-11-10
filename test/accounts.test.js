@@ -88,6 +88,14 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(accounts.overview().accountRevision, revisionBeforeInvalid)
     const secondId = (await save(null, { label: 'Second', token: 'bf_other_fixture' })).accountId
     assert.equal(accounts.record(secondId).toolScope, 'private')
+    for (const progressExpansion of ['list', 'all']) {
+      await accounts.save(firstId, { revision: accounts.revision, account: { progressExpansion } })
+      assert.equal(accounts.record(firstId).progressExpansion, progressExpansion)
+      assert.equal(accounts.overview().accounts.find(row => row.id === firstId).progressExpansion, progressExpansion)
+      assert.equal(accounts.runtimes.get(firstId).settings.config.progressExpansion, progressExpansion)
+      assert.equal(accounts.overview().accounts.find(row => row.id === secondId).progressExpansion, 'collapsed')
+    }
+    await assert.rejects(accounts.save(firstId, { revision: accounts.revision, account: { progressExpansion: 'invalid' } }), /invalid_account/)
     assert.notEqual(firstId, secondId)
     assert.equal(secrets.size, 2)
     const initialStore = accounts.runtimes.get(secondId).store
@@ -117,6 +125,7 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     accounts = make()
     await accounts.initialize()
     const restored = accounts.overview().accounts.find(row => row.id === firstId)
+    assert.equal(restored.progressExpansion, 'all')
     assert.equal(restored.label, 'Renamed')
     assert.equal(restored.permission, 'workspace-write')
     assert.equal(restored.senderPolicy, 'octo')
@@ -231,6 +240,14 @@ test('an in-flight legacy account accepts a partial hot edit without reconnectin
     const worker = runtime.worker
     const originalProfile = worker.config.sessionProfile
     assert.equal(worker.config.toolScope, 'private')
+    const liveConfig = worker.config
+    let revoked = false
+    worker.revokeApproval = () => { revoked = true }
+    await accounts.save('legacy', { revision: accounts.revision, account: { progressExpansion: 'all' } })
+    assert.equal(worker.config, liveConfig, 'presentation changes do not replace the active config')
+    assert.equal(worker.config.progressExpansion, 'all')
+    assert.equal(revoked, false, 'presentation changes do not cancel approvals')
+    delete worker.revokeApproval
     const active = worker.inFlight = Promise.withResolvers().promise
     worker.store.add('1', { messageId: '1', sender: 'owner', text: 'in flight' })
     worker.store.running(1)
@@ -289,6 +306,7 @@ test('old account records and fresh legacy imports keep private tool scope until
       assert.equal(account.toolScope, 'private')
       assert.equal(accounts.runtimes.get(account.id).settings.config.toolScope, 'private')
       assert.equal(accountFields(account).toolScope, 'private')
+      assert.equal(accountFields(account).progressExpansion, 'collapsed')
     }
     assert.equal(readFileSync(file, 'utf8'), original)
     await accounts.save(managedId, { revision: accounts.overview().accountRevision, account: { label: 'Renamed old account' } })
@@ -381,6 +399,7 @@ test('account editor explains independent tool access, localizes efforts and imm
     models: [{ provider: 'fixture', model: 'model', reasoningEfforts: ['max', 'high', 'medium', 'low', 'default', 'custom'] }],
   }
   assert.equal(accountFields().toolScope, 'private')
+  assert.equal(accountFields().progressExpansion, 'collapsed')
   const choices = [['private', '获准的私聊用户'], ['owner', 'Bot 所有者的全部会话'], ['admitted', '所有已准入用户']]
   for (const [index, [toolScope]] of choices.entries()) {
     const saved = []
@@ -403,6 +422,13 @@ test('account editor explains independent tool access, localizes efforts and imm
     const effort = elements.find(node => node?.type === 'select' && node.props.id === 'fixture-effort')
     assert.deepEqual(effort.children.filter(node => node?.props?.value).map(node => node.children[0]),
       ['最高', '高', '中等', '低', '模型默认', 'custom'])
+    const expansion = elements.find(node => node?.type === 'select' && node.props.id === 'fixture-progress-expansion')
+    assert.deepEqual(expansion.children.filter(node => node?.type === 'option').map(node => node.children[0]), ['默认折叠', '展开列表', '全部展开'])
+    const expansionSaved = []
+    const fresh = nodes(Editor({ account, options, lang: 'zh', onSave: async value => { expansionSaved.push(value) } }))
+    fresh.find(node => node?.type === 'select' && node.props.id === 'fixture-progress-expansion').props.onChange({ target: { value: 'all' } })
+    await Promise.resolve()
+    assert.deepEqual(expansionSaved, [{ progressExpansion: 'all' }])
     const next = choices[(index + 1) % choices.length][0]
     select.props.onChange({ target: { value: next } })
     await Promise.resolve()

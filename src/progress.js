@@ -104,7 +104,7 @@ const disclosureTargets = (id, expanded) => [
   visibility(id + '_details', expanded), visibility(id + '_open', !expanded), visibility(id + '_close', expanded),
 ]
 
-function chevrons(id, label, targets, double = false) {
+function chevrons(id, label, targets, double = false, initiallyExpanded = false) {
   return [false, true].map(expanded => {
     const title = (expanded ? '收起' : '展开') + label
     // Octo's server only accepts these exact official icon bytes; visually
@@ -114,12 +114,13 @@ function chevrons(id, label, targets, double = false) {
     const icon = { type: 'Image', url: 'data:image/svg+xml,' + encodeURIComponent(svg),
       altText: title, size: 'Small', width: '14px', height: double ? '8px' : '14px', spacing: 'None' }
     return { ...(double ? { type: 'Container', spacing: 'None', items: [{ ...icon }, { ...icon }] } : icon),
-      id: id + (expanded ? '_close' : '_open'), isVisible: !expanded,
+      id: id + (expanded ? '_close' : '_open'), isVisible: expanded === initiallyExpanded,
       selectAction: { type: 'Action.ToggleVisibility', title, targetElements: targets(!expanded) } }
   })
 }
 
-function compactBody(status, summary, tone, phases, stats, note) {
+function compactBody(status, summary, tone, phases, stats, note, expansion) {
+  const outerExpanded = expansion !== 'collapsed', childrenExpanded = expansion === 'all'
   // Semantic group IDs remain stable when the recent tools window or phase order changes.
   const groups = phases.map(group => ({ ...group,
     id: group.id ?? 'dsh_progress_' + (group.thought === '工具执行' ? 'tools' : group.thought === '文件交付' ? 'files' : 'session') }))
@@ -132,22 +133,22 @@ function compactBody(status, summary, tone, phases, stats, note) {
     { type: 'ColumnSet', spacing: 'None', columns: [
       column('auto', [text('DSH 回复进度', { weight: 'Bolder', size: 'Medium', spacing: 'None' })]),
       // Only these three outer targets change: child visibility survives an outer close/open in this frame.
-      column('auto', chevrons(outer, '详情', expanded => disclosureTargets(outer, expanded))),
+      column('auto', chevrons(outer, '详情', expanded => disclosureTargets(outer, expanded), false, outerExpanded)),
       column('stretch', []),
-      column('auto', chevrons(all, '全部详情', allTargets, true)),
+      column('auto', chevrons(all, '全部详情', allTargets, true, childrenExpanded)),
     ] },
     text(status, { color: tone, spacing: 'None' }),
     text(summary, { isSubtle: true, size: 'Small' }),
-    { type: 'Container', id: outer + '_details', isVisible: false, separator: true, spacing: 'Small', items: [
+    { type: 'Container', id: outer + '_details', isVisible: outerExpanded, separator: true, spacing: 'Small', items: [
 
       ...groups.map(group => ({ type: 'Container', spacing: 'Medium', items: [
         { type: 'ColumnSet', spacing: 'None', columns: [
           column('stretch', [text(group.thought, { spacing: 'None', weight: group.kind === 'note' ? 'Default' : 'Bolder', size: group.kind === 'note' ? 'Small' : 'Default', isSubtle: group.kind === 'note' })]),
           ...(group.status ? [column('auto', [text(group.status, { color: group.tone ?? 'Default', isSubtle: true, spacing: 'None', size: 'Small' })])] : []),
-          column('auto', chevrons(group.id, group.thought, expanded => disclosureTargets(group.id, expanded))),
+          column('auto', chevrons(group.id, group.thought, expanded => disclosureTargets(group.id, expanded), false, childrenExpanded)),
         ] },
         ...(group.summary ? [text(group.summary, { isSubtle: true })] : []),
-        { type: 'Container', id: group.id + '_details', isVisible: false, spacing: 'Small', items: [
+        { type: 'Container', id: group.id + '_details', isVisible: childrenExpanded, spacing: 'Small', items: [
           ...group.actions.map((item, index) => ({ type: 'ColumnSet', spacing: index === 0 ? 'None' : 'Small', columns: [
             column('16px', []),
             column('stretch', [text(item.detail, { isSubtle: true, size: 'Small', spacing: 'None' })]),
@@ -159,8 +160,9 @@ function compactBody(status, summary, tone, phases, stats, note) {
   ] }]
 }
 
-function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
+function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted, expansion = 'collapsed') {
   const terminal = outcomes.includes(phase)
+  expansion = terminal || !['list', 'all'].includes(expansion) ? 'collapsed' : expansion
   const actual = !terminal && stats.approval ? 'approval' : !terminal && stats.waiting ? 'question'
     : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
   const label = interrupted ? '任务已停止' : labels[actual]
@@ -176,7 +178,7 @@ function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   const current = actual === 'tool' && [...stats.recent.values()].reverse().find(row => row.status === 'active')
   const status = current ? '正在' + current.label : label
   if (mode === 'compact' || mode === 'display') {
-    const body = mode === 'compact' ? compactBody(status, summary, tone, phases, stats, note) : [
+    const body = mode === 'compact' ? compactBody(status, summary, tone, phases, stats, note, expansion) : [
       text('DSH 回复进度', { weight: 'Bolder' }), text(status, { color: tone }), text(summary, { isSubtle: true, size: 'Small' }),
       ...phases.flatMap(group => [text(group.thought, { weight: 'Bolder' }), ...(group.summary ? [text(group.summary)] : []),
         ...group.actions.map(a => text(a.statusGlyph + ' ' + a.tool + '：' + a.detail))]),
@@ -185,7 +187,7 @@ function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
     return { profile: 'octo/v1', card_version: '1.5', plain: status + ' · ' + summary + (note ? ' · ' + note : ''),
       card: { type: 'AdaptiveCard', version: '1.5', body } }
   }
-  const expanded = false
+  const expanded = expansion !== 'collapsed'
   return { template_ref: mode, state, data: {
     reasoningId, state, title: 'DSH 回复进度', statusLabel: status, statusTone: tone,
     timerText: elapsed, traceExpanded: expanded, traceCollapsed: !expanded, collapsedSummary: summary,
@@ -228,7 +230,7 @@ export class Progress {
     }
   }
 
-  start(job, mode, signal, authorize, terminalSignal = signal) {
+  start(job, mode, signal, authorize, terminalSignal = signal, expansion = 'collapsed') {
     if (!mode || mode === 'off') return { stage() {}, trace() {}, async finish() { return false } }
     const route = { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }
     const reasoningId = 'dsh-octo-' + (decimalId(job.message_id) ?? randomUUID())
@@ -240,7 +242,7 @@ export class Progress {
     let editAt, refreshAt, scheduledAt
     const active = () => !closed && !blocked && !signal.aborted
     const render = (state, detail, interrupted) => frame(format, reasoningId, state,
-      Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail, interrupted)
+      Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail, interrupted, expansion)
     const clearTimer = () => {
       clearTimeout(timer)
       timer = scheduledAt = undefined

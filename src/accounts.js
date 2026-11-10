@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, isAbsolute, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { apiEndpoint, privateStateDir, validBotIdentity, validToken, validToolScope, validUid } from './config.js'
+import { apiEndpoint, privateStateDir, validBotIdentity, validToken, validToolScope, validUid, validProgressExpansion } from './config.js'
 import { DshHost } from './dsh.js'
 import { OctoClient, OctoError } from './octo.js'
 import { Store } from './store.js'
@@ -23,7 +23,7 @@ import { assistantId, assistantRuntime, assistantRuntimeKeys, assistantDocKeys, 
 const idPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 const refPattern = /^DSH_OCTO_ACCOUNT_[0-9A-F]{32}$/
 const inputKeys = new Set(['label', 'token', 'cwd', 'provider', 'model', 'reasoningEffort',
-  'permission', 'agentPreset', 'toolScope', 'enabled', 'senderPolicy', 'allowedUids', 'idleMinutes', 'sendMode', 'dmCommands', 'groupCommands', 'allowFiles'])
+  'permission', 'agentPreset', 'toolScope', 'enabled', 'senderPolicy', 'allowedUids', 'idleMinutes', 'progressExpansion', 'sendMode', 'dmCommands', 'groupCommands', 'allowFiles'])
 const idleOptions = [0, 15, 30, 60, 120]
 const fail = code => { throw new Error(code) }
 const str = (v, max = 200) => typeof v === 'string' && v.length <= max && !/[\x00-\x1f\x7f]/.test(v)
@@ -58,6 +58,7 @@ function savedRecords(path, endpoint) {
         || !str(item.label, 80) || !str(item.cwd, 1024) || !isAbsolute(item.cwd)
         || !['events', 'websocket'].includes(item.transport) || (item.botKind === 'app' && item.transport !== 'websocket')
         || typeof item.enabled !== 'boolean'
+        || (item.progressExpansion !== undefined && !validProgressExpansion(item.progressExpansion))
         || (item.toolScope !== undefined && !validToolScope(item.toolScope))) fail('accounts_unavailable')
       item.toolScope ??= 'private'
       ids.add(item.id); bots.add(bot)
@@ -250,7 +251,7 @@ export class Accounts {
       }),
       apiBase: this.endpoint, stateDir, cwd: record.cwd, botUid: record.botUid, spaceId: record.spaceId, transport: record.transport,
       ...(record.botKind === 'app' && { botKind: 'app' }),
-      toolScope: record.toolScope ?? 'private',
+      toolScope: record.toolScope ?? 'private', progressExpansion: record.progressExpansion ?? 'collapsed',
     }
     const admission = record.senderPolicy ? { senderPolicy: record.senderPolicy, allowedUids: record.allowedUids ?? [] } : {}
     return loadSettings(base, stateDir, token, () => this.privatePolicy(record), admission)
@@ -277,6 +278,7 @@ export class Accounts {
     }
     else delete config.sessionProfile
     config.idleMinutes = record.idleMinutes ?? 0
+    config.progressExpansion = record.progressExpansion ?? 'collapsed'
     config.toolPermission = record.permission ?? textOnly
     config.toolScope = toolScope
     Object.assign(config, normalizeImControls({ ...this.deployment, ...record }), { fetchImpl: this.fetchImpl })
@@ -478,7 +480,7 @@ export class Accounts {
       ...(record.botKind === 'app' && { botKind: 'app' }),
       provider: record.provider ?? '', model: record.model ?? '', reasoningEffort: record.reasoningEffort ?? '',
       permission: record.permission ?? textOnly, agentPreset: record.agentPreset ?? 'octo-text', idleMinutes: record.idleMinutes ?? 0,
-      toolScope: record.toolScope ?? 'private',
+      toolScope: record.toolScope ?? 'private', progressExpansion: record.progressExpansion ?? 'collapsed',
       senderPolicy: config?.senderPolicy ?? record.senderPolicy ?? 'octo', allowedUids: config?.allowedUids ?? record.allowedUids ?? [],
       status: runtime?.status ?? (record.enabled ? this.openIssues.get(record.id) === 'credentials_not_ready'
         ? 'waiting_credentials' : 'invalid_configuration' : 'disabled'),
@@ -713,13 +715,13 @@ export class Accounts {
     const prior = old && this.publicAccount(old)
     const fields = { ...prior, ...data }
     const { label, cwd, provider = '', model = '', reasoningEffort = '', permission = textOnly,
-      agentPreset: requestedPreset = 'octo-text', toolScope = 'private', enabled = true, idleMinutes = 0 } = fields
+      agentPreset: requestedPreset = 'octo-text', toolScope = 'private', enabled = true, idleMinutes = 0, progressExpansion = 'collapsed' } = fields
     const agentPreset = requestedPreset || 'octo-text'
     const im = normalizeImControls({ ...this.deployment, ...old, ...data })
     for (const key of Object.keys(im)) if (Object.hasOwn(data, key) && im[key] !== data[key]) fail('invalid_account')
     if (!str(label, 80) || !str(cwd, 1024) || !str(provider, 128) || !str(model) || !str(reasoningEffort, 64)
       || !str(permission, 128) || !str(agentPreset, 128) || typeof enabled !== 'boolean' || !idleOptions.includes(idleMinutes)
-      || !validToolScope(toolScope)
+      || !validToolScope(toolScope) || !validProgressExpansion(progressExpansion)
       || (!!provider !== !!model) || (reasoningEffort && !model)) fail('invalid_account')
     if (!this.workspaces().some(row => row.path === cwd)) fail('workspace_unavailable')
     if (provider && (!old || provider !== prior.provider || model !== prior.model || reasoningEffort !== prior.reasoningEffort)) {
@@ -739,7 +741,7 @@ export class Accounts {
       || rawUids.some(uid => !validUid(uid)) || (senderPolicy === 'allowlist' && !rawUids.length)) fail('invalid_account')
     const allowedUids = senderPolicy === 'allowlist' ? [...new Set(rawUids)] : []
     return { label: label.trim() || 'Octo Bot', cwd, provider, model, reasoningEffort,
-      permission, agentPreset, toolScope, enabled, senderPolicy, allowedUids, idleMinutes, ...im }
+      permission, agentPreset, toolScope, enabled, senderPolicy, allowedUids, idleMinutes, progressExpansion, ...im }
   }
 
   save(accountId, input) {
@@ -752,6 +754,10 @@ export class Accounts {
       if (Object.values(docs).some(value => !validAssistantDoc(value))) fail('invalid_assistant')
       const data = Object.fromEntries(Object.entries(payload).filter(([key]) => !assistantDocKeys.includes(key)))
       const fields = await this.editFields(data, old)
+      const previous = old && this.publicAccount(old)
+      const presentationOnly = !!old && !Object.hasOwn(data, 'token')
+        && Object.keys(docs).length === 0
+        && Object.entries(fields).every(([key, value]) => key === 'progressExpansion' || JSON.stringify(value) === JSON.stringify(previous[key]))
       const changedToken = Object.hasOwn(data, 'token')
       if (!old && !changedToken) fail('invalid_bot_token')
       if (changedToken && !this.canStore) fail('credential_provider_unavailable')
@@ -792,7 +798,8 @@ export class Accounts {
         if (rotate) await this.changeConnection(active, { priorSecret: changedToken ? old?.secretRef : undefined })
         else if (active.worker) {
           const config = this.runtimeConfig(record, candidate.config)
-          active.worker.reconfigure(config, this.hostFor(record, config))
+          if (presentationOnly) active.worker.config.progressExpansion = record.progressExpansion
+          else active.worker.reconfigure(config, this.hostFor(record, config))
         }
       } else {
         this.runtimes.set(record.id, candidate)

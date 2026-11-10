@@ -789,7 +789,7 @@ export class Worker {
           reply = meta.cardAction.selection === 'A' || meta.cardAction.selection === 'B'
             ? '已确认：选项 ' + meta.cardAction.selection + '。' : '已确认。'
         } else {
-          progress = this.progress.start(job, config.progress, signal, active => authorizeDelivery({}, active), activeWork?.terminalSignal)
+          progress = this.progress.start(job, config.progress, signal, active => authorizeDelivery({}, active), activeWork?.terminalSignal, config.progressExpansion)
           if (activeWork) activeWork.progress = progress
           const [material, channelContext] = await Promise.all([
             materializeInput(config, meta, signal),

@@ -9,6 +9,7 @@ export const validBotIdentity = (config) => validUid(config?.botUid) && (config.
   ? /^app_[A-Za-z0-9_-]+_bot$/.test(config.botUid) && config.spaceId === null
   : (config.botKind === undefined || config.botKind === 'user') && validUid(config.spaceId))
 export const validToken = (s) => typeof s === 'string' && /^(app|bf)_[A-Za-z0-9_-]{1,512}$/.test(s)
+export const validProgressExpansion = value => ['collapsed', 'list', 'all'].includes(value)
 export const validToolScope = (scope) => ['private', 'owner', 'admitted'].includes(scope)
 
 function scopeList(value, type) {
@@ -70,6 +71,8 @@ export function resolveConfig(config, env = process.env) {
   const waitSeconds = config.waitSeconds ?? 15
   const timeoutMs = config.timeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS
   const progress = config.progress ?? 'auto'
+  const progressExpansion = config.progressExpansion ?? 'collapsed'
+  if (!validProgressExpansion(progressExpansion)) throw new Error('invalid_progress_expansion')
   const maxConcurrentTurns = config.maxConcurrentTurns ?? 4
   if (!Number.isInteger(maxConcurrentTurns) || maxConcurrentTurns < 1 || maxConcurrentTurns > 8) {
     throw new Error('invalid_concurrent_turns')
@@ -86,7 +89,7 @@ export function resolveConfig(config, env = process.env) {
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
     ...identity, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
-    senderPolicy, channelPolicy, mentionPolicy, transport, progress, toolScope, maxConcurrentTurns,
+    senderPolicy, channelPolicy, mentionPolicy, transport, progress, progressExpansion, toolScope, maxConcurrentTurns,
     oboSendContract,
     mediaDownloadOrigins: config.mediaDownloadOrigins, mediaUploadOrigins: config.mediaUploadOrigins,
     mediaMaxBytes: config.mediaMaxBytes, mediaTimeoutMs: config.mediaTimeoutMs,

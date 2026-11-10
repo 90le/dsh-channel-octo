@@ -100,6 +100,12 @@ const copy = {
   idle30: ['30 分钟', '30 min'],
   idle60: ['1 小时', '1 hr'],
   idle120: ['2 小时', '2 hrs'],
+  progressSection: ['进度卡', 'Progress card'],
+  progressExpansion: ['执行时进度卡展开方式', 'Progress card while running'],
+  progressCollapsed: ['默认折叠', 'Collapsed'],
+  progressList: ['展开列表', 'Expand list'],
+  progressAll: ['全部展开', 'Expand all'],
+  progressExpansionHint: ['启用进度卡时，仅对当前 Bot 的新任务生效。等待回答或审批时保持此方式；成功、失败、停止或超时结束后全部折叠。每次更新按此设置显示，手动展开状态可能重置。', 'Applies to new tasks for this Bot. Waiting for answers or approval retains this view; completion, failure, stop or timeout collapses everything. Updates apply this default and may reset manual toggles.'],
   sendMode: ['发送方式', 'Send mode'],
   sendQueue: ['排队发送', 'Queue'],
   sendSteer: ['插话发送', 'Steer'],
@@ -154,6 +160,7 @@ export function accountFields(account) {
     dmCommands: account?.dmCommands === 'safe' ? 'safe' : 'off',
     groupCommands: account?.groupCommands === 'safe' ? 'safe' : 'off',
     allowFiles: account?.allowFiles === true,
+    progressExpansion: ['list', 'all'].includes(account?.progressExpansion) ? account.progressExpansion : 'collapsed',
   }
 }
 
@@ -455,6 +462,11 @@ export function createAccountEditor(React, { Button, Input }) {
         select('idle', 'idleMinutes', idleItems, String(draft.idleMinutes),
           idleMinutes => update({ idleMinutes: Number(idleMinutes) }))),
       draft.sendMode === 'steer' && hint('sendSteerNote'),
+      h('section', { className: 'dsho-account-section' },
+        h('h3', null, tr('progressSection')),
+        select('progress-expansion', 'progressExpansion', enums([['collapsed', 'progressCollapsed'], ['list', 'progressList'], ['all', 'progressAll']]),
+          draft.progressExpansion, progressExpansion => update({ progressExpansion })),
+        hint('progressExpansionHint')),
       h('section', { className: 'dsho-account-section' },
         checkbox('allowFiles', 'allowFiles', id + '-files-help'),
         hint(draft.allowFiles ? app ? 'appFilesNote' : 'filesNote' : 'filesDisabledNote', { id: id + '-files-help' })),
