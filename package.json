@@ -1,6 +1,6 @@
 {
   "name": "dsh-channel-octo",
-  "version": "0.25.0",
+  "version": "0.25.1",
   "description": "Octo IM as a native DeepSeek Harness Web channel",
   "private": true,
   "license": "UNLICENSED",
@@ -23,7 +23,6 @@
     "PLAN.md",
     "OCTO-COVERAGE.md",
     "IM-CONNECT-PARITY.md",
-    "compat/im-connect",
     "LICENSE-OCTO-APACHE-2.0",
     "THIRD-PARTY-NOTICES.md"
   ],

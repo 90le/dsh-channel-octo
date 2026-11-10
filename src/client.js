@@ -4,14 +4,14 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
-    const { createElement: h, useEffect, useRef, useState, useSyncExternalStore } = React
+    const { createElement: h, useEffect, useMemo, useRef, useState, useSyncExternalStore } = React
     const { Button, Input, SegmentedTabs, Menu, IconEllipsisOutlineRegular, IconPinFillRegular, MenuItemButton } = primitives
     const path = 'api/dsh-channel-octo'
     const words = {
       settings: ['Octo 渠道', 'Octo channel'], shortcut: ['Octo 频道', 'Octo conversations'],
       subtitle: ['管理 Octo 机器人、消息规则和会话。', 'Manage your Octo bot, message rules and conversations.'],
       account: ['Bot 账号', 'Bot account'], rules: ['消息规则', 'Message rules'], sessions: ['频道会话', 'Conversations'],
-      openChannel: ['打开频道', 'Open channel'], mainArea: ['主区', 'Main area'],
+      railNav: ['侧栏', 'Sidebar'], tasks: ['任务', 'Tasks'], openChannel: ['打开频道', 'Open channel'], mainArea: ['主区', 'Main area'],
       ungroupedTopics: ['未归组子区', 'Ungrouped topics'], advanced: ['高级设置', 'Advanced settings'],
       copyOctoId: ['复制 Octo 会话 ID', 'Copy Octo conversation ID'], waiting: ['等待回答', 'Waiting for an answer'],
       nav: ['Octo 设置分类', 'Octo settings sections'], close: ['关闭', 'Close'],
@@ -119,6 +119,8 @@ window.__ModuleLoader__.load({
 .dsho-root [hidden] { display:none!important; }
 .dsho-root [role="tabpanel"] { min-width:0; }
 .dsho-advanced > summary { cursor:pointer; font-weight:560; margin-block:8px; }
+.dsho-native-tabs { margin:8px 12px; }
+.dsho-bot-filter { display:flex; align-items:center; gap:8px; margin:6px 12px; }
 .dsho-native-state { max-width:100px; color:var(--dsw-alias-label-secondary,currentColor); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsho-root h2,.dsho-root h3,.dsho-rail h3,.dsho-modal h2 { margin:0; font-weight:650; line-height:1.32; }
 .dsho-root h2,.dsho-modal h2 { font-size:21px; }
@@ -164,6 +166,8 @@ window.__ModuleLoader__.load({
 .dsho-search { min-width:0; flex:1 1 150px; }
 .dsho-search input { width:100%; min-width:0; }
 .dsho-filters { align-items:center; }
+.dsho-route-folder { padding-inline-start:8px; }
+.dsho-route-folder > summary { cursor:pointer; padding-block:5px; }
 .dsho-list { display:grid; gap:2px; list-style:none; padding:0; margin:0; }
 .dsho-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:9px; align-items:center; padding:8px; width:100%; box-sizing:border-box; text-align:left; border:0; border-radius:8px; background:none; color:inherit; font:inherit; cursor:pointer; }
 .dsho-row:not(:disabled):hover,.dsho-row[aria-current="true"] { background:var(--dsho-row); }
@@ -246,6 +250,57 @@ window.__ModuleLoader__.load({
     const hint = text => h('p', { className: 'dsho-muted' }, text)
     const shortId = value => typeof value === 'string' && value.length > 9 ? '…' + value.slice(-7) : value
 
+    const folderPrefix = 'dsh-octo:'
+    function routeParts(row, multi, t) {
+      const bot = multi ? [{ key: 'bot:' + row.accountId, label: row.accountLabel || 'Bot' }] : []
+      if (row.type === 1) return [...bot, { key: 'dm', label: t('dm') }]
+      const groups = [...bot, { key: 'groups', label: t('group') }]
+      if (!row.group) return [...groups, { key: 'unknown', label: t('ungroupedTopics') }]
+      return [...groups, { key: 'group:' + row.group, label: row.groupName || t('group') + ' ' + shortId(row.group) },
+        row.type === 5 ? { key: 'topic:' + row.address, label: row.name || t('topic') + ' ' + shortId(row.address) }
+          : { key: 'main', label: t('mainArea') }]
+    }
+    function octoFolders(rows, sessions, multi, t, archivedOnly, archivedIds) {
+      const result = new Map(), archived = new Set(archivedIds)
+      for (const row of rows) {
+        if (!sessions.byId[row.id] || (archivedOnly && !archived.has(row.id))) continue
+        const parts = routeParts(row, multi, t), keys = [], labels = []
+        const updated = Number(row.updatedAt || sessions.byId[row.id].updatedAt)
+        for (const [index, part] of parts.entries()) {
+          keys.push(encodeURIComponent(part.key)); labels.push(part.label)
+          const leaf = index === parts.length - 1
+          if (archivedOnly && !leaf) continue
+          const path = 'octo-channel:/' + keys.join('/')
+          const id = folderPrefix + keys.join('/')
+          if (!result.has(id)) result.set(id, { workspaceId: id, id, path,
+            title: archivedOnly ? labels.join(' / ') : part.label,
+            createdAt: Number.isFinite(updated) && updated > 0 ? new Date(updated).toISOString() : '', sessionIds: [] })
+          if (leaf) result.get(id).sessionIds.push(row.id)
+        }
+      }
+      return [...result.values()]
+    }
+    function taskWorkspaceProjection(raw, octoIds) {
+      const items = raw.items.filter(workspace => !workspace.sessionIds.length
+        || !workspace.sessionIds.every(id => octoIds.has(id)))
+      return items.length === raw.items.length ? raw : { ...raw, items }
+    }
+    function nativeTabRegistry(officialTree) {
+      const tabs = new Map(), listeners = new Set(), sessionFilters = [], sessionOpeners = []
+      let items = [], revision = 0
+      const emit = () => { revision++; for (const fn of listeners) fn() }
+      const add = (array, item) => {
+        array.push(item); emit()
+        return () => { const i = array.indexOf(item); if (i >= 0) { array.splice(i, 1); emit() } }
+      }
+      const rebuild = () => { items = [...tabs.values()].sort((a,b) => (a.order || 0) - (b.order || 0)); emit() }
+      return { version: 1, officialTree, sessionFilters, sessionOpeners,
+        getTabs: () => items, getRevision: () => revision,
+        subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) },
+        insert(tab) { tabs.set(tab.id, tab); rebuild(); return () => { if (tabs.get(tab.id) === tab) { tabs.delete(tab.id); rebuild() } } },
+        addSessionFilter: fn => add(sessionFilters, fn), addSessionOpener: item => add(sessionOpeners, item) }
+    }
+
     function apply(ctx) {
       const locale = () => ctx.locale.getSnapshot().active
       const subscribeLocale = fn => ctx.locale.subscribe(fn)
@@ -253,6 +308,7 @@ window.__ModuleLoader__.load({
       const sessionSnapshot = () => ctx.sessions.list.getSnapshot()
       const subscribeSessions = fn => ctx.sessions.list.subscribe(fn)
       let showChannel = () => false
+      let ownTabSwitch
       let openOctoSettings = () => {}
       const shortcutListeners = new Set()
       const activeStatus = (data, t) => badge(t(data.status) || t('loading'), connectionTone[data.status])
@@ -341,6 +397,29 @@ window.__ModuleLoader__.load({
         const visible = entries.filter(({ row, title, kind }) =>
           (filter === 'all' || String(row.type) === filter)
           && (!term || [title, kind, row.address, row.accountLabel].some(value => String(value ?? '').toLocaleLowerCase().includes(term))))
+        const tree = { branches: new Map(), entries: [] }
+        for (const entry of visible) {
+          let branch = tree
+          for (const part of routeParts(entry.row, (data.accounts?.length ?? 0) > 1, t)) {
+            if (!branch.branches.has(part.key)) branch.branches.set(part.key, { label: part.label, branches: new Map(), entries: [] })
+            branch = branch.branches.get(part.key)
+          }
+          branch.entries.push(entry)
+        }
+        const renderTree = branch => h(React.Fragment, null,
+          ...[...branch.branches].map(([key, child]) => h('details', { key, open: true, className: 'dsho-route-folder' },
+            h('summary', null, child.label), renderTree(child))),
+          branch.entries.length > 0 && h('ul', { className: 'dsho-list' }, ...branch.entries.map(renderEntry)))
+        const renderEntry = ({ row, kind, title }) => {
+          const issue = row.state === 'review' && issueLabel(row.issue, t)
+          const detail = [kind, row.historical && t('previousSession'), issue].filter(Boolean).join(' · ')
+          return h(ChannelRow, { key: row.id, row, kind, title, detail, issue, t, renderSlot,
+            current: sessions.byId[row.id]?.retainedBy?.mainView, pinned: pins.has(row.id), busy: !!opening,
+            open: async () => {
+              setFailed(false); setOpening(row.id)
+              try { await openSession(row.id); close?.() } catch { setFailed(true) } finally { setOpening('') }
+            } })
+        }
         return h('section', { className: 'dsho-channels' + (rail ? ' dsho-rail' : ''), 'aria-label': t('sessions'),
           ...(rail && { 'data-octo-rail': true }) },
           rail && h('div', { className: 'dsho-head' }, h('h3', null, 'Octo'), activeStatus(data, t)),
@@ -353,19 +432,7 @@ window.__ModuleLoader__.load({
                 h(Button, { key: id, size: 'sm', 'aria-pressed': filter === id, onClick: () => setFilter(id) }, t(label))))),
           failed && h(ErrorNotice, { t, message: t('openError') }),
           !data.status && !data.error && hint(t('loading')),
-          visible.length ? h('ul', { className: 'dsho-list' }, ...visible.map(({ row, kind, title }) => {
-            const issue = row.state === 'review' && issueLabel(row.issue, t)
-            const detail = [kind, data.accounts?.length > 1 && row.accountLabel, row.scope && t('inherited'),
-              row.historical && t('previousSession'), issue].filter(Boolean).join(' · ')
-            return h(ChannelRow, { key: row.id, row, kind, title, detail, issue, t, renderSlot,
-              current: sessions.byId[row.id]?.retainedBy?.mainView, pinned: pins.has(row.id),
-              busy: !!opening,
-              open: async () => {
-                setFailed(false); setOpening(row.id)
-                try { await openSession(row.id); close?.() } catch { setFailed(true) }
-                finally { setOpening('') }
-              } })
-          })) : data.status && h(Empty, { title: t(entries.length ? 'noResults' : 'empty'),
+          visible.length ? renderTree(tree) : data.status && h(Empty, { title: t(entries.length ? 'noResults' : 'empty'),
             note: t(entries.length ? 'noResultsNote' : 'emptyNote') }))
       }
 
@@ -513,7 +580,13 @@ window.__ModuleLoader__.load({
       function NativeOcto({ official, props, getIds }) {
         const t = useT()
         const ids = useSyncExternalStore(subscribe, getIds)
-        const [view, setView] = useState({ groupBy: 'flat', archivedFilter: 'default', orderBy: 'updated',
+        const data = useSyncExternalStore(subscribe, read)
+        const sessions = useSyncExternalStore(subscribeSessions, sessionSnapshot)
+        const [account, setAccount] = useState('')
+        const rows = (data.sessionRoutes ?? data.conversations ?? []).filter(row => !account || row.accountId === account)
+        const visibleIds = useMemo(() => account ? new Set(rows.map(row => row.id)) : ids, [data, account, ids])
+        const sessionCache = useMemo(() => new WeakMap(), [visibleIds])
+        const [view, setView] = useState({ groupBy: 'workspace-tree', archivedFilter: 'default', orderBy: 'updated',
           groupExpansion: {}, sessionOrderByAccount: {} })
         const state = patch => setView(current => ({ ...current, ...patch }))
         const actions = {
@@ -526,20 +599,94 @@ window.__ModuleLoader__.load({
           retainAccountKeys: () => {},
         }
         if (!official || !props?.useSessions || !props?.useWorkspaces) return h(ChannelList, { rail: true, renderSlot: props?.renderSlot })
-        const native = { ...props, actions, useStore: select => select(view),
-          useSessions: (select, equal) => props.useSessions(raw => select(nativeMembers(raw, ids)), equal),
-          useWorkspaces: (select, equal) => props.useWorkspaces(raw => select({
-            ...raw, items: raw.items.map(workspace => ({ ...workspace, sessionIds: workspace.sessionIds.filter(id => ids.has(id)) }))
-              .filter(workspace => workspace.sessionIds.length),
-          }), equal),
-          useDirectoryFlow: select => select(false),
-          requestAddWorkspace: () => openOctoSettings(), startSession: () => {},
-          t: (key, params) => key === 'section.workspaces' ? 'Octo' : props.t?.(key, params) ?? t(key) }
+        const workspaceSource = props.octoUseWorkspaces ?? props.useWorkspaces
+        const archiveOnly = view.archivedFilter === 'only'
+        const flatGroups = archiveOnly || view.groupBy === 'workspace'
+        const workspaceCache = useMemo(() => new WeakMap(), [data, account, sessions, archiveOnly, t])
+        const useOctoWorkspaces = (select, equal) => workspaceSource(raw => {
+          let projected = workspaceCache.get(raw)
+          if (!projected) {
+            projected = { ...raw, items: octoFolders(rows, sessions,
+              (data.accounts?.length ?? 0) > 1 && !account, t, archiveOnly, raw.archivedSessionIds) }
+            workspaceCache.set(raw, projected)
+          }
+          return select(projected)
+        }, equal)
+        const synthetic = id => typeof id === 'string' && id.startsWith(folderPrefix)
+        const defaultExpansion = {}
+        for (const row of rows) {
+          const keys = []
+          for (const part of routeParts(row, (data.accounts?.length ?? 0) > 1 && !account, t)) {
+            keys.push(encodeURIComponent(part.key))
+            defaultExpansion[folderPrefix + keys.join('/')] = true
+          }
+        }
+        const viewProjection = { ...view, groupBy: flatGroups ? 'workspace' : view.groupBy,
+          groupExpansion: { ...defaultExpansion, ...view.groupExpansion } }
+        const native = { ...props, actions, useStore: select => select(viewProjection),
+          useSessions: (select, equal) => props.useSessions(raw => {
+            if (!sessionCache.has(raw)) sessionCache.set(raw, nativeMembers(raw, visibleIds))
+            return select(sessionCache.get(raw))
+          }, equal),
+          useWorkspaces: useOctoWorkspaces,
+          startSession: (id, ...args) => { if (!synthetic(id)) props.startSession?.(id, ...args) },
+          useWorkspaceAccess: (id, ...args) => {
+            const granted = props.useWorkspaceAccess?.(id, ...args)
+            return !synthetic(id) && granted
+          },
+          ...(props.useContextMenu && { useContextMenu: () => {
+            const menu = props.useContextMenu()
+            return { ...menu, getTriggerProps(target, ...args) {
+              return menu.getTriggerProps(synthetic(target?.value?.workspaceId) ? undefined : target, ...args)
+            } }
+          } }),
+          renderFactorySlot: props.renderFactorySlot && ((slot, owner, ...args) =>
+            synthetic(owner?.target?.value?.workspaceId) ? null : props.renderFactorySlot(slot, owner, ...args)),
+          renameWorkspace: (id, ...args) => { if (!synthetic(id)) return props.renameWorkspace?.(id, ...args) },
+          deleteWorkspace: (id, ...args) => { if (!synthetic(id)) return props.deleteWorkspace?.(id, ...args) },
+          insertWorkspaceBefore: (id, ...args) => { if (!synthetic(id)) return props.insertWorkspaceBefore?.(id, ...args) },
+          t: (key, params) => key === 'section.workspaces' || key === 'section.sessions' ? 'Octo' : props.t?.(key, params) ?? t(key) }
         if (props.searchSessions) native.searchSessions = async (...args) => {
           const result = await props.searchSessions(...args)
-          return { ...result, items: result.items.filter(row => ids.has(row.id)) }
+          return { ...result, items: result.items.filter(row => visibleIds.has(row.id)) }
         }
-        return h(official, native)
+        return h(React.Fragment, null, data.accounts?.length > 1 && h('label', { className: 'dsho-bot-filter' },
+          'Bot', h('select', { value: account, onChange: event => setAccount(event.target.value) },
+            h('option', { value: '' }, t('all')), ...data.accounts.map(bot => h('option', { key: bot.id, value: bot.id }, bot.label)))),
+          h(official, native))
+      }
+
+      function StandaloneSidebar({ official, props, registry }) {
+        const t = useT()
+        const tabs = useSyncExternalStore(registry.subscribe, registry.getTabs)
+        const revision = useSyncExternalStore(registry.subscribe, registry.getRevision)
+        const [tab, setTab] = useState('tasks')
+        const allowed = id => registry.sessionFilters.every(fn => fn(id))
+        const taskUseSessions = useMemo(() => {
+          const cache = new WeakMap()
+          return (select, equal) => props.useSessions(raw => {
+            if (!cache.has(raw)) cache.set(raw, nativeMembers(raw, new Set(raw.ids.filter(allowed))))
+            return select(cache.get(raw))
+          }, equal)
+        }, [props.useSessions, revision])
+        useEffect(() => {
+          const select = id => setTab(id)
+          ownTabSwitch = select
+          return () => { if (ownTabSwitch === select) ownTabSwitch = undefined }
+        }, [])
+        const active = tabs.find(item => item.id === tab)
+        const taskProps = { ...props, useSessions: taskUseSessions,
+          ...(props.searchSessions && { searchSessions: async (...args) => {
+            const result = await props.searchSessions(...args)
+            return { ...result, items: result.items.filter(row => allowed(row.id)) }
+          } }),
+        }
+        const items = [{ value: 'tasks', label: t('tasks'), id: 'dsho-tab-tasks' },
+          ...tabs.map(item => ({ value: item.id, label: item.label, id: 'dsho-tab-' + item.id }))]
+        return h(React.Fragment, null,
+          props.wide !== false && h(SegmentedTabs, { className: 'dsho-native-tabs', label: t('railNav'),
+            value: active?.id ?? 'tasks', items, onChange: setTab }),
+          active && props.wide !== false ? active.render(props) : h(official, taskProps))
       }
 
       function NativeState({ sessionId }) {
@@ -644,8 +791,8 @@ window.__ModuleLoader__.load({
         stylesheet.textContent = style
         document.head.appendChild(stylesheet)
         const controller = new AbortController()
-        let timer, flight, registry, remove, removeFilter, bridge, matchIds = new Set(), rowKey = '', sourceRows = []
-        const sourceListeners = new Set()
+        let timer, flight, registry, remove, removeFilter, matchIds = new Set()
+        let hostEntry, hostInject, projectedInject, standalone, original
         const getIds = () => matchIds
         let sessionRefresh
         const refreshNativeIndex = () => {
@@ -653,73 +800,84 @@ window.__ModuleLoader__.load({
           sessionRefresh = Promise.resolve().then(() => ctx.sessions.refresh?.())
             .catch(() => {}).finally(() => { sessionRefresh = undefined })
         }
-        const rebuild = () => {
-          const localeLabel = tFor(locale())
-          const accountCount = snapshot.accounts?.length ?? 0
-          const rows = (snapshot.sessionRoutes ?? snapshot.conversations ?? []).map(row => {
-            const path = []
-            if (accountCount > 1) path.push({ key: 'bot:' + row.accountId, label: row.accountLabel || 'Bot' })
-            if (row.type === 1) path.push({ key: 'dm', label: localeLabel('dm') })
-            else {
-              path.push({ key: 'groups', label: localeLabel('group') })
-              if (row.group) {
-                path.push({ key: 'group:' + row.group, label: row.groupName || localeLabel('group') + ' ' + shortId(row.group) })
-                path.push(row.type === 5
-                  ? { key: 'topic:' + row.address, label: row.name || localeLabel('topic') + ' ' + shortId(row.address) }
-                  : { key: 'main', label: localeLabel('mainArea') })
-              } else path.push({ key: 'unknown', label: localeLabel('ungroupedTopics') })
-            }
-            return { id: row.id, path }
-          })
-          const key = JSON.stringify(rows)
-          if (key === rowKey) return
-          rowKey = key
-          sourceRows = rows
-          const next = new Set(rows.map(row => row.id))
-          const changed = matchIds.size !== next.size || [...next].some(id => !matchIds.has(id))
-          if (changed) {
-            const hasNew = [...next].some(id => !matchIds.has(id))
-            matchIds = next
-            applyFilter()
-            if (hasNew) refreshNativeIndex()
-          }
-          for (const fn of sourceListeners) fn()
-        }
-        const source = { id: 'octo', label: 'Octo', getSnapshot: () => sourceRows,
-          subscribe(fn) { sourceListeners.add(fn); return () => sourceListeners.delete(fn) },
-          openSettings: () => openOctoSettings() }
         const applyFilter = () => {
           removeFilter?.()
           removeFilter = hasNativeTab && matchIds.size ? registry?.addSessionFilter?.(id => !matchIds.has(id)) : undefined
         }
+        const rebuild = () => {
+          const next = new Set((snapshot.sessionRoutes ?? snapshot.conversations ?? []).map(row => row.id))
+          if (matchIds.size === next.size && [...next].every(id => matchIds.has(id))) return
+          const hasNew = [...next].some(id => !matchIds.has(id))
+          matchIds = next
+          applyFilter()
+          if (hasNew) refreshNativeIndex()
+        }
+        const restoreEntry = () => {
+          if (!hostEntry) return
+          if (projectedInject && hostEntry.inject === projectedInject) hostEntry.inject = hostInject
+          if (standalone && hostEntry.component === standalone) hostEntry.component = original
+          hostEntry = hostInject = projectedInject = standalone = original = undefined
+        }
+        const projectWorkspaceProps = (entry) => {
+          if (typeof entry.inject !== 'function') return
+          const inject = hostInject = entry.inject
+          projectedInject = function (...args) {
+            const props = inject.apply(this, args)
+            if (!props?.useWorkspaces) return props
+            const useRaw = props.useWorkspaces
+            return { ...props, octoUseWorkspaces: useRaw,
+              useWorkspaces(select, equal) {
+                const ids = useSyncExternalStore(subscribe, getIds)
+                const cache = useMemo(() => new WeakMap(), [ids])
+                return useRaw(raw => {
+                  if (!cache.has(raw)) cache.set(raw, taskWorkspaceProjection(raw, ids))
+                  return select(cache.get(raw))
+                }, equal)
+              } }
+          }
+          entry.inject = projectedInject
+        }
         const sync = () => {
           const readSlots = ctx.slots.entriesOfSlot ?? ctx.slots.entries
-          const next = readSlots?.call(ctx.slots, 'sidebar.workspaces')
-            ?.find(entry => entry?.component?.__dshNativeTabs?.version === 1)?.component?.__dshNativeTabs
-          const nextBridge = next?.channelSources
-          if (next === registry && nextBridge === bridge) return
-          removeFilter?.()
-          remove?.()
-          registry = next
-          bridge = nextBridge
-          const merged = bridge?.version === 1 && bridge.register?.(source)
-          remove = typeof merged === 'function' ? merged : registry?.insert?.({
-            id: 'octo', label: 'Octo', order: 25,
-            matchSession: id => matchIds.has(id),
-            render: props => h(NativeOcto, { props, official: registry?.officialTree, getIds }),
-          })
+          const entry = readSlots?.call(ctx.slots, 'sidebar.workspaces')?.find(row => typeof row?.component === 'function')
+          const current = entry?.component
+          const offered = current?.__dshNativeTabs
+          const foreign = typeof offered?.insert === 'function' && typeof offered.officialTree === 'function'
+          if (entry === hostEntry && ((standalone && current === standalone) || (!standalone && offered === registry))) return
+          removeFilter?.(); remove?.()
+          removeFilter = remove = registry = undefined
+          restoreEntry()
+          if (entry) {
+            hostEntry = entry
+            if (foreign) registry = offered
+            else if (entry.locale === 'workspace' || /workspace.browser|ui-workspace/i.test(entry.registrant ?? '')
+              || entry.component.name === 'WorkspaceBrowser') {
+              original = entry.component
+              const own = nativeTabRegistry(original)
+              const base = original
+              standalone = props => h(StandaloneSidebar, { official: base, props, registry: own })
+              Object.assign(standalone, { __dshNativeTabs: own, __dshNativeTabHost: true, __dshNativeTabWrapped: true })
+              entry.component = standalone
+              registry = own
+              queueMicrotask(() => window.dispatchEvent(new Event('dsh-native-sidebar-change')))
+            }
+            if (registry) projectWorkspaceProps(entry)
+          }
+          const official = registry?.officialTree
+          remove = registry?.insert({ id: 'octo', label: 'Octo', order: 25,
+            matchSession: id => matchIds.has(id), render: props => h(NativeOcto, { props, official, getIds }) })
           hasNativeTab = typeof remove === 'function'
-          showChannel = typeof merged === 'function' ? () => bridge.open?.() === true : () => {
+          showChannel = () => {
+            if (ownTabSwitch) { ownTabSwitch('octo'); return true }
             const tab = document.getElementById('ima-tab-octo') ?? document.getElementById('dcu-tab-octo')
+              ?? [...document.querySelectorAll('[role=tab]')].find(el => el.textContent.trim() === 'Octo')
             if (!tab || tab.getAttribute('role') !== 'tab') return false
-            tab.click()
-            return true
+            tab.click(); return true
           }
           applyFilter()
           notify()
         }
         const unsubscribe = subscribe(rebuild)
-        const unsubscribeLocale = subscribeLocale(rebuild)
         rebuild()
         const poll = () => {
           if (flight || controller.signal.aborted) return flight
@@ -757,8 +915,8 @@ window.__ModuleLoader__.load({
         document.addEventListener('visibilitychange', poll)
         void poll()
         return () => {
-          controller.abort(); clearTimeout(timer); clearInterval(interval); unsubscribe(); unsubscribeLocale(); unsubscribeSlots?.()
-          removeFilter?.(); remove?.(); stylesheet.remove()
+          controller.abort(); clearTimeout(timer); clearInterval(interval); unsubscribe(); unsubscribeSlots?.()
+          removeFilter?.(); remove?.(); restoreEntry(); stylesheet.remove()
           window.removeEventListener('dsh-native-sidebar-change', sync)
           document.removeEventListener('visibilitychange', poll)
           refresh = () => {}; showChannel = () => false; hasNativeTab = false; publish({})

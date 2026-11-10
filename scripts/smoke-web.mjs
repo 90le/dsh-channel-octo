@@ -161,6 +161,7 @@ async function assertAppBotSmoke(child, output, deadline) {
   console.log('PASS: group/topic inputs rejected; unavailable group/search/proactive/voice tools absent; fake local APIs only.')
 }
 let child, browser
+const sidebarComplete = Symbol('sidebar smoke passed')
 try {
   if (!['0.2.1-rc.5', '0.2.2-rc.1'].includes(node([cli, '--version']).trim())) throw new Error('Expected a supported DSH host')
   const packed = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
@@ -335,9 +336,7 @@ export function apply(ctx) {
     })
     await page.addInitScript(() => { Object.defineProperty(window, 'isSecureContext', { value: false }) })
     await page.goto(launch)
-    const native = imSourcePackage
-      ? page.getByRole('tab', { name: /^(频道|Channels)$/ })
-      : page.getByRole('tab', { name: 'Octo', exact: true })
+    const native = page.getByRole('tab', { name: 'Octo', exact: true })
     const fallback = page.locator('[data-octo-shortcut]')
     const shortcut = native.or(fallback).first()
     try { await shortcut.waitFor({ timeout: 15000 }) } catch (error) {
@@ -410,17 +409,26 @@ export function apply(ctx) {
     }
     if (nativeList) {
       const sidebar = page.locator('[data-row-key^=\"workspace:\"]').filter({ hasText: 'Octo' }).first()
-      if (imSourcePackage) {
-        await sidebar.waitFor({ timeout: 8000 })
-        if (await page.getByRole('tab', { name: 'Octo', exact: true }).count()) throw Error('Unexpected independent Octo tab')
+      if (process.env.DSH_OCTO_SMOKE_SIDEBAR_ONLY === '1') {
+        await page.getByRole('treeitem').filter({ hasText: '私聊' }).first().waitFor({ timeout: 8000 })
+        await page.getByRole('button', { name: /添加工作区|Add workspace/ }).first().waitFor({ timeout: 8000 })
         await page.getByRole('tab', { name: /^(任务|Tasks)$/ }).click()
         if (await nativeRow.count()) throw Error('Octo session leaked into Tasks')
+        if (includeImConnect) {
+          await page.getByRole('tab', { name: /^(频道|Channels)$/ }).click()
+          if (await nativeRow.count()) throw Error('Octo session leaked into other IM channels')
+        }
         await native.click()
       }
       await channel.click({ button: 'right' })
       await page.getByRole('menuitem', { name: /重命名|Rename/ }).first().waitFor({ timeout: 7000 })
       await page.keyboard.press('Escape')
       console.log('PASS: Octo uses the native sidebar session row and context menu.')
+      if (process.env.DSH_OCTO_SMOKE_SIDEBAR_ONLY === '1') {
+        console.log('PASS: native add workspace, route grouping, Tasks exclusion and independent Octo tab.')
+        process.exitCode = 0
+        throw sidebarComplete
+      }
     } else {
     const search = page.getByRole('searchbox', { name: '搜索会话', exact: true })
     await search.fill('this-does-not-match')
@@ -761,6 +769,8 @@ export function apply(ctx) {
     + (wire ? 'Octo friends/members with @ and no-@ over WebSocket' : 'explicit @ over HTTP events')
     + '; channel rules and isolated histories.')
   }
+} catch (error) {
+  if (error !== sidebarComplete) throw error
 } finally {
   await browser?.close()
   if (child && child.exitCode === null && child.signalCode === null) {

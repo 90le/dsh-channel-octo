@@ -4,9 +4,7 @@
 
 ## Octo 会话在哪里
 
-支持渠道注册接口的 IM Connect 会把 Octo 放在原生「频道」页。按频道视图中，私聊与群聊分开，群主区和子区归在各自的群下。工作区、原生会话 ID、归档与置顶不迁移；「任务」不重复列出已被频道接管的会话。已确认删除的会话不再出现在频道，归档仍可从原生归档视图恢复。
-
-当前兼容包基于 IM Connect 1.0.34，构建、验证和回退见[渠道接入说明](compat/im-connect/README.md)。其他版本仍可使用独立 Octo 入口。Bot 管理和消息规则仍在「设置 → Octo 渠道」。
+在侧栏打开「Octo」。它可以单独运行，也可以和 IM Connect 的「频道」页并存；无需安装、降级或锁定任何 IM Connect 版本。Octo 复用可用的 DSH 工作区菜单和会话操作，并按 Bot、私聊、群主区和子区分组。任务页仅隐藏完全由 Octo 会话占用的工作区，保留真实关联。Bot 管理和消息规则仍在「设置 → Octo 渠道」。
 
 ## 本地检查
 
@@ -23,7 +21,7 @@ npm pack --dry-run
 以 DSH `0.2.2-rc.1` 或 `0.2.1-rc.5` 为兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.25.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.25.1.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
