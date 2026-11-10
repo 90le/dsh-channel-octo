@@ -27,11 +27,12 @@ const terminalWaitBudget = 6000
 export function cardMode(profile) {
   const config = profile?.config
   if (![true, 1].includes(profile?.enabled) || config?.card_enabled !== true) return undefined
-  // Prefer a local, one-level disclosure when the server advertises every element.
+  // Prefer nested local disclosures when the server advertises every element.
+  // Column is structurally covered by ColumnSet; the official profile does not list it separately.
   // Registry-only installations retain their official template and local toggles.
   if (config.display_enabled === true && profile.card_version === '1.5'
     && profile.profiles?.includes('octo/v1') && profile.actions?.includes('Action.ToggleVisibility')
-    && ['TextBlock', 'Container'].every(type => profile.elements?.includes(type))) return 'compact'
+    && ['TextBlock', 'Container', 'ColumnSet', 'Image'].every(type => profile.elements?.includes(type))) return 'compact'
   const ref = config.reasoning_template_ref
   const templates = profile.templating?.templates
   if (config.reasoning_enabled === true && ref?.id === 'ai.reasoning-process'
@@ -94,6 +95,66 @@ function duration(seconds) {
     : minutes ? `${minutes} 分 ${rest} 秒` : `${rest} 秒`
 }
 
+const text = (value, extra = {}) => ({ type: 'TextBlock', text: value, size: 'Small', wrap: true, spacing: 'Small', ...extra })
+const column = (width, items) => ({ type: 'Column', width, spacing: 'Small', verticalContentAlignment: 'Center', items })
+const visibility = (elementId, isVisible) => ({ elementId, isVisible })
+const disclosureTargets = (id, expanded) => [
+  visibility(id + '_details', expanded), visibility(id + '_open', !expanded), visibility(id + '_close', expanded),
+]
+
+function chevrons(id, label, targets, double = false) {
+  return [false, true].map(expanded => {
+    const title = (expanded ? '收起' : '展开') + label
+    const path = double ? expanded ? 'm6 11 6-6 6 6m-12 8 6-6 6 6' : 'm6 5 6 6 6-6m-12 8 6 6 6-6'
+      : expanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="none" stroke="#a1a6ab" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${path}"/></svg>`
+    return { type: 'Image', id: id + (expanded ? '_close' : '_open'), isVisible: !expanded,
+      url: 'data:image/svg+xml,' + encodeURIComponent(svg), altText: title, size: 'Small', width: '14px', height: '14px', spacing: 'None',
+      selectAction: { type: 'Action.ToggleVisibility', title, targetElements: targets(!expanded) } }
+  })
+}
+
+function compactBody(status, summary, tone, phases, stats, note) {
+  // Semantic group IDs remain stable when the recent tools window or phase order changes.
+  const groups = phases.map(group => ({ ...group,
+    id: 'dsh_progress_' + (group.thought === '工具执行' ? 'tools' : group.thought === '文件交付' ? 'files' : 'session') }))
+  const outer = 'dsh_progress', all = 'dsh_progress_all'
+  const allTargets = expanded => [
+    ...[outer, ...groups.map(group => group.id)].flatMap(id => disclosureTargets(id, expanded)),
+    visibility(all + '_open', !expanded), visibility(all + '_close', expanded),
+  ]
+  return [{ type: 'Container', style: 'emphasis', bleed: true, spacing: 'None', items: [
+    { type: 'ColumnSet', spacing: 'None', columns: [
+      column('auto', [text('DSH 回复进度', { weight: 'Bolder', spacing: 'None' })]),
+      // Only these three outer targets change: child visibility survives an outer close/open in this frame.
+      column('auto', chevrons(outer, '详情', expanded => disclosureTargets(outer, expanded))),
+      column('stretch', []),
+      column('auto', chevrons(all, '全部详情', allTargets, true)),
+    ] },
+    text(status, { color: tone, spacing: 'None' }),
+    text(summary, { isSubtle: true }),
+    { type: 'Container', id: outer + '_details', isVisible: false, separator: true, spacing: 'Small', items: [
+      ...(stats.steps ? [text('已进入 ' + stats.steps + ' 个处理步骤', { isSubtle: true })] : []),
+      ...groups.map(group => ({ type: 'Container', spacing: 'Small', items: [
+        { type: 'ColumnSet', spacing: 'None', columns: [
+          column('stretch', [text(group.thought, { spacing: 'None' })]),
+          column('auto', chevrons(group.id, group.thought, expanded => disclosureTargets(group.id, expanded))),
+        ] },
+        { type: 'Container', id: group.id + '_details', isVisible: false, spacing: 'Small', items: [
+          ...(group.thought === '工具执行' && stats.calls > 4 ? [text('最近 4 次工具操作', { isSubtle: true })] : []),
+          ...group.actions.map((item, index) => ({ type: 'ColumnSet', spacing: index === 0 ? 'None' : 'Small', columns: [
+            { type: 'Column', width: '8px', items: [] },
+            column('auto', [text(item.statusGlyph, { color: item.statusTone, spacing: 'None' })]),
+            column('auto', [text(item.tool, { spacing: 'None' })]),
+            column('stretch', [text(item.detail, { isSubtle: true, spacing: 'None' })]),
+          ] })),
+        ] },
+      ] })),
+      ...(note ? [text(note, { color: stats.failed ? 'Warning' : tone })] : []),
+    ] },
+  ] }]
+}
+
 function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   const terminal = outcomes.includes(phase)
   const actual = !terminal && stats.approval ? 'approval' : !terminal && stats.waiting ? 'question'
@@ -117,29 +178,12 @@ function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   const current = actual === 'tool' && [...stats.recent.values()].reverse().find(row => row.status === 'active')
   const status = current ? '正在' + current.label : label
   if (mode === 'compact' || mode === 'display') {
-    const text = (value, extra = {}) => ({ type: 'TextBlock', text: value, size: 'Small', wrap: true, spacing: 'Small', ...extra })
-    const details = [
-      ...(stats.steps ? [text('已进入 ' + stats.steps + ' 个处理步骤', { isSubtle: true })] : []),
-      ...(stats.calls > 4 ? [text('最近 4 次工具操作', { isSubtle: true })] : []),
-      ...phases.flatMap(group => group.actions.map(item =>
-        text(item.statusGlyph + ' ' + item.tool + '：' + item.detail, { color: item.statusTone }))),
-      ...(note ? [text(note, { color: stats.failed ? 'Warning' : tone })] : []),
-    ]
-    const header = expanded => ({ type: 'Container', id: expanded ? 'dsh_progress_close' : 'dsh_progress_open',
-      isVisible: !expanded, spacing: 'None',
-      selectAction: { type: 'Action.ToggleVisibility', title: expanded ? '收起全部详情' : '展开全部详情', targetElements: [
-        { elementId: 'dsh_progress_details', isVisible: !expanded },
-        { elementId: 'dsh_progress_open', isVisible: expanded },
-        { elementId: 'dsh_progress_close', isVisible: !expanded },
-      ] },
-      items: [text('DSH 回复进度  ' + (expanded ? '▴' : '▾'), { weight: 'Bolder', spacing: 'None' })] })
     return { profile: 'octo/v1', card_version: '1.5', plain: status + ' · ' + summary + (note ? ' · ' + note : ''),
-      card: { type: 'AdaptiveCard', version: '1.5', body: [
-        ...(mode === 'compact' ? [header(false), header(true)] : [text('DSH 回复进度', { weight: 'Bolder' })]),
+      card: { type: 'AdaptiveCard', version: '1.5', body: mode === 'compact' ? compactBody(status, summary, tone, phases, stats, note) : [
+        text('DSH 回复进度', { weight: 'Bolder' }),
         text(status, { color: tone, spacing: 'None' }),
         text(summary, { isSubtle: true }),
-        ...(mode === 'compact' ? [{ type: 'Container', id: 'dsh_progress_details', isVisible: false,
-          separator: true, spacing: 'Small', items: details }] : note ? [text(note)] : []),
+        ...(note ? [text(note)] : []),
       ] } }
   }
   const expanded = false

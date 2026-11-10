@@ -2,6 +2,7 @@ import { createAccountEditor } from './account-editor.js'
 import { createWebhookView } from './webhook-view.js'
 
 const styles = `
+.dsho-account-success{color:var(--color-success,#217a53);font-size:13px;margin:0;line-height:1.5}
 .dsho-account-roster {
   container-type:inline-size; min-width:0; border:1px solid var(--dsho-edge); border-radius:12px;
   background:var(--dsw-alias-bg-layer-1,transparent); overflow:hidden;
@@ -113,6 +114,11 @@ dialog.dsho-account-modal[open] {
 `
 
 const caption = {
+  saved: ['保存成功', 'Saved successfully'],
+  credentials_not_ready: ['凭据服务尚未就绪，正在自动重试；不需要重新添加 Bot。', 'The credential service is not ready; recovery is automatic. Do not add this bot again.'],
+  invalid_bot_token: ['未找到有效令牌，请在账号连接中检查或更换。', 'A valid token was not found. Check or replace it in Account connection.'],
+  invalid_working_or_state_directory: ['工作区或状态目录不可用，请检查绑定目录。', 'The workspace or state directory is unavailable.'],
+  account_configuration_unavailable: ['账号暂时无法启动，请诊断连接或重新连接。', 'The account could not start. Diagnose or reconnect it.'],
   recentIssues: ['最近 24 小时的处理问题', 'Processing issues in the last 24 hours'],
   count: ['个账号', 'accounts'], one: ['个账号', 'account'], add: ['添加账号', 'Add account'],
   receive: ['接收消息', 'Receive messages'], receiveHint: ['关闭后保留账号配置，但不接收新消息。', 'Turning this off keeps the account settings and stops new messages.'],
@@ -317,7 +323,10 @@ export function createAccountView(React, primitives, { request, status, label })
                   return result
                 } })),
           options, allowCredentials, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
-          connectionStatus: account && status(account.enabled === false ? 'disabled' : account.status, lang),
+          connectionStatus: account && h(React.Fragment, null,
+            status(account.enabled === false ? 'disabled' : account.status, lang),
+            account.enabled && account.connectionIssue && h('p', { className: 'dsho-account-note', role: 'status' },
+              tr(account.connectionIssue) || tr('account_configuration_unavailable'))),
           onVerify: ({ token }) => perform('POST', '/accounts/verify', { token, accountId: account?.id }),
           onSave: fields => perform(account ? 'PUT' : 'POST', account ? endpoint(account.id) : '/accounts',
             { account: fields, revision: revision.current }, !account),
@@ -379,8 +388,9 @@ export function createAccountView(React, primitives, { request, status, label })
       setNotice('')
       try {
         publish(await send(endpoint(account.id) + suffix, 'PUT', { ...body, revision: data.accountRevision }))
+        setNotice({ text: tr('saved') })
       } catch (error) {
-        setNotice(tr(error?.message) || tr('failure'))
+        setNotice({ text: tr(error?.message) || tr('failure'), error: true })
         if (error?.message === 'account_changed') refresh()
       } finally {
         writing.current = false
@@ -414,13 +424,14 @@ export function createAccountView(React, primitives, { request, status, label })
             : status(account.enabled === false ? 'disabled' : account.status, lang),
           h('div', { className: 'dsho-account-receive', title: tr('receiveHint') },
             h('span', { className: 'dsho-muted dsho-account-receive-caption' }, tr('receive')),
-            h(Switch, { checked: account.enabled === true, disabled: !!busy || !account.config,
+            h(Switch, { checked: account.enabled === true, disabled: !!busy || !data.canManage,
               label: tr('receive') + ' · ' + (account.label || tr('unnamed')),
               onChange: enabled => mutate(account, '/state', { enabled }) })),
           h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!busy,
             onClick: () => { if (!writing.current) { choose(account.id); setModal({ id: account.id }) } },
             'aria-label': tr('edit') + ' · ' + (account.label || tr('unnamed')) }, tr('edit'))))),
-      notice && h('p', { className: 'dsho-alert dsho-account-list-note', role: 'alert' }, notice),
+      notice && h('p', { className: (notice.error ? 'dsho-alert' : 'dsho-account-success') + ' dsho-account-list-note',
+        role: notice.error ? 'alert' : 'status' }, !notice.error && '✓ ', notice.text),
       open && current?.inbox?.recoveringRoutes > 0 && h('p', { className: 'dsho-account-list-note', role: 'status' },
         tr(current.inbox.failedRoutes ? 'inboxUnavailable' : 'inboxRecovering')),
       open && current?.eventRecovery && (!current.eventRecovery.ready || current.eventRecovery.failed)
@@ -434,6 +445,6 @@ export function createAccountView(React, primitives, { request, status, label })
         h('ul', null, ...current.recentIssues.map(row => h('li', { key: row.issue },
           (label(row.issue, lang) || label('review', lang)) + ' · ' + row.total)))),
       modal && (!modal.id || selected) && h(Modal, { key: modal.id ?? 'new', account: selected, data, lang, tr, publish, refresh,
-        close: () => setModal(null), added: () => setExpanded(true) }))
+        close: () => setModal(null), added: () => { setExpanded(true); setNotice({ text: tr('saved') }) } }))
   }
 }

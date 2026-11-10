@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { setImmediate } from 'node:timers/promises'
 import { Accounts } from '../src/accounts.js'
 import { registerWeb } from '../src/web.js'
 import { createServer } from 'node:http'
@@ -396,7 +397,7 @@ test('account editor explains independent tool access, localizes efforts and imm
     assert.match(text, /私聊快捷命令/)
     assert.match(text, /群聊快捷命令/)
     assert.match(text, /不转发其他插件命令/)
-    assert.match(text, /选择包含群聊、子区的工具范围时/)
+    assert.match(text, /只读权限下也可开启/)
     assert.doesNotMatch(text, /仅允许插件命令|只有获准使用工具的私聊用户可以接收/)
     if (toolScope !== 'private') assert.doesNotMatch(text, /群聊和子区不开放工具/)
     const effort = elements.find(node => node?.type === 'select' && node.props.id === 'fixture-effort')
@@ -407,4 +408,74 @@ test('account editor explains independent tool access, localizes efforts and imm
     await Promise.resolve()
     assert.deepEqual(saved, [{ toolScope: next }])
   }
+})
+
+
+test('late credential readiness restores only the waiting Bot, preserving persisted conversations', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const root = mkdtempSync(join(tmpdir(), 'octo-late-vault-'))
+  const endpoint = 'https://octo.invalid/api', managedId = '12345678-1234-1234-1234-123456789abc'
+  const record = { id: managedId, botUid: 'managed', spaceId: 'space', label: 'Managed',
+    secretRef: 'DSH_OCTO_ACCOUNT_' + 'A'.repeat(32), cwd: root, transport: 'events', enabled: true }
+  const legacy = { ...record, id: 'legacy', botUid: 'legacy', secretRef: undefined }
+  const file = join(root, 'accounts.json'), original = JSON.stringify({ version: 1, endpoint, accounts: [legacy, record] })
+  writeFileSync(file, original, { mode: 0o600 })
+  const store = new Store(join(root, 'bots', managedId), JSON.stringify([endpoint, 'space', 'managed']))
+  const session = store.session('user'); store.sessionCreated('user'); store.close()
+  let provider, token, attempts = 0
+  const logs = [], started = []
+  const accounts = new Accounts({ get: name => name === 'credentials' ? provider : undefined,
+    logger: () => ({ info: value => logs.push(value), error: value => logs.push(value) }) },
+  { apiBase: endpoint, stateDir: root, cwd: root, senderPolicy: 'octo' }, { env: { DSH_OCTO_BOT_TOKEN: 'bf_env_fixture' } })
+  accounts.start = runtime => { runtime.status = 'online'; started.push(runtime.record.id) }
+  try {
+    await accounts.initialize()
+    const firstRuntime = accounts.runtimes.get('legacy')
+    assert.equal(accounts.publicAccount(record).status, 'waiting_credentials')
+    assert.equal(accounts.runtimes.size, 1)
+    provider = { resolve: async () => { attempts++; return token ? { value: token } : undefined } }
+    t.mock.timers.tick(3000); await setImmediate()
+    assert.equal(attempts, 1)
+    assert.equal(accounts.runtimes.size, 1)
+    token = 'bf_secret_fixture_must_not_log'
+    t.mock.timers.tick(6000); await setImmediate()
+    assert.deepEqual(started, ['legacy', managedId])
+    assert.equal(accounts.runtimes.get('legacy'), firstRuntime)
+    assert.equal(accounts.runtimes.get(managedId).store.session('user').session_id, session.session_id)
+    assert.equal(accounts.publicAccount(record).status, 'online')
+    assert.equal(accounts.publicAccount(record).connectionIssue, undefined)
+    assert.equal(readFileSync(file, 'utf8'), original)
+    t.mock.timers.tick(60_000); await setImmediate()
+    assert.equal(attempts, 2)
+    assert.doesNotMatch(logs.join(' '), /bf_secret_fixture|bf_env_fixture/)
+  } finally { await accounts.dispose(); rmSync(root, { recursive: true, force: true }) }
+})
+
+test('a missing runtime can reconnect or pause recovery; stopping the plugin cancels retries', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const root = mkdtempSync(join(tmpdir(), 'octo-recover-account-'))
+  const endpoint = 'https://octo.invalid/api', accountId = '12345678-1234-1234-1234-123456789abc'
+  const record = { id: accountId, botUid: 'managed', spaceId: 'space', label: 'Managed',
+    secretRef: 'DSH_OCTO_ACCOUNT_' + 'A'.repeat(32), cwd: root, transport: 'events', enabled: true }
+  writeFileSync(join(root, 'accounts.json'), JSON.stringify({ version: 1, endpoint, accounts: [record] }), { mode: 0o600 })
+  let token, attempts = 0
+  const accounts = new Accounts({ get: name => name === 'credentials' ? { resolve: async () => { attempts++; return { value: token } } } : undefined,
+    logger: () => ({ info() {}, error() {} }) }, { apiBase: endpoint, stateDir: root, cwd: root }, { env: {} })
+  accounts.start = runtime => { runtime.status = runtime.record.enabled ? 'online' : 'disabled' }
+  try {
+    await accounts.initialize()
+    await accounts.setEnabled(accountId, { revision: accounts.revision, enabled: false })
+    t.mock.timers.tick(60_000); await setImmediate()
+    assert.equal(attempts, 1)
+    assert.equal(accounts.publicAccount(accounts.record(accountId)).status, 'disabled')
+    await accounts.setEnabled(accountId, { revision: accounts.revision, enabled: true })
+    token = 'bf_recovery_fixture'
+    await accounts.reconnect(accountId, { revision: accounts.revision })
+    assert.equal(accounts.runtimes.size, 1)
+    assert.equal(accounts.publicAccount(accounts.record(accountId)).status, 'online')
+    await accounts.dispose()
+    const count = attempts
+    t.mock.timers.tick(60_000); await setImmediate()
+    assert.equal(attempts, count)
+  } finally { if (!accounts.lifetime.signal.aborted) await accounts.dispose(); rmSync(root, { recursive: true, force: true }) }
 })

@@ -248,7 +248,7 @@ function renderer() {
   const values = [], effects = []
   let index = 0
   const React = {
-    Fragment: 'fragment', useEffect(effect) { effects.push(effect) }, useId: () => 'fixture',
+    Fragment: 'fragment', useEffect(effect) { effects.push(effect) }, useMemo: factory => factory(), useId: () => 'fixture',
     useState(initial) {
       const key = index++
       if (!(key in values)) values[key] = typeof initial === 'function' ? initial() : initial
@@ -435,4 +435,31 @@ test('channel settings keep App response controls usable and omit hidden group s
     else assert.deepEqual(requests[0].settings, { progress: 'typing', timeoutMs: 6000, maxConcurrentTurns: 3, channelPolicy: 'allowlist',
       mentionPolicy: 'required', threadRuleMode: 'thread-only', allowedGroupIds: [], allowedThreadIds: [] })
   }
+})
+
+
+test('account saves visibly confirm unchanged and automatic saves, but never confirm a failed write', async () => {
+  const ui = renderer(), Editor = createAccountEditor(ui.React, { Button: 'button', Input: 'input' })
+  let saves = 0, reject = false
+  const props = { account: { ...userIdentity, id: 'legacy', cwd: process.cwd(), label: 'Fixture', toolScope: 'private' },
+    lang: 'zh', options: { workspaces: [{ path: process.cwd() }], policies: [{ id: 'text-only' }] },
+    onSave: async () => { saves++; if (reject) throw new Error('write_failed') } }
+  const settle = () => new Promise(resolve => setImmediate(resolve))
+  let tree = ui.render(Editor, props)
+  nodes(tree).find(node => node?.type === 'form').props.onSubmit({ preventDefault() {} })
+  await settle()
+  tree = ui.render(Editor, props)
+  assert.match(textOf(tree), /保存成功/)
+  assert.equal(saves, 0)
+  nodes(tree).find(node => node?.props?.id === 'fixture-tool-scope').props.onChange({ target: { value: 'owner' } })
+  await settle()
+  tree = ui.render(Editor, props)
+  assert.match(textOf(tree), /保存成功/)
+  assert.equal(saves, 1)
+  reject = true
+  nodes(tree).find(node => node?.props?.id === 'fixture-tool-scope').props.onChange({ target: { value: 'admitted' } })
+  await settle()
+  tree = ui.render(Editor, props)
+  assert.match(textOf(tree), /未能保存/)
+  assert.doesNotMatch(textOf(tree), /保存成功/)
 })

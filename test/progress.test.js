@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { setImmediate } from 'node:timers/promises'
 import { OctoClient, OctoError } from '../src/octo.js'
-import { Progress } from '../src/progress.js'
+import { cardMode, Progress } from '../src/progress.js'
 
 const job = { message_id: '123', sender: 'member', channel_id: 'thread', channel_type: 5 }
 const ref = { id: 'ai.reasoning-process', version: '0.4.1' }
@@ -17,6 +17,7 @@ const template = {
     { ...ref, views: [{ states: ['reasoning', 'answering', 'completed', 'stopped', 'error'] }] },
   ] },
 }
+const compact = { ...template, elements: ['TextBlock', 'Container', 'ColumnSet', 'Image'], actions: ['Action.ToggleVisibility'] }
 const labels = {
   queued: '已收到，等待 DSH 开始处理', running: 'DSH 正在处理', responding: '正在生成回复',
   completed: '回复已发送', error: '本次回复未完成，请先核对 DSH 执行状态', stopped: '回复发送待确认',
@@ -43,6 +44,55 @@ function fixture({ profile = () => template, create = () => '456', edit = () => 
   }
   return { calls, logs, progress: new Progress(api, log => logs.push(log)) }
 }
+
+function elements(card) {
+  const walk = rows => rows.flatMap(row => [row, ...walk(row.items ?? row.columns ?? [])])
+  return walk(card.body)
+}
+
+function localCard(card) {
+  const rows = elements(card), byId = new Map(rows.filter(row => row.id).map(row => [row.id, row]))
+  assert.equal(byId.size, rows.filter(row => row.id).length, 'IDs are unique within the frame')
+  for (const row of rows) {
+    assert.ok(row.type === 'Column' || compact.elements.includes(row.type))
+    if (row.isVisible !== undefined) assert.equal(typeof row.isVisible, 'boolean')
+    if (!row.selectAction) continue
+    assert.equal(row.selectAction.type, 'Action.ToggleVisibility')
+    assert.ok(row.selectAction.targetElements.length > 0)
+    for (const target of row.selectAction.targetElements) {
+      assert.equal(typeof target.isVisible, 'boolean', 'all target states are explicit')
+      assert.ok(byId.has(target.elementId), 'target exists: ' + target.elementId)
+    }
+  }
+  return {
+    byId,
+    click(id) {
+      assert.equal(byId.get(id).isVisible, true, 'control is locally visible: ' + id)
+      for (const target of byId.get(id).selectAction.targetElements) byId.get(target.elementId).isVisible = target.isVisible
+    },
+    expanded(id, expected) {
+      assert.equal(byId.get(id + '_details').isVisible, expected)
+      assert.equal(byId.get(id + '_open').isVisible, !expected)
+      assert.equal(byId.get(id + '_close').isVisible, expected)
+    },
+  }
+}
+
+test('nested compact mode requires every advertised capability and retains registry/display fallbacks', () => {
+  assert.equal(cardMode(compact), 'compact')
+  for (const element of compact.elements) {
+    const profile = { ...compact, elements: compact.elements.filter(type => type !== element) }
+    assert.deepEqual(cardMode(profile), ref, element)
+    assert.equal(cardMode({ ...profile, templating: undefined }), 'display', element)
+  }
+  assert.deepEqual(cardMode({ ...compact, actions: [] }), ref)
+  assert.deepEqual(cardMode({ ...compact, config: { ...compact.config, display_enabled: false } }), ref)
+  assert.equal(cardMode({ ...compact, config: { ...compact.config, card_enabled: false } }), undefined)
+  assert.equal(cardMode({ ...compact, enabled: 0 }), undefined)
+  assert.equal(cardMode({ ...display, profiles: [] }), undefined)
+  assert.equal(cardMode({ ...display, card_version: '1.4' }), undefined)
+  assert.equal(cardMode(display), 'display')
+})
 
 test('native approval has a distinct waiting label and cannot hide the final state', async t => {
   const tick = clock(t), f = fixture()
@@ -295,28 +345,34 @@ test('progress shows verified tools and delivered files without exposing tool in
 })
 
 
-test('compact progress is collapsed, expands every detail locally, and edits the same card', async t => {
+test('compact progress keeps three visible lines, resets each frame, and edits the same card', async t => {
   const tick = clock(t)
-  const profile = { ...template, elements: ['TextBlock', 'Container'], actions: ['Action.ToggleVisibility'] }
-  const f = fixture({ profile: () => profile })
+  const f = fixture({ profile: () => compact })
   const handle = f.progress.start(job, 'auto', new AbortController().signal)
   handle.stage('running')
   await tick(450)
   const initial = f.calls.at(-1).frame
   assert.equal(initial.template_ref, undefined)
   assert.doesNotMatch(initial.plain, /0 次工具|0 步/)
-  const body = initial.card.body
-  const details = body.find(row => row.id === 'dsh_progress_details')
-  assert.equal(details.isVisible, false)
+  const root = initial.card.body[0], body = root.items
+  assert.equal(root.type, 'Container')
+  assert.equal(root.style, 'emphasis')
+  assert.equal(root.bleed, true)
+  assert.equal(root.spacing, 'None')
+  assert.equal(body.filter(row => row.isVisible !== false).length, 3)
+  assert.equal(body[0].columns[0].items[0].text, 'DSH 回复进度')
+  assert.equal(body[1].text, labels.running)
+  assert.match(body[2].text, /^已用时 /)
+  assert.equal(body[0].selectAction, undefined, 'bulk control has no enclosing click handler')
+  assert.equal(body[0].columns.at(-1).items[0].id, 'dsh_progress_all_open')
+  assert.equal(body[0].columns.at(-1).items[0].width, '14px')
+  const local = localCard(initial.card)
+  local.expanded('dsh_progress', false)
+  local.expanded('dsh_progress_session', false)
   // Execute precisely the declared client-local actions without a Bot callback.
-  for (const [header, expanded] of [['dsh_progress_open', true], ['dsh_progress_close', false]]) {
-    const action = body.find(row => row.id === header).selectAction
-    assert.equal(action.type, 'Action.ToggleVisibility')
-    for (const target of action.targetElements) body.find(row => row.id === target.elementId).isVisible = target.isVisible
-    assert.equal(details.isVisible, expanded)
-    assert.equal(body.find(row => row.id === 'dsh_progress_open').isVisible, !expanded)
-    assert.equal(body.find(row => row.id === 'dsh_progress_close').isVisible, expanded)
-  }
+  local.click('dsh_progress_all_open')
+  local.expanded('dsh_progress', true)
+  local.expanded('dsh_progress_session', true)
   handle.trace({ kind: 'tool-start', id: 'read', name: 'read', arguments: 'private-data' })
   await tick(800)
   const editing = f.calls.at(-1)
@@ -324,15 +380,146 @@ test('compact progress is collapsed, expands every detail locally, and edits the
   assert.equal(editing.id, '456')
   assert.match(editing.frame.plain, /正在读取文件/)
   assert.match(JSON.stringify(editing.frame.card), /执行中/)
+  const edited = localCard(editing.frame.card)
+  edited.expanded('dsh_progress', false)
+  edited.expanded('dsh_progress_tools', false)
   handle.trace({ kind: 'tool-end', id: 'read' })
   handle.trace({ kind: 'file-sent' })
   await tick(3_600_000)
   await handle.finish('completed')
   const final = f.calls.at(-1).frame
   assert.match(final.plain, /回复已发送 · 已用时 1 小时 0 分 · 1 次工具 · 已发 1 个文件/)
-  assert.equal(final.card.body.find(row => row.id === 'dsh_progress_details').isVisible, false)
+  localCard(final.card).expanded('dsh_progress', false)
+  localCard(final.card).expanded('dsh_progress_files', false)
   assert.doesNotMatch(JSON.stringify(f.calls), /private-data/)
   assert.equal(f.calls.filter(row => row.type === 'create').length, 1)
+})
+
+test('outer and group arrows preserve siblings while bulk arrows set every disclosure explicitly', async t => {
+  const tick = clock(t), f = fixture({ profile: () => compact })
+  const handle = f.progress.start(job, 'auto', new AbortController().signal)
+  handle.trace({ kind: 'tool-start', id: 'private-call', name: 'read', arguments: 'private-args' })
+  handle.trace({ kind: 'file-sent' })
+  await tick(450)
+  const frame = f.calls.at(-1).frame, local = localCard(frame.card), count = f.calls.length
+  const outer = 'dsh_progress', tools = outer + '_tools', files = outer + '_files'
+  for (const id of [outer, tools, files]) local.expanded(id, false)
+  const details = local.byId.get('dsh_progress_details')
+  assert.match(JSON.stringify(details), /工具执行.*文件交付/)
+  local.click(outer + '_open')
+  local.expanded(tools, false)
+  local.expanded(files, false)
+  local.click(tools + '_open')
+  local.expanded(tools, true)
+  local.expanded(files, false)
+  const childState = JSON.stringify(details.items)
+  local.click(outer + '_close')
+  local.click(outer + '_open')
+  assert.equal(JSON.stringify(details.items), childState, 'outer actions do not touch children')
+  local.click(files + '_open')
+  local.click(tools + '_close')
+  local.expanded(files, true)
+  local.expanded(tools, false)
+  local.click(outer + '_all_open')
+  for (const id of [outer, tools, files]) local.expanded(id, true)
+  local.click(files + '_close')
+  local.click(outer + '_close')
+  local.click(outer + '_all_close')
+  for (const id of [outer, tools, files]) local.expanded(id, false)
+  local.click(outer + '_open')
+  for (const id of [tools, files]) local.expanded(id, false)
+  assert.equal(f.calls.length, count, 'local toggles never call the server')
+  assert.doesNotMatch(JSON.stringify(frame), /private-/)
+  await handle.finish('completed')
+})
+
+test('group IDs stay stable, tool history is bounded to four, and compact idle refresh remains 15 seconds', async t => {
+  const tick = clock(t), f = fixture({ profile: () => compact })
+  const handle = f.progress.start(job, 'auto', new AbortController().signal)
+  handle.trace({ kind: 'file-sent' })
+  await tick(450)
+  const fileIds = [...localCard(f.calls.at(-1).frame.card).byId.keys()].filter(id => id.includes('_files_'))
+  for (const [i, name] of ['read', 'write', 'shell', 'edit', 'present', 'private-tool'].entries()) {
+    handle.trace({ kind: 'tool-start', id: 'private-call-' + i, name, arguments: 'private-input' })
+    handle.trace({ kind: 'tool-end', id: 'private-call-' + i, failed: i === 5, result: 'private-result' })
+  }
+  handle.stage({ type: 'reasoning-delta', text: 'private-reasoning' })
+  await tick(800)
+  const frame = f.calls.at(-1).frame, local = localCard(frame.card)
+  assert.deepEqual([...local.byId.keys()].filter(id => id.includes('_files_')), fileIds)
+  const items = local.byId.get('dsh_progress_tools_details').items
+  assert.equal(items[0].text, '最近 4 次工具操作')
+  assert.equal(items.length, 5)
+  const columns = items.at(-1).columns
+  assert.deepEqual(columns.map(column => column.width), ['8px', 'auto', 'auto', 'stretch'])
+  assert.equal(columns[1].items[0].color, 'Attention')
+  assert.equal(columns[2].items[0].text, '调用工具')
+  assert.equal(columns[2].items[0].color, undefined)
+  assert.equal(columns[3].items[0].text, '未完成')
+  assert.equal(columns[3].items[0].isSubtle, true)
+  assert.equal(columns[3].items[0].color, undefined)
+  assert.doesNotMatch(JSON.stringify(items), /读取文件|写入文件/)
+  assert.doesNotMatch(JSON.stringify(f.calls), /private-/)
+  const ids = [...local.byId.keys()]
+  local.click('dsh_progress_all_open')
+  const count = f.calls.filter(c => c.type === 'edit').length
+  await tick(14_999)
+  assert.equal(f.calls.filter(c => c.type === 'edit').length, count)
+  await tick(1)
+  const refreshed = localCard(f.calls.at(-1).frame.card)
+  assert.equal(f.calls.filter(c => c.type === 'edit').length, count + 1)
+  assert.deepEqual([...refreshed.byId.keys()], ids)
+  for (const id of ['dsh_progress', 'dsh_progress_tools', 'dsh_progress_files']) refreshed.expanded(id, false)
+  await handle.finish('error')
+  assert.equal(f.calls.at(-1).frame.card.body[0].items[1].color, 'Attention')
+})
+
+// Optional upstream contract check: use an existing octo-web checkout without copying it into this repo.
+test('compact frames pass the official Octo InteractiveCard validator', {
+  skip: !process.env.OCTO_PROGRESS_VALIDATOR_DIR,
+}, async t => {
+  const { readFile } = await import('node:fs/promises')
+  const { resolve } = await import('node:path')
+  const { stripTypeScriptTypes } = await import('node:module')
+  const directory = process.env.OCTO_PROGRESS_VALIDATOR_DIR
+  const sourceModule = async (file, imports = {}) => {
+    let source = stripTypeScriptTypes(await readFile(resolve(directory, file), 'utf8'), { mode: 'transform' })
+    for (const [specifier, url] of Object.entries(imports)) source = source.replaceAll('"' + specifier + '"', '"' + url + '"')
+    return 'data:text/javascript;base64,' + Buffer.from(source).toString('base64')
+  }
+  const types = await sourceModule('types.ts')
+  const guards = await sourceModule('guards.ts', { './types': types })
+  const security = await sourceModule('../../Utils/security.ts')
+  const { validateCardForOcto } = await import(await sourceModule('validateCardForOcto.ts', {
+    './guards': guards, '../../Utils/security': security,
+  }))
+  const tick = clock(t)
+  for (const outcome of ['completed', 'stopped', 'error']) {
+    const f = fixture({ profile: () => compact })
+    const handle = f.progress.start(job, 'auto', new AbortController().signal)
+    await tick(450)
+    handle.trace({ kind: 'file-sent' })
+    await tick(800)
+    for (let i = 0; i < 8; i++) {
+      handle.trace({ kind: 'step' })
+      handle.trace({ kind: 'tool-start', id: 'tool-' + i, name: 'read' })
+      handle.trace({ kind: 'tool-end', id: 'tool-' + i, failed: i === 0 })
+    }
+    await tick(800)
+    handle.trace({ kind: 'question-open' })
+    await tick(800)
+    handle.stage('approval')
+    await tick(800)
+    await handle.finish(outcome)
+    for (const { frame } of f.calls.filter(call => call.frame)) {
+      assert.deepEqual(validateCardForOcto(frame.card), { ok: true })
+      const local = localCard(frame.card)
+      local.click('dsh_progress_all_open')
+      assert.deepEqual(validateCardForOcto(frame.card), { ok: true })
+      local.click('dsh_progress_all_close')
+      assert.deepEqual(validateCardForOcto(frame.card), { ok: true })
+    }
+  }
 })
 
 test('idle cards refresh less often, while questions and completion update promptly', async t => {

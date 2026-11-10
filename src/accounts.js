@@ -96,6 +96,7 @@ export class Accounts {
     this.records = new Map()
     this.assistants = new Map()
     this.runtimes = new Map()
+    this.openIssues = new Map()
     this.revision = id()
     this.lifetime = new AbortController()
     this.ops = Promise.resolve()
@@ -142,18 +143,10 @@ export class Accounts {
       this.status = this.records.size ? 'connecting' : 'disabled'
       for (const record of this.records.values()) {
         if (record.removed || this.lifetime.signal.aborted) continue
-        try {
-          const token = await this.tokenFor(record)
-          if (!this.lifetime.signal.aborted) {
-            const runtime = this.open(record, token)
-            this.runtimes.set(record.id, runtime)
-            this.start(runtime, true)
-          }
-        } catch {
-          this.log.error('state_open_failed: account settings or credentials unavailable')
-        }
+        await this.restoreAccount(record, true)
       }
       this.ready = true
+      this.scheduleRestore()
     } catch {
       this.ready = false
       this.status = 'configuration_or_state_error'
@@ -163,6 +156,7 @@ export class Accounts {
 
   async dispose() {
     this.lifetime.abort()
+    clearTimeout(this.restoreTimer)
     await this.ops.catch(() => {})
     await Promise.allSettled([...this.runtimes.values()].map(runtime => runtime.transition))
     await Promise.allSettled([...this.runtimes.values()].map(async runtime => {
@@ -171,6 +165,62 @@ export class Accounts {
     }))
     this.runtimes.clear()
     this.lease?.close()
+  }
+
+  // Credentials are optional for the legacy environment-backed account and can
+  // arrive after this plugin starts. A missing provider must not strand other Bots.
+  async restoreAccount(record, attachExisting = false) {
+    if (this.lifetime.signal.aborted || record.removed || this.runtimes.has(record.id)) return
+    let runtime
+    try {
+      let token
+      if (record.secretRef) {
+        try {
+          if (typeof this.vault?.resolve !== 'function') fail('credentials_not_ready')
+          token = await this.tokenFor(record)
+        } catch { fail('credentials_not_ready') }
+        if (!token) fail('credentials_not_ready')
+      } else token = await this.tokenFor(record)
+      if (this.lifetime.signal.aborted) return
+      runtime = this.open(record, token)
+      this.runtimes.set(record.id, runtime)
+      this.start(runtime, attachExisting)
+      this.openIssues.delete(record.id)
+      return runtime
+    } catch (error) {
+      if (runtime) { runtime.store.close(); this.runtimes.delete(record.id) }
+      // Never print provider errors, tokens, configuration values or filesystem paths.
+      const code = ['credentials_not_ready', 'invalid_bot_token', 'permission_unavailable',
+        'invalid_working_or_state_directory', 'invalid_settings', 'invalid_settings_file',
+        'state_directory_must_be_private', 'state_bound_to_another_bot', 'invalid_user_allowlist',
+        'invalid_access_policy', 'ambiguous_channel_policy'].includes(error?.message)
+        ? error.message : 'account_configuration_unavailable'
+      const previous = this.openIssues.get(record.id)
+      this.openIssues.set(record.id, code)
+      if (previous !== code) this.log.error('state_open_failed: account=' + record.id + ' reason=' + code)
+    }
+  }
+
+  scheduleRestore() {
+    clearTimeout(this.restoreTimer)
+    if (!this.ready || this.lifetime.signal.aborted || ![...this.openIssues].some(([id, issue]) =>
+      issue === 'credentials_not_ready' && this.records.get(id)?.enabled && !this.records.get(id)?.removed)) return
+    const delay = Math.min(30_000, 3000 * 2 ** Math.min(this.restoreAttempts ?? 0, 4))
+    this.restoreTimer = setTimeout(() => {
+      this.restoreAttempts = (this.restoreAttempts ?? 0) + 1
+      void this.restoreMissing().catch(() => {}).finally(() => this.scheduleRestore())
+    }, delay)
+    this.restoreTimer.unref?.()
+  }
+
+  restoreMissing() {
+    return this.locked(async () => {
+      for (const [accountId, issue] of this.openIssues) {
+        const record = this.records.get(accountId)
+        if (!record || record.removed || this.runtimes.has(accountId)) { this.openIssues.delete(accountId); continue }
+        if (record.enabled && issue === 'credentials_not_ready') await this.restoreAccount(record, true)
+      }
+    })
   }
 
   tokenFor(record) {
@@ -271,7 +321,7 @@ export class Accounts {
           if (justConnected) queueMicrotask(() => this.refreshNavigation())
         }
         else if (line.startsWith('octo_ws_retry_') || line.startsWith('octo_poll_')) runtime.status = 'reconnecting'
-        if (line !== 'octo_poll_ok') this.log.info(line)
+        if (line !== 'octo_poll_ok') this.log.info(line + ' account=' + record.id)
       },
     })
     runtime.stopped = (async () => {
@@ -286,7 +336,7 @@ export class Accounts {
     })().catch(error => {
       if (!signal.aborted) {
         runtime.status = 'worker_stopped'
-        this.log.error('worker_stopped: ' + (error instanceof OctoError ? error.code : 'internal_error'))
+        this.log.error('worker_stopped: ' + (error instanceof OctoError ? error.code : 'internal_error') + ' account=' + record.id)
       }
     })
   }
@@ -430,7 +480,9 @@ export class Accounts {
       permission: record.permission ?? textOnly, agentPreset: record.agentPreset ?? 'octo-text', idleMinutes: record.idleMinutes ?? 0,
       toolScope: record.toolScope ?? 'private',
       senderPolicy: config?.senderPolicy ?? record.senderPolicy ?? 'octo', allowedUids: config?.allowedUids ?? record.allowedUids ?? [],
-      status: runtime?.status ?? (record.enabled ? 'invalid_configuration' : 'disabled'),
+      status: runtime?.status ?? (record.enabled ? this.openIssues.get(record.id) === 'credentials_not_ready'
+        ? 'waiting_credentials' : 'invalid_configuration' : 'disabled'),
+      connectionIssue: runtime ? undefined : this.openIssues.get(record.id),
       ...normalizeImControls({ ...this.deployment, ...record }),
       config, revision: runtime?.settings.revision(), counts: overview?.counts ?? [], recentIssues: overview?.recentIssues ?? [], inbox: overview?.inbox,
       ...(eventRecovery && { eventRecovery: { ready: eventRecovery.ready, failed: eventRecovery.failed } }),
@@ -744,6 +796,7 @@ export class Accounts {
         }
       } else {
         this.runtimes.set(record.id, candidate)
+        this.openIssues.delete(record.id)
         this.start(candidate)
       }
       if (!active && changedToken && old?.secretRef) await this.vault?.unset?.(old.secretRef).catch(() => {})
@@ -775,13 +828,15 @@ export class Accounts {
       if (typeof input.enabled !== 'boolean') fail('invalid_account')
       const record = this.record(accountId)
       const runtime = this.runtimes.get(accountId)
-      if (!runtime) fail('channel_not_configured')
       if (record.enabled === input.enabled) return this.overview()
-      if (runtime.changing) fail('account_transition')
+      if (runtime?.changing) fail('account_transition')
       const next = { ...record, enabled: input.enabled }
       this.persist(next)
-      runtime.record = next
-      await this.changeConnection(runtime)
+      if (runtime) {
+        runtime.record = next
+        await this.changeConnection(runtime)
+      } else if (next.enabled) await this.restoreAccount(next)
+      this.scheduleRestore()
       return this.overview()
     })
   }
@@ -899,8 +954,12 @@ export class Accounts {
       this.checkRevision(input)
       const record = this.record(accountId)
       const runtime = this.runtimes.get(accountId)
-      if (!record.enabled || !runtime) fail('channel_not_configured')
-      await this.changeConnection(runtime)
+      if (!record.enabled) fail('channel_not_configured')
+      if (runtime) await this.changeConnection(runtime)
+      else {
+        await this.restoreAccount(record, true)
+        this.scheduleRestore()
+      }
       return this.overview()
     })
   }

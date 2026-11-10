@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
       loading: ['正在加载 Octo…', 'Loading Octo…'], retry: ['重新加载', 'Reload'],
       online: ['已连接', 'Connected'], connecting: ['正在连接', 'Connecting'],
       reconnecting: ['正在重连', 'Reconnecting'], disconnecting: ['正在停止接收', 'Stopping'], disabled: ['已暂停接收', 'Receiving paused'],
+      waiting_credentials: ['等待凭据就绪', 'Waiting for credentials'],
       invalid_configuration: ['连接配置有误', 'Invalid connection settings'],
       configuration_or_state_error: ['无法读取渠道设置', 'Channel settings are unavailable'],
       worker_stopped: ['连接已停止', 'Connection stopped'],
@@ -252,7 +253,7 @@ window.__ModuleLoader__.load({
     const tFor = locale => key => words[key]?.[locale === 'zh' || locale?.startsWith?.('zh-') ? 0 : 1] ?? ''
     const channelNames = { 1: 'dm', 2: 'group', 5: 'topic' }
     const connectionTone = {
-      online: 'good', connecting: 'busy', reconnecting: 'busy',
+      online: 'good', connecting: 'busy', reconnecting: 'busy', waiting_credentials: 'busy',
       worker_stopped: 'fault', invalid_configuration: 'fault', configuration_or_state_error: 'fault',
     }
     const jobTone = { sent: 'good', review: 'fault', running: 'busy', sending: 'busy' }

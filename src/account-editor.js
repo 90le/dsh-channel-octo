@@ -117,7 +117,7 @@ const copy = {
   enabled: ['启用此账号', 'Enable this account'],
   save: ['保存账号', 'Save account'],
   saving: ['正在保存…', 'Saving…'],
-  saved: ['已保存', 'Saved'],
+  saved: ['保存成功', 'Saved successfully'],
   saveEdits: ['保存设置', 'Save settings'],
   saveFailed: ['未能保存账号。请稍后重试。', 'Could not save the account. Try again.'],
   retry: ['重试保存', 'Retry save'],
@@ -126,7 +126,7 @@ const copy = {
   remove: ['移除账号', 'Remove account'],
   working: ['正在处理账号请求…', 'Working…'],
   diagnosed: ['Octo 已确认 Bot 身份，现有连接未被重启。', 'Octo verified the bot identity. The existing connection was not restarted.'],
-  reconnected: ['重连请求已完成。', 'Reconnect completed.'],
+  reconnected: ['已发起重连，请查看账号连接状态。', 'Reconnection requested. Check the account connection status.'],
   actionFailed: ['未能完成账号操作。请稍后重试。', 'Could not complete the account action. Try again.'],
   cancel: ['取消', 'Cancel'], close: ['关闭', 'Close'],
 }
@@ -321,7 +321,7 @@ export function createAccountEditor(React, { Button, Input }) {
         return
       }
       if (!withCredential && JSON.stringify(fields) === saved.current) {
-        setFeedback(current => current?.error ? null : current)
+        setFeedback({ text: tr('saved') })
         return
       }
       const request = start('save')
@@ -345,7 +345,7 @@ export function createAccountEditor(React, { Button, Input }) {
           next = queued.current
           queued.current = null
         }
-        setFeedback(current => current?.error ? current : { text: tr('saved') })
+        setFeedback({ text: tr('saved') })
       } catch (error) {
         queued.current = null
         if (pending.current === request) failure(error, 'saveFailed',
@@ -492,8 +492,9 @@ export function createAccountEditor(React, { Button, Input }) {
       .filter(([, handler]) => editing && typeof handler === 'function')
     const feedbackLine = h('div', { className: 'dsho-account-feedback' },
       busy && hint(busy === 'verify' ? 'verifying' : busy === 'save' ? 'saving' : 'working', { role: 'status' }),
-      feedback && feedback.area !== 'credentials' && h('p', { className: feedback.error ? 'dsho-alert' : 'dsho-account-note',
-        role: feedback.error ? 'alert' : 'status' }, feedback.text),
+      feedback && feedback.area !== 'credentials' && h('p', { className: feedback.error ? 'dsho-alert' : 'dsho-account-success',
+        role: feedback.error ? 'alert' : 'status', 'aria-live': 'polite' },
+        !feedback.error && h('span', { 'aria-hidden': true }, '✓ '), feedback.text),
       feedback?.retry && h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!busy,
         onClick: () => save(draft, uidText) }, tr('retry')))
     const pages = [['account', 'accountTab'], ['assistant', 'assistantTab'], ['messages', 'messagesTab'],
