@@ -18,6 +18,8 @@ import { directoryRecoveryEnabled } from './directory-discovery.js'
 
 const legacy = 'legacy'
 const textOnly = 'text-only'
+import { assistantId, assistantRuntime, assistantRuntimeKeys, assistantDocKeys, legacyAssistant, validAssistantDoc } from './assistants.js'
+
 const idPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 const refPattern = /^DSH_OCTO_ACCOUNT_[0-9A-F]{32}$/
 const inputKeys = new Set(['label', 'token', 'cwd', 'provider', 'model', 'reasoningEffort',
@@ -40,7 +42,7 @@ function privateDir(dir) {
 function savedRecords(path, endpoint) {
   try {
     const stat = lstatSync(path)
-    if (!stat.isFile() || stat.size > 64_000 || (process.getuid && (stat.uid !== process.getuid() || (stat.mode & 0o077)))) {
+    if (!stat.isFile() || stat.size > 3_000_000 || (process.getuid && (stat.uid !== process.getuid() || (stat.mode & 0o077)))) {
       fail('accounts_unavailable')
     }
     const saved = JSON.parse(readFileSync(path, 'utf8'))
@@ -60,9 +62,27 @@ function savedRecords(path, endpoint) {
       item.toolScope ??= 'private'
       ids.add(item.id); bots.add(bot)
     }
-    return saved.accounts
+    const profiles = new Map()
+    if (saved.assistants !== undefined && (!Array.isArray(saved.assistants) || saved.assistants.length > 64)) fail('accounts_unavailable')
+    for (const profile of saved.assistants ?? []) {
+      if ((!idPattern.test(profile?.id ?? '') && profile?.id !== legacy) || profiles.has(profile.id)
+        || !str(profile.name, 80) || !str(profile.cwd, 1024) || !isAbsolute(profile.cwd)
+        || assistantDocKeys.some(key => !validAssistantDoc(profile[key] ?? ''))
+        || assistantRuntimeKeys.filter(key => key !== 'cwd').some(key => profile[key] !== undefined && !str(profile[key]))
+        || (profile.toolScope !== undefined && !validToolScope(profile.toolScope))) fail('accounts_unavailable')
+      profiles.set(profile.id, { id: profile.id, name: profile.name, ...assistantRuntime(profile),
+        agentsMd: profile.agentsMd ?? '', soulMd: profile.soulMd ?? '' })
+    }
+    const bound = new Set()
+    for (const record of saved.accounts) {
+      const key = assistantId(record)
+      if ((!idPattern.test(key) && key !== legacy) || (!record.removed && bound.has(key))) fail('accounts_unavailable')
+      if (record.assistantId !== undefined && !profiles.has(key)) fail('accounts_unavailable')
+      if (!record.removed) bound.add(key)
+    }
+    return { accounts: saved.accounts, assistants: profiles }
   } catch (error) {
-    if (error?.code === 'ENOENT') return []
+    if (error?.code === 'ENOENT') return { accounts: [], assistants: new Map() }
     throw error
   }
 }
@@ -74,6 +94,7 @@ export class Accounts {
     Object.assign(this, { ctx, deployment, fetchImpl, env })
     this.log = ctx.logger('dsh-channel-octo')
     this.records = new Map()
+    this.assistants = new Map()
     this.runtimes = new Map()
     this.revision = id()
     this.lifetime = new AbortController()
@@ -98,7 +119,9 @@ export class Accounts {
       this.lease = new DatabaseSync(join(this.root, 'accounts-lease.sqlite'))
       this.lease.exec('BEGIN IMMEDIATE')
       this.file = join(this.root, 'accounts.json')
-      for (const record of savedRecords(this.file, this.endpoint)) this.records.set(record.id, record)
+      const saved = savedRecords(this.file, this.endpoint)
+      this.assistants = saved.assistants
+      for (const record of saved.accounts) this.records.set(record.id, record)
       const { botUid, spaceId, cwd, mentionPolicy } = this.deployment
       const botKind = this.deployment.botKind === undefined && this.env.DSH_OCTO_BOT_TOKEN?.startsWith('app_')
         ? 'app' : this.deployment.botKind
@@ -111,6 +134,10 @@ export class Accounts {
           ...(identity.botKind === 'app' && { botKind: 'app' }),
           transport: this.deployment.transport ?? (identity.botKind === 'app' || mentionPolicy === 'octo' ? 'websocket' : 'events'),
         })
+      }
+      for (const record of this.records.values()) {
+        const key = assistantId(record)
+        if (!record.removed && !this.assistants.has(key)) this.assistants.set(key, legacyAssistant(record))
       }
       this.status = this.records.size ? 'connecting' : 'disabled'
       for (const record of this.records.values()) {
@@ -189,12 +216,13 @@ export class Accounts {
 
   runtimeConfig(record, config) {
     const toolScope = record.toolScope ?? 'private'
-    if (record.id !== legacy || record.cwd !== this.deployment.cwd || record.provider || record.reasoningEffort
+    if (assistantId(record) !== record.id || record.id !== legacy || record.cwd !== this.deployment.cwd || record.provider || record.reasoningEffort
       || (record.permission && record.permission !== textOnly) || (record.agentPreset && record.agentPreset !== 'octo-text')
       || toolScope !== 'private') {
       config.sessionProfile = createHash('sha256').update(JSON.stringify([
         record.cwd, record.provider, record.model, record.reasoningEffort, record.permission, record.agentPreset,
         ...(toolScope === 'private' ? [] : [toolScope]),
+        ...(assistantId(record) !== record.id ? ['assistant', assistantId(record)] : []),
       ])).digest('hex').slice(0, 24)
     }
     else delete config.sessionProfile
@@ -232,12 +260,16 @@ export class Accounts {
     }
     const worker = runtime.worker = new Worker({
       api: new OctoClient({ ...config, fetchImpl: this.fetchImpl }), store,
-      host: new DshHost(this.ctx, config.cwd, config.timeoutMs, record),
+      host: this.hostFor(record, config),
       config, attach, isArchived: sessionId => this.ctx.get('workspaceRegistry')?.archivedSessionIds?.includes(sessionId),
       proposeWebhookChat: (message, requestSignal) => this.#proposeWebhookChat(runtime, worker, message, requestSignal),
       log: (line) => {
         if (runtime.changing) return
-        if (line === 'octo_ws_connected' || line === 'octo_poll_ok') runtime.status = 'online'
+        if (line === 'octo_ws_connected' || line === 'octo_poll_ok') {
+          const justConnected = runtime.status !== 'online'
+          runtime.status = 'online'
+          if (justConnected) queueMicrotask(() => this.refreshNavigation())
+        }
         else if (line.startsWith('octo_ws_retry_') || line.startsWith('octo_poll_')) runtime.status = 'reconnecting'
         if (line !== 'octo_poll_ok') this.log.info(line)
       },
@@ -340,6 +372,45 @@ export class Accounts {
     }
   }
 
+  refreshNavigation() {
+    if (this.lifetime.signal.aborted) return
+    const now = Date.now()
+    for (const runtime of this.runtimes.values()) {
+      const worker = runtime.worker, config = worker?.config
+      if (runtime.status !== 'online' || runtime.changing || !config || config.botKind === 'app'
+        || !runtime.controller || runtime.controller.signal.aborted
+        || typeof worker.api.refreshNavigation !== 'function'
+        || runtime.navigationFlight || (runtime.navigationNext ?? 0) > now) continue
+      const names = runtime.store.navigationNames()
+      runtime.navigationAttempts ??= new Map()
+      const candidates = []
+      for (const row of runtime.store.sessionRoutes()) {
+        if (!row.route.startsWith('[')) continue
+        let route
+        try { route = JSON.parse(row.route) } catch { continue }
+        if (!Array.isArray(route)) continue
+        const [type, address] = route
+        if (![2,5].includes(type) || !ruleScope(type, address)
+          || (config.channelPolicy === 'allowlist' && !(type === 2 ? config.groups : config.threads)?.has(address))) continue
+        const key = type + ':' + address
+        if ((runtime.navigationAttempts.get(key) ?? 0) > now) continue
+        candidates.push({ type, address, key })
+        if (!names.has(key)) break
+      }
+      const target = candidates.at(-1)
+      if (!target) { runtime.navigationNext = now + 15_000; continue }
+      runtime.navigationAttempts.set(target.key, now + 5 * 60_000)
+      for (const [key, until] of runtime.navigationAttempts) if (until <= now) runtime.navigationAttempts.delete(key)
+      runtime.navigationNext = now + 2500
+      const signal = AbortSignal.any([this.lifetime.signal, runtime.controller.signal, AbortSignal.timeout(8000)])
+      runtime.navigationFlight = worker.api.refreshNavigation(config, target.type, target.address, signal)
+        .then(rows => {
+          if (!signal.aborted && !runtime.changing && runtime.record.enabled && worker.config === config
+            && this.runtimes.get(runtime.record.id) === runtime) runtime.store.rememberNavigationNames(rows)
+        }).catch(() => {}).finally(() => { runtime.navigationFlight = undefined })
+    }
+  }
+
   publicAccount(record) {
     const runtime = this.runtimes.get(record.id)
     const overview = runtime?.store.overview()
@@ -352,6 +423,7 @@ export class Accounts {
       ? runtime.store.directoryRecovery?.() : undefined
     return {
       id: record.id, legacy: record.id === legacy, label: record.label, enabled: record.enabled,
+      assistantId: assistantId(record), assistantName: this.assistants.get(assistantId(record))?.name ?? record.label,
       botUid: record.botUid, spaceId: record.spaceId, cwd: record.cwd, transport: record.transport,
       ...(record.botKind === 'app' && { botKind: 'app' }),
       provider: record.provider ?? '', model: record.model ?? '', reasoningEffort: record.reasoningEffort ?? '',
@@ -375,7 +447,11 @@ export class Accounts {
     const accounts = rows.map(({ conversations, ...account }) => account)
     const selected = accounts[0]
     return {
-      accounts, accountRevision: this.revision, canManage: this.ready === true, credentialAvailable: this.ready && this.canStore,
+      accounts, assistants: [...this.assistants.values()].map(({ agentsMd, soulMd, ...assistant }) => ({
+        ...assistant, boundAccountId: accounts.find(account => account.assistantId === assistant.id)?.id,
+      })),
+      channelWorkspacePaths: [...new Set(accounts.map(account => account.cwd))],
+      accountRevision: this.revision, canManage: this.ready === true, credentialAvailable: this.ready && this.canStore,
       status: selected?.status ?? this.status, config: selected?.config ?? null, revision: selected?.revision,
       counts: selected?.counts ?? [], conversations: rows.flatMap(account => account.conversations).slice(0, 1000),
       sessionRoutes: rows.flatMap(account => {
@@ -504,17 +580,77 @@ export class Accounts {
     return record
   }
 
-  persist(record) {
+  persist(record, assistants = this.assistants) {
     const pending = this.file + '.' + id()
     const records = new Map(this.records)
-    records.set(record.id, record)
+    if (record) records.set(record.id, record)
     try {
-      writeFileSync(pending, JSON.stringify({ version: 1, endpoint: this.endpoint, accounts: [...records.values()] }, null, 2) + '\n',
+      writeFileSync(pending, JSON.stringify({ version: 1, endpoint: this.endpoint, accounts: [...records.values()], assistants: [...assistants.values()] }, null, 2) + '\n',
         { mode: 0o600, flag: 'wx', flush: true })
       renameSync(pending, this.file)
     } finally { try { unlinkSync(pending) } catch {} }
     this.records = records
+    this.assistants = assistants
     this.revision = id()
+  }
+
+  hostFor(record, config) {
+    const assistant = this.assistants.get(assistantId(record))
+    return new DshHost(this.ctx, config.cwd, config.timeoutMs, { ...record,
+      agentsMd: assistant?.agentsMd, soulMd: assistant?.soulMd })
+  }
+
+  assistantDetail(key) {
+    const profile = this.assistants.get(key)
+    if (!profile) fail('assistant_not_found')
+    const record = [...this.records.values()].find(item => !item.removed && assistantId(item) === key)
+    return { ...profile, boundAccountId: record?.id }
+  }
+
+  saveAssistant(key, input) {
+    return this.locked(async () => {
+      this.checkRevision(input)
+      const old = key ? this.assistantDetail(key) : undefined
+      const data = input?.assistant
+      if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data)
+        .some(name => !['name', ...assistantRuntimeKeys, ...assistantDocKeys].includes(name))
+        || !str(data.name, 80) || !data.name.trim() || (!old && this.assistants.size >= 64)) fail('invalid_assistant')
+      const docs = Object.fromEntries(assistantDocKeys.map(name => [name, data[name] ?? old?.[name] ?? '']))
+      if (Object.values(docs).some(value => !validAssistantDoc(value))) fail('invalid_assistant')
+      if (old?.boundAccountId && input.accountId && old.boundAccountId !== input.accountId) fail('assistant_bound')
+      const recordId = old?.boundAccountId ?? input.accountId
+      const record = recordId ? this.record(recordId) : undefined
+      const runtime = record && this.runtimes.get(record.id)
+      if (runtime?.changing) fail('account_transition')
+      const validationBase = old && { id: 'assistant', label: old.name, ...assistantRuntime(old) }
+      const fields = await this.editFields({ ...assistantRuntime(data), label: data.name }, validationBase)
+      const selected = assistantRuntime(fields)
+      // Virtual migration preserves absent legacy fields: an instructions-only
+      // save must not change a pre-existing session fingerprint.
+      if (old) for (const name of assistantRuntimeKeys) {
+        if (!Object.hasOwn(old, name) && selected[name] === ({ agentPreset: 'octo-text',
+          permission: textOnly, toolScope: 'private', provider: '', model: '', reasoningEffort: '' })[name]) delete selected[name]
+      }
+      const profile = { id: old?.id ?? id(), name: fields.label, ...selected, ...docs }
+      const next = record && { ...record, assistantId: profile.id }
+      if (next) for (const name of assistantRuntimeKeys) {
+        if (Object.hasOwn(profile, name)) next[name] = profile[name]
+        else delete next[name]
+      }
+      const profiles = new Map(this.assistants).set(profile.id, profile)
+      const candidate = runtime && this.settingsFor(next, await this.tokenFor(next))
+      if (next) this.privatePolicy(next)
+      this.persist(next, profiles)
+      if (runtime) {
+        runtime.record = next
+        runtime.settings = candidate
+        if (runtime.worker) {
+          const config = this.runtimeConfig(next, candidate.config)
+          runtime.worker.reconfigure(config, this.hostFor(next, config))
+        }
+      }
+      return { assistantId: profile.id, ...this.overview() }
+    })
   }
 
   async editFields(data, old) {
@@ -574,6 +710,11 @@ export class Accounts {
         ...(identity.botKind === 'app' && { botKind: 'app' }),
         transport: old?.transport ?? 'websocket',
       }
+      const selectedAssistant = assistantId(old ?? record)
+      record.assistantId = selectedAssistant
+      const profile = this.assistants.get(selectedAssistant) ?? legacyAssistant(record)
+      if (!this.assistants.has(selectedAssistant) && this.assistants.size >= 64) fail('invalid_assistant')
+      const profiles = new Map(this.assistants).set(selectedAssistant, { ...profile, ...assistantRuntime(record) })
       const active = this.runtimes.get(record.id)
       if (active?.changing) fail('account_transition')
       const rotate = !!active && (changedToken || active.record.enabled !== record.enabled)
@@ -581,7 +722,7 @@ export class Accounts {
       try {
         candidate = active ? this.settingsFor(record, token) : this.open(record, token)
         if (changedToken) await this.vault.set(newRef, token)
-        this.persist(record)
+        this.persist(record, profiles)
       } catch (error) {
         if (!active) candidate?.store.close()
         if (changedToken) await this.vault?.unset?.(newRef).catch(() => {})
@@ -592,7 +733,7 @@ export class Accounts {
         if (rotate) await this.changeConnection(active, { priorSecret: changedToken ? old?.secretRef : undefined })
         else if (active.worker) {
           const config = this.runtimeConfig(record, candidate.config)
-          active.worker.reconfigure(config, new DshHost(this.ctx, config.cwd, config.timeoutMs, record))
+          active.worker.reconfigure(config, this.hostFor(record, config))
         }
       } else {
         this.runtimes.set(record.id, candidate)
@@ -615,7 +756,7 @@ export class Accounts {
       runtime.settings.save(next, input?.revision)
       if (runtime.worker) {
         const config = this.runtimeConfig(record, runtime.settings.config)
-        runtime.worker.reconfigure(config, new DshHost(this.ctx, config.cwd, config.timeoutMs, record))
+        runtime.worker.reconfigure(config, this.hostFor(record, config))
       }
       return { config: channelView(runtime.settings.config), revision: runtime.settings.revision(), overview: this.overview() }
     })

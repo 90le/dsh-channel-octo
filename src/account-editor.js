@@ -21,6 +21,8 @@ const builtinEffort = {
 }
 const copy = {
   unnamed: ['Octo 账号', 'Octo account'],
+  assistant: ['绑定助理', 'Bound assistant'],
+  assistantHint: ['工作区、模型、预设和权限请在「助理」页编辑。', 'Use the Assistants tab to edit the workspace, model, preset and permissions.'],
   connection: ['连接与诊断', 'Connection and diagnostics'], messageBehavior: ['私聊准入与附件', 'DM admission and attachments'],
   advancedBehavior: ['高级消息行为', 'Advanced message behavior'],
   legacy: ['此账号来自服务器原有配置。', 'This account comes from the server configuration.'],
@@ -391,6 +393,9 @@ export function createAccountEditor(React, { Button, Input }) {
     }), editing && hint('labelHint')), true)
     const settings = h('div', { className: 'dsho-account-settings' },
       !editing && labelField,
+      account?.assistantId && h('div', { className: 'dsho-account-wide' },
+        h('strong', null, tr('assistant') + ' · ' + account.assistantName), hint('assistantHint')),
+      !account?.assistantId && h(React.Fragment, null,
       select('cwd', editing ? 'currentWorkspace' : 'workspace', workspaceItems, draft.cwd, cwd => update({ cwd }),
         workspaceItems.length ? 'pickWorkspace' : 'noWorkspaces'),
       select('preset', 'agentPreset', presetItems, draft.agentPreset, agentPreset => update({ agentPreset })),
@@ -408,7 +413,7 @@ export function createAccountEditor(React, { Button, Input }) {
       select('tool-scope', 'toolScope', toolItems, draft.toolScope, toolScope => update({ toolScope })),
       policies.some(item => item.disabled) && hint('policyDisabled', { className: 'dsho-account-note dsho-account-wide' }),
       hint(app ? 'appToolScopeHint' : 'toolScopeHint', { className: 'dsho-account-note dsho-account-wide' }),
-      hint(toolHint, { className: 'dsho-account-note dsho-account-wide' }),
+      hint(toolHint, { className: 'dsho-account-note dsho-account-wide' })),
       h('section', { className: 'dsho-account-settings dsho-account-wide', 'aria-label': tr('messageBehavior') },
       h('h4', { className: 'dsho-account-wide' }, tr('messageBehavior')),
       select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),

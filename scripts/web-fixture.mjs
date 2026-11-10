@@ -871,6 +871,14 @@ globalThis.fetch = async (input, init) => {
         { headers: { 'Content-Type': 'text/event-stream' } })
     }
     const systemText = typeof body.system === 'string' ? body.system : (body.system ?? []).map(c => c.text ?? '').join('\n')
+    if (round === 2 && process.env.DSH_OCTO_FIXTURE_ASSISTANT === '1') {
+      if (!systemText.includes('ASSISTANT-AGENTS-FIXTURE') || !systemText.includes('ASSISTANT-SOUL-FIXTURE')
+        || !history.includes('fixture response 1')) {
+        console.error('FIXTURE_ASSISTANT_SCOPE_FAIL')
+        return new Response(null, { status: 400 })
+      }
+      console.log('FIXTURE_ASSISTANT_SCOPE_OK')
+    }
     const snapshot = systemText.includes('Octo 当前会话规则快照') ? systemText : ''
     const rulesOk = history.includes('Octo 当前会话规则快照') ? false : round <= 2 || round === 6 ? !snapshot
       : round === 3 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && !snapshot.includes('THREAD-FIXTURE')

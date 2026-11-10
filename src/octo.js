@@ -295,6 +295,27 @@ export class OctoClient {
     return true
   }
 
+  async refreshNavigation(config, type, address, signal) {
+    if (config.botKind === 'app' || ![2, 5].includes(type)) return []
+    const scope = ruleScope(type, address)
+    if (!scope || (config.channelPolicy === 'allowlist'
+      && !(type === 2 ? config.groups : config.threads)?.has(address))) return []
+    const query = new URLSearchParams({ space_id: config.spaceId })
+    const groups = memberList(await this.#request('/v1/bot/groups?' + query, undefined, signal, { timeout: 3500 }), 'groups')
+    const group = groups.find(row => row?.group_no === scope.group && row.space_id === config.spaceId)
+    if (!group) return []
+    this.#rememberChannelName(2, scope.group, group.name)
+    if (type === 5) {
+      const root = '/v1/bot/groups/' + encodeURIComponent(scope.group) + '/threads/'
+      const detail = await this.#request(root + scope.thread, undefined, signal, { timeout: 3500 })
+      if (detail?.group_no === scope.group && detail?.short_id === scope.thread
+        && detail?.channel_id === address && detail?.channel_type === 5 && [1, 2].includes(detail.status)) {
+        this.#rememberChannelName(5, address, detail.name)
+      }
+    }
+    return this.navigationNames(type, address)
+  }
+
   async inboxDirectoryGroups(config, signal) {
     if (!directoryEligible(config, this.#token)) return []
     return this.#directoryGroups(config, signal)

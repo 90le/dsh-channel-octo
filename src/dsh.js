@@ -7,6 +7,7 @@ import { mountChannelTools } from './channel-tools.js'
 import { mountApprovalAdapter } from './approval.js'
 import { OCTO_STOP } from './im-controls.js'
 import { resolveOctoQuoteOrder } from './octo-quote.js'
+import { assistantInstructions } from './assistants.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
@@ -53,6 +54,7 @@ export class DshHost {
     const signal = AbortSignal.any([lifetime, deadline.signal])
     const permission = toolsAllowed && this.profile.permission !== 'text-only' ? this.profile.permission : null
     const authority = { active: false, mixed: false }
+    const personality = assistantInstructions(this.profile)
     const chosen = this.profile.agentPreset ?? 'octo-text'
     const preset = permission && chosen === 'octo-text' ? 'standard' : chosen
     const applyPermission = (agent) => {
@@ -129,16 +131,18 @@ export class DshHost {
           } finally { await claim?.return?.(); deadline.resume() }
         }, { prepend: true }))
       }
-      if (rules || extras.authorCard || extras.taskContext || history || extras.channelTools) {
+      if (rules || personality || extras.authorCard || extras.taskContext || history || extras.channelTools) {
         const prompt = scoped.get('systemPrompt')
-        if ((rules && (typeof prompt?.section !== 'function' || typeof scoped.on !== 'function'))
+        if (((rules || personality) && (typeof prompt?.section !== 'function' || typeof scoped.on !== 'function'))
           || ((extras.authorCard || extras.taskContext || history || extras.channelTools)
             && typeof prompt?.context !== 'function')) throw new Error('missing_scoped_rule_context')
         // The driver claims the complete step input before assembling its
         // system prompt. Do not apply Octo policy to a shared or Web turn.
-        if (rules) {
+        if (rules || personality) {
           const applies = () => authority.active && !authority.mixed && !signal.aborted
-          cleanup.push(prompt.section(ruleSection(rules, applies)))
+          if (rules) cleanup.push(prompt.section(ruleSection(rules, applies)))
+          if (personality) cleanup.push(prompt.section({ name: 'dsh-channel-octo.assistant', order: 10185,
+            interpolate: false, text: () => applies() ? personality : '' }))
           let previouslyApplied = false
           cleanup.push(scoped.on('agent/pre-step', async ({ step }, next) => {
             const decision = await next()
@@ -156,7 +160,7 @@ export class DshHost {
               // put these scoped rules in this turn's own input instead.
               updated.messages = decision.messages.flatMap(message => message.id === authority.requestId
                 ? [{ id: randomUUID(), role: 'user', source: { kind: 'octo-channel-rules', form: 'instructions' },
-                  content: [{ type: 'text', text: ruleContext(rules) + '\n\n【下条为本轮 Octo 消息】' }] }, message]
+                  content: [{ type: 'text', text: [personality, rules && ruleContext(rules), '【下条为本轮 Octo 消息】'].filter(Boolean).join('\n\n') }] }, message]
                 : [message])
             }
             return updated

@@ -6,6 +6,12 @@
 
 在侧栏打开「Octo」。它可以单独运行，也可以和 IM Connect 的「频道」页并存；无需安装、降级或锁定任何 IM Connect 版本。Octo 复用可用的 DSH 工作区菜单和会话操作，并按 Bot、私聊、群主区和子区分组。任务页仅隐藏完全由 Octo 会话占用的工作区，保留真实关联。Bot 管理和消息规则仍在「设置 → Octo 渠道」。
 
+## 多 Bot 助理
+
+在「设置 → Octo 渠道 → 助理」配置工作区、模型、Agent 预设、权限与工具范围。可先建立未绑定的助理，再绑定给 Bot；每个 Bot 同时只绑定一位助理。账号首次升级时自动沿用旧配置，助理在第一次保存时持久化；Bot、群主区、各子区及各私聊的会话绑定不迁移。切换助理或执行权限可能开启新会话，旧会话仍可查看。
+
+助理页的 AGENTS.md 和 SOUL.md 是插件管理的提示词文件，只注入对应助理的 Octo 回合，不覆盖项目目录的同名文件，也不赋予工具权限。
+
 ## 本地检查
 
 要求 Node.js 24 或 26。运行时使用 `ws` 连接 Octo，用 `mdast-util-from-markdown` 保留 Markdown 段落及识别正文提及。
@@ -21,7 +27,7 @@ npm pack --dry-run
 以 DSH `0.2.2-rc.1` 或 `0.2.1-rc.5` 为兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.25.1.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。

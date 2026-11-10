@@ -5,12 +5,13 @@ import { resolveConfig } from './config.js'
 import { webhookErrors } from './webhook-admin.js'
 
 const path = '/api/dsh-channel-octo'
+const assistantView = readFileSync(new URL('./assistant-view.js', import.meta.url), 'utf8')
 const editor = readFileSync(new URL('./account-editor.js', import.meta.url), 'utf8')
 const view = readFileSync(new URL('./account-view.js', import.meta.url), 'utf8')
 const webhookView = readFileSync(new URL('./webhook-view.js', import.meta.url), 'utf8')
 const webhookChatView = readFileSync(new URL('./webhook-chat-view.js', import.meta.url), 'utf8')
-const uiVersion = createHash('sha256').update(editor).update(view).update(webhookView).update(webhookChatView).digest('hex').slice(0, 16)
-const modules = new Map([[path + '/account-editor.js', editor],
+const uiVersion = createHash('sha256').update(assistantView).update(editor).update(view).update(webhookView).update(webhookChatView).digest('hex').slice(0, 16)
+const modules = new Map([[path + '/assistant-view.js', assistantView], [path + '/account-editor.js', editor],
   [path + '/webhook-chat-view.js', webhookChatView],
   [path + '/webhook-view.js', webhookView.replace('./webhook-chat-view.js', './webhook-chat-view.js?v=' + uiVersion)],
   [path + '/account-view.js', view.replace('./account-editor.js', './account-editor.js?v=' + uiVersion)
@@ -74,12 +75,12 @@ export function channelView(config) {
     allowedUids: [...allowed], allowedGroupIds: [...groups], allowedThreadIds: [...threads] }
 }
 
-async function body(req) {
+async function body(req, limit = 16_384) {
   let size = 0
   const chunks = []
   for await (const part of req.iterator({ destroyOnReturn: false })) {
     size += part.length
-    if (size > 16_384) { req.resume(); throw new Error('invalid_settings') }
+    if (size > limit) { req.resume(); throw new Error('invalid_settings') }
     chunks.push(part)
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
@@ -88,6 +89,7 @@ async function body(req) {
 const accountErrors = {
   ...webhookErrors,
   accounts_unavailable: 503, credential_provider_unavailable: 503,
+  assistant_not_found: 404, assistant_bound: 409, invalid_assistant: 400,
   account_not_found: 404, account_changed: 409, account_transition: 409, duplicate_bot: 409,
   invalid_account: 400, invalid_bot_token: 400, bot_identity_mismatch: 400, bot_verification_failed: 400,
   workspace_unavailable: 400, model_unavailable: 400, reasoning_unavailable: 400, permission_unavailable: 400,
@@ -111,6 +113,7 @@ export function registerWeb(ctx, accounts) {
       const target = new URL(req.url ?? '/', 'http://localhost').pathname
       if (req.method === 'GET' && target === path) {
         await accounts.reconcileSessions?.()
+        accounts.refreshNavigation?.()
         return send(200, { ...accounts.overview(), accountUiVersion: uiVersion })
       }
       if (req.method === 'GET' && modules.has(target)) {
@@ -119,11 +122,19 @@ export function registerWeb(ctx, accounts) {
         return res.end(modules.get(target))
       }
       if (req.method === 'GET' && target === path + '/account-options') return send(200, await accounts.options())
+      const assistant = /^\/api\/dsh-channel-octo\/assistants\/(legacy|[a-f0-9-]{36})$/.exec(target)
+      if (req.method === 'GET' && assistant) {
+        try { return send(200, accounts.assistantDetail(assistant[1])) }
+        catch { return send(404, { error: 'assistant_not_found' }) }
+      }
       if (!['POST', 'PUT'].includes(req.method)) return send(404, { error: 'not_found' })
       if (req.headers['x-dsh-octo-client'] !== '1' || ['cross-site', 'same-site'].includes(req.headers['sec-fetch-site'])
         || !/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) return send(403, { error: 'forbidden' })
       try {
-        const input = await body(req)
+        const creatingAssistant = req.method === 'POST' && target === path + '/assistants'
+        const editingAssistant = req.method === 'PUT' && assistant
+        const input = await body(req, creatingAssistant || editingAssistant ? 110_000 : undefined)
+        if (creatingAssistant || editingAssistant) return send(200, await accounts.saveAssistant(assistant?.[1], input))
         if (req.method === 'POST' && target === path + '/accounts/verify') {
           return send(200, await accounts.verify(input?.token))
         }

@@ -82,6 +82,24 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(accounts.record(secondId).toolScope, 'private')
     assert.notEqual(firstId, secondId)
     assert.equal(secrets.size, 2)
+    const initialStore = accounts.runtimes.get(secondId).store
+    const existing = initialStore.session('fixture-user')
+    initialStore.sessionCreated('fixture-user')
+    const unbound = await accounts.saveAssistant(null, { revision: accounts.revision, assistant: {
+      name: 'Independent assistant', cwd: root, agentPreset: 'standard', agentsMd: 'SECOND ONLY', soulMd: 'Calm',
+    } })
+    const aid = unbound.assistantId
+    assert.equal(unbound.assistants.find(item => item.id === aid).boundAccountId, undefined)
+    const profile = accounts.assistantDetail(aid)
+    const { id: _id, boundAccountId, ...assistant } = profile
+    await accounts.saveAssistant(aid, { revision: accounts.revision, accountId: secondId, assistant })
+    assert.equal(accounts.record(secondId).assistantId, aid)
+    assert.equal(accounts.runtimes.get(secondId).store, initialStore)
+    assert.ok(initialStore.knownSessions().includes(existing.session_id))
+    assert.equal(accounts.hostFor(accounts.record(firstId), { cwd: root }).profile.agentsMd, '')
+    assert.equal(accounts.hostFor(accounts.record(secondId), { cwd: root }).profile.agentsMd, 'SECOND ONLY')
+    assert.ok(!JSON.stringify(accounts.overview()).includes('SECOND ONLY'))
+    await assert.rejects(accounts.saveAssistant(aid, { revision: accounts.revision, accountId: firstId, assistant }), /assistant_bound/)
     const publicAndDisk = JSON.stringify(accounts.overview()) + readFileSync(join(root, 'accounts.json'), 'utf8')
     for (const secret of ['bf_first_fixture', 'bf_other_fixture', 'bf_rotated_fixture']) {
       assert.ok(!publicAndDisk.includes(secret))
@@ -96,6 +114,8 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(restored.senderPolicy, 'octo')
     assert.equal(restored.toolScope, 'admitted')
     assert.equal(accounts.overview().accounts.find(row => row.id === secondId).toolScope, 'private')
+    assert.equal(accounts.assistantDetail(aid).boundAccountId, secondId)
+    assert.ok(accounts.runtimes.get(secondId).store.knownSessions().includes(existing.session_id))
     assert.deepEqual(await accounts.diagnose(firstId), { botUid: 'bot-fixture', spaceId: 'fixture-space' })
     await accounts.remove(secondId, { revision: accounts.overview().accountRevision })
     assert.equal(accounts.overview().accounts.length, 1)

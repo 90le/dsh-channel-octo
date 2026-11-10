@@ -19,6 +19,7 @@ const state = join(home, 'octo-state')
 const npm = process.env.npm_execpath
 const wire = process.argv[3] !== 'events'
 const imSourcePackage = process.env.DSH_OCTO_SMOKE_IM_SOURCE
+const assistantSmoke = process.env.DSH_OCTO_SMOKE_ASSISTANTS === '1'
 const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
 const appBotSmoke = process.env.DSH_OCTO_SMOKE_APP_BOT === '1'
@@ -81,6 +82,7 @@ Object.assign(env, {
   DSH_OCTO_FIXTURE_STOP: stopSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_STATE: state,
   DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
+  DSH_OCTO_FIXTURE_ASSISTANT: assistantSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_AUTOMATION_SIDEBAR: automation && browserModule ? '1' : '0',
   // Synthetic fixtures exercise published code; no dependency build scripts.
   npm_config_ignore_scripts: 'true',
@@ -414,6 +416,8 @@ export function apply(ctx) {
         await page.getByRole('button', { name: /添加工作区|Add workspace/ }).first().waitFor({ timeout: 8000 })
         await page.getByRole('tab', { name: /^(任务|Tasks)$/ }).click()
         if (await nativeRow.count()) throw Error('Octo session leaked into Tasks')
+        if (assistantSmoke) await page.locator('[data-row-key^="workspace:"]').getByText('Octo', { exact: true })
+          .first().waitFor({ state: 'hidden', timeout: 6000 })
         if (includeImConnect) {
           await page.getByRole('tab', { name: /^(频道|Channels)$/ }).click()
           if (await nativeRow.count()) throw Error('Octo session leaked into other IM channels')
@@ -426,6 +430,30 @@ export function apply(ctx) {
       console.log('PASS: Octo uses the native sidebar session row and context menu.')
       if (process.env.DSH_OCTO_SMOKE_SIDEBAR_ONLY === '1') {
         console.log('PASS: native add workspace, route grouping, Tasks exclusion and independent Octo tab.')
+        if (assistantSmoke) {
+          const kind = page.getByLabel('会话类型', { exact: true })
+          await kind.selectOption('2')
+          await nativeRow.waitFor({ state: 'detached' })
+          await kind.selectOption('1')
+          await nativeRow.waitFor()
+          await page.keyboard.press('Control+Alt+,')
+          await page.getByRole('button', { name: 'Octo 渠道', exact: true }).click()
+          await page.getByRole('tab', { name: '助理', exact: true }).click()
+          await page.getByRole('button', { name: /编辑 · Octo Bot/ }).click()
+          await page.getByLabel('AGENTS.md', { exact: true }).fill('ASSISTANT-AGENTS-FIXTURE')
+          await page.getByLabel('SOUL.md', { exact: true }).fill('ASSISTANT-SOUL-FIXTURE')
+          await page.getByRole('button', { name: '保存助理', exact: true }).click()
+          await page.getByText('助理设置已保存，从后续消息起生效。').waitFor()
+          const settings = await (await page.request.get(new URL('/api/dsh-channel-octo/assistants/legacy', launch).href)).json()
+          if (settings.agentsMd !== 'ASSISTANT-AGENTS-FIXTURE' || settings.soulMd !== 'ASSISTANT-SOUL-FIXTURE') {
+            throw Error('Assistant files were not persisted by the UI')
+          }
+          writeFileSync(browserReady, sessionId)
+          const deadline = Date.now() + 28_000
+          while (Date.now() < deadline && !output.includes('FIXTURE_ASSISTANT_SCOPE_OK')) await delay(150)
+          if (!output.includes('FIXTURE_ASSISTANT_SCOPE_OK')) throw Error('Assistant prompt not verified: ' + output.slice(-1400))
+          console.log('PASS: assistant editor saves both documents; the next message resumes the original session with both.')
+        }
         process.exitCode = 0
         throw sidebarComplete
       }

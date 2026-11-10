@@ -711,6 +711,18 @@ export class Worker {
     }
     const route = { channel_id: recipient, channel_type: channelType }
     const names = this.api.navigationNames?.(channelType, recipient)
+    if (channelType !== 1 && typeof this.api.refreshNavigation === 'function') {
+      const key = channelType + ':' + recipient, now = Date.now()
+      this.nameRefreshes ??= new Map()
+      if ((this.nameRefreshes.get(key) ?? 0) <= now) {
+        if (this.nameRefreshes.size >= 512) this.nameRefreshes.delete(this.nameRefreshes.keys().next().value)
+        this.nameRefreshes.set(key, now + 5 * 60_000)
+        void this.api.refreshNavigation(sourceConfig, channelType, recipient,
+          AbortSignal.any([signal, AbortSignal.timeout(8000)])).then(rows => {
+          if (!signal.aborted && this.config === sourceConfig && !this.stopIntake) this.store.rememberNavigationNames(rows)
+        }).catch(() => {})
+      }
+    }
     if (names?.length) {
       try { this.store.rememberNavigationNames(names) } catch { this.log('channel_navigation_names_unavailable') }
     }

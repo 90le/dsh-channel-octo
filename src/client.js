@@ -11,6 +11,7 @@ window.__ModuleLoader__.load({
       settings: ['Octo 渠道', 'Octo channel'], shortcut: ['Octo 频道', 'Octo conversations'],
       subtitle: ['管理 Octo 机器人、消息规则和会话。', 'Manage your Octo bot, message rules and conversations.'],
       account: ['Bot 账号', 'Bot account'], rules: ['消息规则', 'Message rules'], sessions: ['频道会话', 'Conversations'],
+      conversationType: ['会话类型', 'Conversation type'], assistants: ['助理', 'Assistants'],
       railNav: ['侧栏', 'Sidebar'], tasks: ['任务', 'Tasks'], openChannel: ['打开频道', 'Open channel'], mainArea: ['主区', 'Main area'],
       ungroupedTopics: ['未归组子区', 'Ungrouped topics'], advanced: ['高级设置', 'Advanced settings'],
       copyOctoId: ['复制 Octo 会话 ID', 'Copy Octo conversation ID'], waiting: ['等待回答', 'Waiting for an answer'],
@@ -119,6 +120,7 @@ window.__ModuleLoader__.load({
 .dsho-root [hidden] { display:none!important; }
 .dsho-root [role="tabpanel"] { min-width:0; }
 .dsho-advanced > summary { cursor:pointer; font-weight:560; margin-block:8px; }
+[data-dsho-hidden-task-workspace] { display:none!important; }
 .dsho-native-tabs { margin:8px 12px; }
 .dsho-bot-filter { display:flex; align-items:center; gap:8px; margin:6px 12px; }
 .dsho-native-state { max-width:100px; color:var(--dsw-alias-label-secondary,currentColor); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -278,11 +280,29 @@ window.__ModuleLoader__.load({
           if (leaf) result.get(id).sessionIds.push(row.id)
         }
       }
-      return [...result.values()]
+      const folders = [...result.values()]
+      for (const main of result.values()) {
+        if (!main.path.endsWith('/main')) continue
+        const prefix = main.path.slice(0, -4) + 'topic%3A'
+        const before = folders.findIndex(folder => folder.path.startsWith(prefix))
+        const current = folders.indexOf(main)
+        if (before >= 0 && before < current) {
+          folders.splice(current, 1)
+          folders.splice(before, 0, main)
+        }
+      }
+      return folders
     }
-    function taskWorkspaceProjection(raw, octoIds) {
-      const items = raw.items.filter(workspace => !workspace.sessionIds.length
-        || !workspace.sessionIds.every(id => octoIds.has(id)))
+    const workspacePathKey = path => typeof path === 'string' ? path.replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, '') || '/' : ''
+    function taskWorkspaceProjection(raw, octoIds, channelPaths, catalog) {
+      const items = raw.items.filter(workspace => {
+        if (workspace.sessionIds.length && workspace.sessionIds.every(id => octoIds.has(id))) return false
+        const path = workspacePathKey(workspace.path)
+        if (!channelPaths.has(path) || catalog.phase !== 'ready') return true
+        const local = id => !octoIds.has(id) && catalog.byId[id] && !catalog.byId[id].blank
+        return workspace.sessionIds.some(local)
+          || catalog.ids.some(id => local(id) && workspacePathKey(catalog.byId[id].cwd) === path)
+      })
       return items.length === raw.items.length ? raw : { ...raw, items }
     }
     function nativeTabRegistry(officialTree) {
@@ -382,6 +402,7 @@ window.__ModuleLoader__.load({
         const pins = new Map((workspaces?.pinnedSessionIds ?? []).map((id, index) => [id, index]))
         const statusRows = new Map((data.conversations ?? []).map(row => [row.id, row]))
         const [filter, setFilter] = useState('all')
+        const [botFilter, setBotFilter] = useState('')
         const [query, setQuery] = useState('')
         const [opening, setOpening] = useState('')
         const [failed, setFailed] = useState(false)
@@ -395,7 +416,7 @@ window.__ModuleLoader__.load({
         })
         const term = query.trim().toLocaleLowerCase()
         const visible = entries.filter(({ row, title, kind }) =>
-          (filter === 'all' || String(row.type) === filter)
+          (!botFilter || row.accountId === botFilter) && (filter === 'all' || String(row.type) === filter)
           && (!term || [title, kind, row.address, row.accountLabel].some(value => String(value ?? '').toLocaleLowerCase().includes(term))))
         const tree = { branches: new Map(), entries: [] }
         for (const entry of visible) {
@@ -425,6 +446,8 @@ window.__ModuleLoader__.load({
           rail && h('div', { className: 'dsho-head' }, h('h3', null, 'Octo'), activeStatus(data, t)),
           data.error && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
           h('div', { className: 'dsho-tools' },
+            data.accounts?.length > 1 && h('label', null, 'Bot ', h('select', { value: botFilter, onChange: e => setBotFilter(e.target.value) },
+              h('option', { value: '' }, t('all')), ...data.accounts.map(bot => h('option', { key: bot.id, value: bot.id }, bot.label)))),
             h(Input, { className: 'dsho-search', type: 'search', value: query, 'aria-label': t('search'),
               placeholder: t('search'), onChange: e => setQuery(e.target.value) }),
             h('div', { className: 'dsho-filters', role: 'group', 'aria-label': t('filter') },
@@ -583,8 +606,10 @@ window.__ModuleLoader__.load({
         const data = useSyncExternalStore(subscribe, read)
         const sessions = useSyncExternalStore(subscribeSessions, sessionSnapshot)
         const [account, setAccount] = useState('')
-        const rows = (data.sessionRoutes ?? data.conversations ?? []).filter(row => !account || row.accountId === account)
-        const visibleIds = useMemo(() => account ? new Set(rows.map(row => row.id)) : ids, [data, account, ids])
+        const [kind, setKind] = useState('')
+        const rows = (data.sessionRoutes ?? data.conversations ?? []).filter(row =>
+          (!account || row.accountId === account) && (!kind || Number(kind) === row.type))
+        const visibleIds = useMemo(() => account || kind ? new Set(rows.map(row => row.id)) : ids, [data, account, kind, ids])
         const sessionCache = useMemo(() => new WeakMap(), [visibleIds])
         const [view, setView] = useState({ groupBy: 'workspace-tree', archivedFilter: 'default', orderBy: 'updated',
           groupExpansion: {}, sessionOrderByAccount: {} })
@@ -650,9 +675,12 @@ window.__ModuleLoader__.load({
           const result = await props.searchSessions(...args)
           return { ...result, items: result.items.filter(row => visibleIds.has(row.id)) }
         }
-        return h(React.Fragment, null, data.accounts?.length > 1 && h('label', { className: 'dsho-bot-filter' },
-          'Bot', h('select', { value: account, onChange: event => setAccount(event.target.value) },
-            h('option', { value: '' }, t('all')), ...data.accounts.map(bot => h('option', { key: bot.id, value: bot.id }, bot.label)))),
+        return h(React.Fragment, null, h('div', { className: 'dsho-bot-filter' },
+          data.accounts?.length > 1 && h('label', null, 'Bot ',
+            h('select', { 'aria-label': 'Bot', value: account, onChange: event => setAccount(event.target.value) },
+              h('option', { value: '' }, t('all')), ...data.accounts.map(bot => h('option', { key: bot.id, value: bot.id }, bot.label)))),
+          h('label', null, t('conversationType') + ' ', h('select', { 'aria-label': t('conversationType'), value: kind, onChange: event => setKind(event.target.value) },
+            h('option', { value: '' }, t('all')), ...[1,2,5].map(type => h('option', { key: type, value: type }, t(channelNames[type])))))),
           h(official, native))
       }
 
@@ -675,7 +703,18 @@ window.__ModuleLoader__.load({
           return () => { if (ownTabSwitch === select) ownTabSwitch = undefined }
         }, [])
         const active = tabs.find(item => item.id === tab)
+        const snapshot = useSyncExternalStore(subscribe, read)
+        const catalog = useSyncExternalStore(subscribeSessions, sessionSnapshot)
+        const taskPaths = useMemo(() => new Set((snapshot.channelWorkspacePaths ?? []).map(workspacePathKey)), [snapshot])
+        const workspaceCache = useMemo(() => new WeakMap(), [taskPaths, catalog, revision])
         const taskProps = { ...props, useSessions: taskUseSessions,
+          useWorkspaces: (select, equal) => props.useWorkspaces(raw => {
+            if (!workspaceCache.has(raw)) {
+              const ids = new Set((snapshot.sessionRoutes ?? snapshot.conversations ?? []).map(row => row.id))
+              workspaceCache.set(raw, taskWorkspaceProjection(raw, ids, taskPaths, catalog))
+            }
+            return select(workspaceCache.get(raw))
+          }, equal),
           ...(props.searchSessions && { searchSessions: async (...args) => {
             const result = await props.searchSessions(...args)
             return { ...result, items: result.items.filter(row => allowed(row.id)) }
@@ -715,6 +754,23 @@ window.__ModuleLoader__.load({
         } }, t('copyOctoId'))
       }
 
+      function Assistants({ data, t }) {
+        const [View, setView] = useState(null)
+        const [failed, setFailed] = useState(false)
+        useEffect(() => {
+          let stopped = false
+          const url = new URL(path + '/assistant-view.js', document.baseURI)
+          if (data.accountUiVersion) url.searchParams.set('v', data.accountUiVersion)
+          import(url.href).then(module => {
+            if (!stopped) setView(() => module.createAssistantView(React, primitives))
+          }).catch(() => { if (!stopped) setFailed(true) })
+          return () => { stopped = true }
+        }, [data.accountUiVersion])
+        if (failed) return h(ErrorNotice, { t, message: t('unavailable') })
+        return View ? h(View, { data, request: api, publish: replaceSnapshot, refresh,
+          lang: locale()?.startsWith('zh') ? 'zh' : 'en' }) : hint(t('loading'))
+      }
+
       function Settings({ close }) {
         const t = useT()
         const data = useSyncExternalStore(subscribe, read)
@@ -722,7 +778,7 @@ window.__ModuleLoader__.load({
         const [selected, setSelected] = useState('')
         const accounts = data.accounts ?? []
         const current = accounts.find(account => account.id === selected) ?? accounts[0]
-        const sections = ['account', 'rules']
+        const sections = ['account', 'assistants', 'rules']
         const panel = (key, content) => h('div', { id: 'dsho-panel-' + key, role: 'tabpanel',
           'aria-labelledby': 'dsho-tab-' + key, hidden: page !== key, key }, content)
         return h('div', { className: 'dsho-root', 'data-octo-settings': true },
@@ -735,6 +791,7 @@ window.__ModuleLoader__.load({
             items: sections.map(key => ({ value: key, label: t(key), id: 'dsho-tab-' + key, panelId: 'dsho-panel-' + key })) }),
           data.error && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
           panel('account', h(Account, { data, t, current, choose: setSelected })),
+          panel('assistants', page === 'assistants' && h(Assistants, { data, t })),
           panel('rules',
             h('div', { className: 'dsho-panel' },
               accounts.length > 1 && h('div', { className: 'dsho-field' },
@@ -792,7 +849,7 @@ window.__ModuleLoader__.load({
         document.head.appendChild(stylesheet)
         const controller = new AbortController()
         let timer, flight, registry, remove, removeFilter, matchIds = new Set()
-        let hostEntry, hostInject, projectedInject, standalone, original
+        let hostEntry, standalone, original
         const getIds = () => matchIds
         let sessionRefresh
         const refreshNativeIndex = () => {
@@ -813,30 +870,40 @@ window.__ModuleLoader__.load({
           if (hasNew) refreshNativeIndex()
         }
         const restoreEntry = () => {
-          if (!hostEntry) return
-          if (projectedInject && hostEntry.inject === projectedInject) hostEntry.inject = hostInject
-          if (standalone && hostEntry.component === standalone) hostEntry.component = original
-          hostEntry = hostInject = projectedInject = standalone = original = undefined
+          if (standalone && hostEntry?.component === standalone) hostEntry.component = original
+          hostEntry = standalone = original = undefined
         }
-        const projectWorkspaceProps = (entry) => {
-          if (typeof entry.inject !== 'function') return
-          const inject = hostInject = entry.inject
-          projectedInject = function (...args) {
-            const props = inject.apply(this, args)
-            if (!props?.useWorkspaces) return props
-            const useRaw = props.useWorkspaces
-            return { ...props, octoUseWorkspaces: useRaw,
-              useWorkspaces(select, equal) {
-                const ids = useSyncExternalStore(subscribe, getIds)
-                const cache = useMemo(() => new WeakMap(), [ids])
-                return useRaw(raw => {
-                  if (!cache.has(raw)) cache.set(raw, taskWorkspaceProjection(raw, ids))
-                  return select(cache.get(raw))
-                }, equal)
-              } }
+        // A foreign shell may pass the root workspace hook directly (not the
+        // entry injection). Keep its workspace source untouched and limit the
+        // visibility adjustment to its selected Tasks panel.
+        const workspaceList = ctx.get?.('workspaces')?.list ?? ctx.workspaces?.list
+        const hiddenMark = 'data-dsho-hidden-task-workspace'
+        let frame
+        const updateForeignTasks = () => {
+          frame = undefined
+          const selected = [...document.querySelectorAll('[role=tab][aria-selected=true]')]
+            .find(tab => /(?:^|-)tab-tasks$/.test(tab.id) || ['任务', 'Tasks'].includes(tab.textContent.trim()))
+          const raw = registry && !standalone && selected ? workspaceList?.getSnapshot?.() : null
+          const paths = new Set((snapshot.channelWorkspacePaths ?? []).map(workspacePathKey))
+          const hidden = new Set()
+          if (raw) {
+            const remaining = new Set(taskWorkspaceProjection(raw, matchIds, paths, sessionSnapshot()).items
+              .map(row => row.workspaceId ?? row.id))
+            for (const row of raw.items) {
+              const id = row.workspaceId ?? row.id
+              if (id && !remaining.has(id)) hidden.add('workspace:' + id)
+            }
           }
-          entry.inject = projectedInject
+          for (const row of document.querySelectorAll('[data-row-key^="workspace:"], [' + hiddenMark + ']')) {
+            row.toggleAttribute(hiddenMark, hidden.has(row.getAttribute('data-row-key')))
+          }
         }
+        const scheduleForeignTasks = () => { if (frame === undefined) frame = requestAnimationFrame(updateForeignTasks) }
+        const taskObserver = new MutationObserver(scheduleForeignTasks)
+        taskObserver.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-selected'] })
+        const stopWorkspace = workspaceList?.subscribe?.(scheduleForeignTasks)
+        const stopSession = subscribeSessions(scheduleForeignTasks)
+        const stopSnapshot = subscribe(scheduleForeignTasks)
         const sync = () => {
           const readSlots = ctx.slots.entriesOfSlot ?? ctx.slots.entries
           const entry = readSlots?.call(ctx.slots, 'sidebar.workspaces')?.find(row => typeof row?.component === 'function')
@@ -861,7 +928,6 @@ window.__ModuleLoader__.load({
               registry = own
               queueMicrotask(() => window.dispatchEvent(new Event('dsh-native-sidebar-change')))
             }
-            if (registry) projectWorkspaceProps(entry)
           }
           const official = registry?.officialTree
           remove = registry?.insert({ id: 'octo', label: 'Octo', order: 25,
@@ -917,12 +983,15 @@ window.__ModuleLoader__.load({
         return () => {
           controller.abort(); clearTimeout(timer); clearInterval(interval); unsubscribe(); unsubscribeSlots?.()
           removeFilter?.(); remove?.(); restoreEntry(); stylesheet.remove()
+          taskObserver.disconnect(); stopWorkspace?.(); stopSession?.(); stopSnapshot()
+          if (frame !== undefined) cancelAnimationFrame(frame)
+          for (const row of document.querySelectorAll('[' + hiddenMark + ']')) row.removeAttribute(hiddenMark)
           window.removeEventListener('dsh-native-sidebar-change', sync)
           document.removeEventListener('visibilitychange', poll)
           refresh = () => {}; showChannel = () => false; hasNativeTab = false; publish({})
         }
       }, 'Octo channel workspace')
     }
-    return { apply, inject: ['slots', 'sessions', 'uiWorkspace', 'locale'] }
+    return { apply, inject: ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'locale'] }
   },
 })
