@@ -46,3 +46,27 @@ test('main is above newer topics; task projection hides empty owned directories 
   assert.deepEqual(taskWorkspaceProjection(rows, known, paths, { phase, ids: [], byId: {} }).items, [rows.items[1]])
   assert.equal(taskWorkspaceProjection(rows, known, paths, { phase, ids: ['local'], byId: { local: { cwd: rows.items[0].path } } }), rows)
 })
+
+
+test('unchanged polls retain snapshots and route references; updates and removed fields still notify', () => {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const implementation = source.slice(source.indexOf('    const listeners = new Set()'), source.indexOf('    const tFor'))
+  const store = new Function(implementation + '; return { read, publish, subscribe }')()
+  let notifications = 0
+  store.subscribe(() => notifications++)
+  store.publish({ sessionRoutes: [{ id: 'one', type: 1 }], accounts: [{ id: 'bot' }], status: 'online', error: 'old' })
+  const original = store.read()
+  store.publish(JSON.parse(JSON.stringify(original)))
+  assert.equal(store.read(), original)
+  assert.equal(notifications, 1)
+  store.publish({ ...original, status: 'reconnecting' })
+  assert.equal(store.read().sessionRoutes, original.sessionRoutes)
+  assert.equal(notifications, 2)
+  store.publish({ sessionRoutes: [{ id: 'one', type: 2 }], accounts: [{ id: 'bot' }], status: 'online' })
+  assert.notEqual(store.read().sessionRoutes, original.sessionRoutes)
+  assert.equal(store.read().accounts, original.accounts)
+  assert.equal(Object.hasOwn(store.read(), 'error'), false)
+  assert.equal(notifications, 3)
+  store.publish({})
+  assert.equal(Object.hasOwn(store.read(), 'sessionRoutes'), false)
+})

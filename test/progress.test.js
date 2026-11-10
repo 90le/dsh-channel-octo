@@ -56,7 +56,7 @@ test('native approval has a distinct waiting label and cannot hide the final sta
   handle.trace({ kind: 'question-closed' })
   handle.stage('running')
   await tick(800)
-  assert.equal(f.calls.filter(c => c.type === 'edit').at(-1).frame.data.statusLabel, '正在执行工具')
+  assert.equal(f.calls.filter(c => c.type === 'edit').at(-1).frame.data.statusLabel, '正在写入文件')
   await handle.finish('completed')
   assert.equal(f.calls.filter(c => c.type === 'edit').at(-1).frame.data.statusLabel, '回复已发送')
 })
@@ -282,7 +282,7 @@ test('progress shows verified tools and delivered files without exposing tool in
   handle.trace({ kind: 'step' })
   handle.trace({ kind: 'tool-start', name: 'write', id: 'call-fixture', arguments: { secret: 'never-show' } })
   await tick(450)
-  assert.equal(calls.at(-1).frame.data.traceExpanded, true)
+  assert.equal(calls.at(-1).frame.data.traceExpanded, false)
   assert.equal(calls.at(-1).frame.data.phases[0].actions[0].tool, '写入文件')
   handle.trace({ kind: 'tool-end', id: 'call-fixture' })
   handle.stage('delivering')
@@ -290,6 +290,66 @@ test('progress shows verified tools and delivered files without exposing tool in
   assert.equal(await handle.finish('completed'), true)
   const terminal = calls.at(-1)
   assert.equal(terminal.frame.data.traceCollapsed, true)
-  assert.match(terminal.frame.data.collapsedSummary, /1 步 · 1 次工具 · 已发 1 个文件/)
+  assert.match(terminal.frame.data.collapsedSummary, /1 次工具 · 已发 1 个文件/)
   assert.doesNotMatch(JSON.stringify(calls), /never-show|call-fixture/)
+})
+
+
+test('compact progress is collapsed, expands every detail locally, and edits the same card', async t => {
+  const tick = clock(t)
+  const profile = { ...template, elements: ['TextBlock', 'Container'], actions: ['Action.ToggleVisibility'] }
+  const f = fixture({ profile: () => profile })
+  const handle = f.progress.start(job, 'auto', new AbortController().signal)
+  handle.stage('running')
+  await tick(450)
+  const initial = f.calls.at(-1).frame
+  assert.equal(initial.template_ref, undefined)
+  assert.doesNotMatch(initial.plain, /0 次工具|0 步/)
+  const body = initial.card.body
+  const details = body.find(row => row.id === 'dsh_progress_details')
+  assert.equal(details.isVisible, false)
+  // Execute precisely the declared client-local actions without a Bot callback.
+  for (const [header, expanded] of [['dsh_progress_open', true], ['dsh_progress_close', false]]) {
+    const action = body.find(row => row.id === header).selectAction
+    assert.equal(action.type, 'Action.ToggleVisibility')
+    for (const target of action.targetElements) body.find(row => row.id === target.elementId).isVisible = target.isVisible
+    assert.equal(details.isVisible, expanded)
+    assert.equal(body.find(row => row.id === 'dsh_progress_open').isVisible, !expanded)
+    assert.equal(body.find(row => row.id === 'dsh_progress_close').isVisible, expanded)
+  }
+  handle.trace({ kind: 'tool-start', id: 'read', name: 'read', arguments: 'private-data' })
+  await tick(800)
+  const editing = f.calls.at(-1)
+  assert.equal(editing.type, 'edit')
+  assert.equal(editing.id, '456')
+  assert.match(editing.frame.plain, /正在读取文件/)
+  assert.match(JSON.stringify(editing.frame.card), /执行中/)
+  handle.trace({ kind: 'tool-end', id: 'read' })
+  handle.trace({ kind: 'file-sent' })
+  await tick(3_600_000)
+  await handle.finish('completed')
+  const final = f.calls.at(-1).frame
+  assert.match(final.plain, /回复已发送 · 已用时 1 小时 0 分 · 1 次工具 · 已发 1 个文件/)
+  assert.equal(final.card.body.find(row => row.id === 'dsh_progress_details').isVisible, false)
+  assert.doesNotMatch(JSON.stringify(f.calls), /private-data/)
+  assert.equal(f.calls.filter(row => row.type === 'create').length, 1)
+})
+
+test('idle cards refresh less often, while questions and completion update promptly', async t => {
+  const tick = clock(t), f = fixture()
+  const handle = f.progress.start(job, 'auto', new AbortController().signal)
+  await tick(450)
+  await tick(14_999)
+  assert.equal(f.calls.filter(row => row.type === 'edit').length, 0)
+  await tick(1)
+  assert.equal(f.calls.filter(row => row.type === 'edit').length, 1)
+  handle.trace({ kind: 'question-open' })
+  await tick(800)
+  assert.equal(f.calls.at(-1).frame.data.statusLabel, '等待你的回答')
+  const count = f.calls.length
+  handle.trace({ kind: 'question-open' })
+  await tick(800)
+  assert.equal(f.calls.length, count)
+  await handle.finish('completed')
+  assert.equal(f.calls.at(-1).frame.data.statusLabel, '回复已发送')
 })

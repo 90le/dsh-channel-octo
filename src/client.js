@@ -237,7 +237,18 @@ window.__ModuleLoader__.load({
     const read = () => snapshot
     const subscribe = fn => { listeners.add(fn); return () => listeners.delete(fn) }
     const notify = () => { for (const fn of listeners) fn() }
-    const publish = data => { snapshot = { accountUiVersion: snapshot.accountUiVersion, ...data }; notify() }
+    const publish = data => {
+      const next = { accountUiVersion: snapshot.accountUiVersion, ...data }
+      // Share unchanged fields so status polling does not rebuild every conversation tree.
+      let changed = Object.keys(snapshot).length !== Object.keys(next).length
+      for (const key of Object.keys(next)) {
+        if (Object.hasOwn(snapshot, key) && JSON.stringify(snapshot[key]) === JSON.stringify(next[key])) next[key] = snapshot[key]
+        else changed = true
+      }
+      if (!changed) return
+      snapshot = next
+      notify()
+    }
     const tFor = locale => key => words[key]?.[locale === 'zh' || locale?.startsWith?.('zh-') ? 0 : 1] ?? ''
     const channelNames = { 1: 'dm', 2: 'group', 5: 'topic' }
     const connectionTone = {
@@ -339,7 +350,10 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       const locale = () => ctx.locale.getSnapshot().active
       const subscribeLocale = fn => ctx.locale.subscribe(fn)
-      const useT = () => tFor(useSyncExternalStore(subscribeLocale, locale))
+      const useT = () => {
+        const lang = useSyncExternalStore(subscribeLocale, locale)
+        return useMemo(() => tFor(lang), [lang])
+      }
       const sessionSnapshot = () => ctx.sessions.list.getSnapshot()
       const subscribeSessions = fn => ctx.sessions.list.subscribe(fn)
       let showChannel = () => false
@@ -622,9 +636,10 @@ window.__ModuleLoader__.load({
         const sessions = useSyncExternalStore(subscribeSessions, sessionSnapshot)
         const [account, setAccount] = useState('')
         const [kind, setKind] = useState('')
-        const rows = (data.sessionRoutes ?? data.conversations ?? []).filter(row =>
-          (!account || row.accountId === account) && (!kind || Number(kind) === row.type))
-        const visibleIds = useMemo(() => account || kind ? new Set(rows.map(row => row.id)) : ids, [data, account, kind, ids])
+        const rows = useMemo(() => (data.sessionRoutes ?? data.conversations ?? []).filter(row =>
+          (!account || row.accountId === account) && (!kind || Number(kind) === row.type)),
+        [data.sessionRoutes, data.conversations, account, kind])
+        const visibleIds = useMemo(() => account || kind ? new Set(rows.map(row => row.id)) : ids, [rows, account, kind, ids])
         const sessionCache = useMemo(() => new WeakMap(), [visibleIds])
         const [view, setView] = useState({ groupBy: 'workspace-tree', archivedFilter: 'default', orderBy: 'updated',
           groupExpansion: {}, sessionOrderByAccount: {} })
@@ -642,7 +657,7 @@ window.__ModuleLoader__.load({
         const workspaceSource = props.octoUseWorkspaces ?? props.useWorkspaces
         const archiveOnly = view.archivedFilter === 'only'
         const flatGroups = archiveOnly || view.groupBy === 'workspace'
-        const workspaceCache = useMemo(() => new WeakMap(), [data, account, sessions, archiveOnly, t])
+        const workspaceCache = useMemo(() => new WeakMap(), [rows, data.accounts?.length, account, sessions, archiveOnly, t])
         const useOctoWorkspaces = (select, equal) => workspaceSource(raw => {
           let projected = workspaceCache.get(raw)
           if (!projected) {

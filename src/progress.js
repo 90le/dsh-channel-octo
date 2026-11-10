@@ -20,13 +20,18 @@ const wireStates = { queued: 'reasoning', running: 'reasoning', responding: 'ans
 const templateStates = ['reasoning', 'answering', ...outcomes]
 const initialDelay = 450
 const editInterval = 800
-const refreshInterval = 5500
+const refreshInterval = 15_000
 const typingInterval = 4000
 const terminalWaitBudget = 6000
 
 export function cardMode(profile) {
   const config = profile?.config
   if (![true, 1].includes(profile?.enabled) || config?.card_enabled !== true) return undefined
+  // Prefer a local, one-level disclosure when the server advertises every element.
+  // Registry-only installations retain their official template and local toggles.
+  if (config.display_enabled === true && profile.card_version === '1.5'
+    && profile.profiles?.includes('octo/v1') && profile.actions?.includes('Action.ToggleVisibility')
+    && ['TextBlock', 'Container'].every(type => profile.elements?.includes(type))) return 'compact'
   const ref = config.reasoning_template_ref
   const templates = profile.templating?.templates
   if (config.reasoning_enabled === true && ref?.id === 'ai.reasoning-process'
@@ -82,15 +87,22 @@ const action = (tool, detail, status = 'active') => ({
   statusTone: status === 'done' ? 'Good' : status === 'failed' ? 'Attention' : 'Accent',
 })
 
+function duration(seconds) {
+  const days = Math.floor(seconds / 86400), hours = Math.floor(seconds / 3600) % 24
+  const minutes = Math.floor(seconds / 60) % 60, rest = seconds % 60
+  return days ? `${days} 天 ${hours} 小时` : hours ? `${hours} 小时 ${minutes} 分`
+    : minutes ? `${minutes} 分 ${rest} 秒` : `${rest} 秒`
+}
+
 function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   const terminal = outcomes.includes(phase)
   const actual = !terminal && stats.approval ? 'approval' : !terminal && stats.waiting ? 'question'
     : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
   const label = interrupted ? '任务已停止' : labels[actual]
   const state = wireStates[actual] ?? actual
-  const elapsed = '已用时 ' + seconds + ' 秒'
-  const counts = stats.steps + ' 步 · ' + stats.calls + ' 次工具' + (stats.files ? ' · 已发 ' + stats.files + ' 个文件' : '')
-  const summary = elapsed + ' · ' + counts
+  const elapsed = '已用时 ' + duration(seconds)
+  const summary = [elapsed, stats.calls && stats.calls + ' 次工具', stats.files && '已发 ' + stats.files + ' 个文件']
+    .filter(Boolean).join(' · ')
   const descriptions = [...stats.recent.values()].slice(-4).map(row =>
     action(row.label, row.status === 'done' ? '已完成' : row.status === 'failed' ? '未完成' : terminal ? '未确认结束' : '执行中', row.status))
   const note = detail || (stats.failed ? stats.failed + ' 次工具未成功' : '')
@@ -98,20 +110,41 @@ function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   if (descriptions.length) phases.push({ thought: '工具执行', actions: descriptions })
   if (stats.files) phases.push({ thought: '文件交付', actions: [action('Octo 附件', '已确认发送 ' + stats.files + ' 个文件', 'done')] })
   if (!phases.length) phases.push({ thought: stats.steps ? '会话处理' : '请求已接收',
-    actions: [action('DSH', stats.steps ? '已进入 ' + stats.steps + ' 个处理步骤' : '等待模型开始', terminal ? 'done' : 'active')] })
-  if (mode === 'display') return {
-    profile: 'octo/v1', card_version: '1.5', plain: label + ' · ' + summary,
-    card: { type: 'AdaptiveCard', version: '1.5', body: [
-      { type: 'TextBlock', text: 'DSH 回复进度', weight: 'Bolder', wrap: true },
-      { type: 'TextBlock', text: label + ' · ' + summary, wrap: true },
-      ...descriptions.map(item => ({ type: 'TextBlock', text: item.statusGlyph + ' ' + item.tool + '：' + item.detail, wrap: true })),
-      ...(note ? [{ type: 'TextBlock', text: note, wrap: true }] : []),
-    ] },
-  }
+    actions: [action('DSH', terminal ? phase === 'completed' ? '处理已结束' : interrupted ? '已停止执行' : '未确认完成'
+      : stats.steps ? '已进入 ' + stats.steps + ' 个处理步骤' : '等待模型开始',
+      phase === 'completed' ? 'done' : terminal ? 'failed' : 'active')] })
   const tone = state === 'error' ? 'Attention' : state === 'completed' ? 'Good' : state === 'stopped' ? 'Warning' : 'Accent'
-  const expanded = !terminal && descriptions.length > 0
+  const current = actual === 'tool' && [...stats.recent.values()].reverse().find(row => row.status === 'active')
+  const status = current ? '正在' + current.label : label
+  if (mode === 'compact' || mode === 'display') {
+    const text = (value, extra = {}) => ({ type: 'TextBlock', text: value, size: 'Small', wrap: true, spacing: 'Small', ...extra })
+    const details = [
+      ...(stats.steps ? [text('已进入 ' + stats.steps + ' 个处理步骤', { isSubtle: true })] : []),
+      ...(stats.calls > 4 ? [text('最近 4 次工具操作', { isSubtle: true })] : []),
+      ...phases.flatMap(group => group.actions.map(item =>
+        text(item.statusGlyph + ' ' + item.tool + '：' + item.detail, { color: item.statusTone }))),
+      ...(note ? [text(note, { color: stats.failed ? 'Warning' : tone })] : []),
+    ]
+    const header = expanded => ({ type: 'Container', id: expanded ? 'dsh_progress_close' : 'dsh_progress_open',
+      isVisible: !expanded, spacing: 'None',
+      selectAction: { type: 'Action.ToggleVisibility', title: expanded ? '收起全部详情' : '展开全部详情', targetElements: [
+        { elementId: 'dsh_progress_details', isVisible: !expanded },
+        { elementId: 'dsh_progress_open', isVisible: expanded },
+        { elementId: 'dsh_progress_close', isVisible: !expanded },
+      ] },
+      items: [text('DSH 回复进度  ' + (expanded ? '▴' : '▾'), { weight: 'Bolder', spacing: 'None' })] })
+    return { profile: 'octo/v1', card_version: '1.5', plain: status + ' · ' + summary + (note ? ' · ' + note : ''),
+      card: { type: 'AdaptiveCard', version: '1.5', body: [
+        ...(mode === 'compact' ? [header(false), header(true)] : [text('DSH 回复进度', { weight: 'Bolder' })]),
+        text(status, { color: tone, spacing: 'None' }),
+        text(summary, { isSubtle: true }),
+        ...(mode === 'compact' ? [{ type: 'Container', id: 'dsh_progress_details', isVisible: false,
+          separator: true, spacing: 'Small', items: details }] : note ? [text(note)] : []),
+      ] } }
+  }
+  const expanded = false
   return { template_ref: mode, state, data: {
-    reasoningId, state, title: 'DSH 回复进度', statusLabel: label, statusTone: tone,
+    reasoningId, state, title: 'DSH 回复进度', statusLabel: status, statusTone: tone,
     timerText: elapsed, traceExpanded: expanded, traceCollapsed: !expanded, collapsedSummary: summary,
     progressText: note || (terminal ? summary : label + ' · ' + summary),
     phases,
@@ -274,7 +307,7 @@ export class Progress {
     return {
       stage(next) {
         if (!active()) return
-        if (next === 'approval') { stats.approval = true; changed(); return }
+        if (next === 'approval') { if (!stats.approval) { stats.approval = true; changed() }; return }
         if (next === 'running' && stats.approval) { stats.approval = false; changed() }
         if (next === 'answering') next = 'responding'
         if (!active() || stages.indexOf(next) <= stages.indexOf(phase)) return
@@ -284,7 +317,11 @@ export class Progress {
       trace(event) {
         if (!active()) return
         if (event?.kind === 'step') stats.steps = Math.min(999, stats.steps + 1)
-        else if (event?.kind === 'question-open' || event?.kind === 'question-closed') stats.waiting = event.kind === 'question-open'
+        else if (event?.kind === 'question-open' || event?.kind === 'question-closed') {
+          const waiting = event.kind === 'question-open'
+          if (stats.waiting === waiting) return
+          stats.waiting = waiting
+        }
         else if (event?.kind === 'tool-start' && typeof event.id === 'string' && event.id.length <= 256 && !stats.pending.has(event.id)
           && stats.pending.size < 128) {
           stats.calls = Math.min(999, stats.calls + 1)
