@@ -21,6 +21,8 @@
 
 ## 当前状态
 
+2026-11-10 已部署 [0.26.9](https://github.com/90le/dsh-channel-octo/releases/tag/v0.26.9)，源码 `2a7bea9`，包 SHA-256 `6985052ffc04ec51ffbfff8d735ce4e2c97675ea56d630e2958b33c768a560a1`。Debian `/opt/dsh-channel-octo/releases/0.26.9-6985052ffc/` 的 60 个文件匹配；Web 与两个 Bot 身份和长连接就绪；账号、凭据、宿主配置、IM Connect 保持。备份 `/root/dsh-octo-0269-rollout.03Mwft`。正式所有者私聊 3 张标有模拟步骤的卡片、6 次更新成功，无错误/降级；实际发送帧核对 collapsed 为全部关闭、list 为外层开子层关、all 为全部开，等待回答保持对应状态，三张完成后均全部折叠。真实任务设置最终观感待用户反馈，未修改用户已保存选项或调用模型。
+
 2026-11-10 0.26.9 候选：每 Bot 独立 progressExpansion 设置（collapsed/list/all），创建/编辑界面位于消息行为，默认旧账号折叠。运行中按设置展开，等待问答/审批保持；完成、失败、停止、超时终态统一折叠。纯展示配置保存不调用 worker 重配置、不撤销审批，当前卡片捕获原配置，新任务使用新配置。48 项定向检查覆盖保存/重启/隔离、旧账号默认、无干扰更新、三种展开与终态；36 个官方服务端卡片帧验证通过，官方渲染器布局核实。上线与正式接口结果另记。
 
 2026-11-10 已部署 [0.26.8](https://github.com/90le/dsh-channel-octo/releases/tag/v0.26.8)，运行源码 `380e8bc`，包 SHA-256 `26373c9d968a2ba88d6861dd7011e66245307b018b51b36fa76fcad5e1903f26`。Debian `/opt/dsh-channel-octo/releases/0.26.8-26373c9d96/` 的 60 个文件匹配；Web 和两个 Bot 长连接就绪，账号、凭据及 IM Connect 保持。备份 `/root/dsh-octo-0268-rollout.L18kNX`。正式所有者私聊模拟展示验收：1 张精细进度卡创建成功、3 次更新成功、完成终态成功，无发送错误或降级。未调用模型或执行工作区任务；真实任务观感待用户反馈。
