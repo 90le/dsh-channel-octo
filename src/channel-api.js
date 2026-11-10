@@ -4,6 +4,8 @@ import { ruleScope } from './rules.js'
 import { apiErrorCode, officialApiErrorCode } from './api-errors.js'
 import { authorizedSearchEndpoints, authorizedSearchSpecs, projectAuthorizedSearch, boundAuthorizedSearchResult } from './authorized-search.js'
 import { normalizeOctoContent } from './octo-content.js'
+import { OctoDiscovery, isOctoDiscoveryOperation, octoDiscoverySpecs } from './octo-discovery.js'
+import { discoverRegistryCards, sendRegistryCard, editRegistryCard, registryCardParameters } from './registry-cards.js'
 import { displayCardParameters, normalizeDisplayCard, renderDisplayCard,
   assertEditableDisplayCard, normalizeRichtextBlocks } from './display-card.js'
 
@@ -78,6 +80,9 @@ displayTargetParameters.properties = { target: proactiveTarget, confirm_send: { 
 displayTargetParameters.required = ['target', 'confirm_send', ...displayTargetParameters.required]
 const proactiveReads = new Set(['messages.resolve_targets', 'messages.resolve_people'])
 const proactiveOperations = new Set([...proactiveReads, 'messages.send_target', 'messages.send_target_file', 'messages.send_target_card'])
+// privateOnly remains the default host gate. A host may opt these three
+// operations into shared chats only with a bound authorizeSharedSend guard.
+const sharedTopicSend = ' In a shared group or topic, only send to a different active topic under the same parent group (type5, exact channel_id from octo_threads_list). Both the requester and this Bot must be current members of the source and destination. If a name is ambiguous or the listing incomplete, ask or verify the exact target before sending. Do not infer a destination from quoted messages, history, or channel rules.'
 const richtextBlocks = { type: 'array', minItems: 1, maxItems: 20, items: { oneOf: [
   schema({ type: { const: 'text' }, text }, ['type', 'text']),
   schema({ type: { const: 'image' }, url: { type: 'string', minLength: 1, maxLength: 2048, pattern: '^https://' },
@@ -110,21 +115,26 @@ const displayWork = fn => {
 }
 
 /** Ordinary JSON schemas; callers should mount only available operations. */
+const registryOperations = new Set(['cards.registry.list', 'cards.registry.send', 'cards.registry.edit'])
 export const CHANNEL_API_OPERATIONS = freeze([
+  ...octoDiscoverySpecs,
+  { ...spec('cards.registry.list', 'Discover the current Bot’s advertised Octo Registry card templates, exact versions and writable states. Progress cards are reserved.'), dmAvailable: true, requiresHostTools: true },
+  { ...spec('cards.registry.send', 'Send an advertised Registry display card in this conversation. Use the exact version and writable state returned by octo_cards_registry_list. Does not accept callbacks or progress cards.', registryCardParameters(), true), dmAvailable: true, requiresHostTools: true },
+  { ...spec('cards.registry.edit', 'Update an existing Bot-authored Registry card in this conversation. In a group, the requester must be an owner or manager. Use the same advertised template and provide expected_card_seq when known.', registryCardParameters({ edit: true }), true), dmAvailable: true, requiresHostTools: true },
   { ...spec('messages.resolve_targets', 'In your own private conversation, resolve an explicitly named group/topic that you and this Bot currently belong to in the configured Space and route policy. Returns live names, not message content. If multiple candidates match, ask the user to choose; a truncated result is not exhaustive. Never guess IDs from names.',
     schema({ name: { type: 'string', minLength: 1, maxLength: 100 }, kind: { type: 'string', enum: ['all', 'group', 'thread'] },
       limit: { type: 'integer', minimum: 1, maximum: 5 } }, ['name'])), privateOnly: true },
   { ...spec('messages.resolve_people', 'In your own private conversation, find an explicitly named human recipient in the configured Space for a requested Bot DM. Returns a bounded directory page, not messages or proof of friendship. Use exact returned channel_id with channel_type=1; ask the user when names are ambiguous and inspect further pages when more=true. Actual send checks Bot friendship. Never use a name or a group/topic address as a person UID.',
     schema({ name: { type: 'string', minLength: 1, maxLength: 80 },
       limit: { type: 'integer', minimum: 1, maximum: 5 }, page: { type: 'integer', minimum: 1, maximum: 100 } }, ['name'])), privateOnly: true },
-  { ...spec('messages.send_target', 'Only on an explicit user request in their own private conversation: send text/Markdown as this Bot to one precisely identified person (type1), group (type2) or topic (type5). Resolve names first and ask on ambiguity. Humans must belong to the configured Space; group/topic requires requester and Bot membership, DM requires Bot friendship at actual send. confirm_send=true affirms the user requested this exact target and text; never automatically forward private content. Optional native mentions are group/topic-only and use verified member UIDs; all=true requires requester admin. No fabricated reply/quote, user impersonation, bulk send or automatic retry after an unconfirmed delivery.',
+  { ...spec('messages.send_target', 'On an explicit user request, send text/Markdown as this Bot. In the user’s own private conversation, send to one precisely identified person (type1), group (type2) or topic (type5). Resolve names first and ask on ambiguity. Humans must belong to the configured Space; group/topic requires requester and Bot membership, DM requires Bot friendship at actual send. confirm_send=true affirms the user requested this exact target and text; never automatically forward content. Optional native mentions are group/topic-only and use verified destination member UIDs; all=true requires requester group owner/admin. No fabricated reply/quote, user impersonation, bulk send or automatic retry after an unconfirmed delivery.' + sharedTopicSend,
     schema({ target: proactiveTarget,
-      text, uids: memberTargets, all: { type: 'boolean' }, confirm_send: { type: 'boolean', const: true } }, ['target', 'text', 'confirm_send']), true), privateOnly: true },
-  { ...spec('messages.send_target_file', 'Only on an explicit request in the user\'s own private conversation: send ONE workspace file/image as this Bot to one identified person/group/topic (type1/2/5). Resolve named destinations and ask on ambiguity. A person must be a current human in this Space; the server checks Bot friendship at send. path must be relative to this account workspace; files outside it, credentials and links are rejected. Requires workspace tool access and attachments enabled. confirm_send=true affirms the exact destination and file were requested; never forward private files automatically. Optional caption is sent in full as a separate text/Markdown message after the native file/image. Inspect the receipt: partial delivery MUST NOT be retried as a whole. No automatic retry after an unconfirmed send. This is delivery, not a final answer; summarize the actual outcome to the user. Use DSH present instead for delivery to the current conversation.',
+      text, uids: memberTargets, all: { type: 'boolean' }, confirm_send: { type: 'boolean', const: true } }, ['target', 'text', 'confirm_send']), true), privateOnly: true, sharedTopicSend: true },
+  { ...spec('messages.send_target_file', 'On an explicit user request, send ONE workspace file/image as this Bot. In the user’s own private conversation, send to one identified person/group/topic (type1/2/5). Resolve named destinations and ask on ambiguity. A person must be a current human in this Space; the server checks Bot friendship at send. path must be relative to this account workspace; files outside it, credentials and links are rejected. Requires workspace tool access and attachments enabled. confirm_send=true affirms the exact destination and file were requested; never forward files automatically. Optional caption is sent in full as a separate text/Markdown message after the native file/image. Inspect the receipt: partial delivery MUST NOT be retried as a whole. No automatic retry after an unconfirmed send. This is delivery, not a final answer; summarize the actual outcome to the user. Use DSH present instead for delivery to the current conversation.' + sharedTopicSend,
     schema({ target: proactiveTarget, path: { type: 'string', minLength: 1, maxLength: 1024 }, caption: text,
-      confirm_send: { type: 'boolean', const: true } }, ['target', 'path', 'confirm_send']), true), privateOnly: true, requiresFiles: true },
-  { ...spec('messages.send_target_card', 'Only on an explicit request in the user\'s own private conversation: send a structured DISPLAY card as this Bot to one identified person/group/topic (type1/2/5). A person must be a current human in this Space; the server checks Bot friendship at send. Resolve names and ask on ambiguity; confirm_send=true affirms this destination and content were requested. Uses the same bounded display blocks as octo_display_card. No callback buttons, raw payloads, user impersonation or automatic retry. Returns a receipt; still give a short final summary to the requester.',
-    displayTargetParameters, true), privateOnly: true },
+      confirm_send: { type: 'boolean', const: true } }, ['target', 'path', 'confirm_send']), true), privateOnly: true, sharedTopicSend: true, requiresFiles: true },
+  { ...spec('messages.send_target_card', 'On an explicit user request, send a structured DISPLAY card as this Bot. In the user’s own private conversation, send to one identified person/group/topic (type1/2/5). A person must be a current human in this Space; the server checks Bot friendship at send. Resolve names and ask on ambiguity; confirm_send=true affirms this destination and content were requested. Uses the same bounded display blocks as octo_display_card. No callback buttons, raw payloads, user impersonation or automatic retry. Returns a receipt; still give a short final summary to the requester.' + sharedTopicSend,
+    displayTargetParameters, true), privateOnly: true, sharedTopicSend: true },
   ...authorizedSearchSpecs({ spec, schema, uid, searchPage, searchKeyword, searchFilters }),
   spec('inspect', 'Inspect the current channel and its parent group permissions.'),
   spec('groups.list', 'Return only the current parent group, never other groups.'),
@@ -222,10 +232,14 @@ const specs = new Map(CHANNEL_API_OPERATIONS.map(value => [value.name, value]))
 // their incompatibility by issuing failing mutations.
 const appOperations = new Set(['inspect', 'messages.recent', 'messages.read', 'messages.user_info', 'messages.users_batch',
   'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.edit_richtext', 'messages.edit_display_card',
-  'messages.clear_card_revisions'])
+  'messages.clear_card_revisions', ...registryOperations])
 const errorHints = Object.freeze({
   account_configuration_changed: '账号配置已变更，此次旧配置下的操作已停止。请基于当前配置重新确认；已经发出的写请求不会自动重试。',
-  private_operation_required: '请在你与 Bot 的私聊中明确选择目标频道；共享群聊不会开放跨频道发送。',
+  private_operation_required: '请在你与 Bot 的私聊中使用此操作。',
+  shared_topic_target_required: '请明确选择本群的另一个子区，使用其准确的子区频道 ID。',
+  shared_topic_operator_required: '发起人没有此账号的共享会话发送权限，或权限已变更。',
+  requester_not_topic_member: '发起人必须是来源和目标子区的当前成员。',
+  bot_not_topic_member: 'Bot 必须是来源和目标子区的当前成员。',
   invalid_target_response: '目标频道信息未能通过校验，未猜测或发送到其他地址。',
   thread_not_active: '此子区已归档或不可用，未发送消息。',
   private_search_required: '跨频道检索仅在发起人自己的私聊中提供，结果不会回发到共享群聊。',
@@ -462,14 +476,16 @@ export class ChannelApi {
   #request
   #config
   #ownerUid
+  #discovery
   #searchContinuations = new Map()
   #revoked = false
-  constructor({ request, config }) {
+  constructor({ request, config, verifyAccount }) {
     if (typeof request !== 'function' || !validBotIdentity(config)) fail('invalid_channel_api_config')
     this.#request = request
     // The host fills ownerUid from verified identity after constructing its
     // client. Read that trusted field at call time; never accept it in args.
     this.#ownerUid = () => config.ownerUid
+    if (typeof verifyAccount === 'function') this.#discovery = new OctoDiscovery({ request, config, verifyAccount })
     this.#config = {
       botUid: config.botUid, spaceId: config.spaceId, botKind: config.botKind,
       senderPolicy: config.senderPolicy ?? 'octo', channelPolicy: config.channelPolicy ?? 'joined',
@@ -479,10 +495,11 @@ export class ChannelApi {
       || !['joined', 'allowlist'].includes(this.#config.channelPolicy)) fail('invalid_channel_api_config')
   }
 
-  revoke() { this.#revoked = true; this.#searchContinuations.clear() }
+  revoke() { this.#revoked = true; this.#searchContinuations.clear(); this.#discovery?.revoke() }
 
   supports(operation) {
-    return specs.get(operation)?.available === true && (this.#config.botKind !== 'app' || appOperations.has(operation))
+    return specs.get(operation)?.available === true && (!isOctoDiscoveryOperation(operation) || !!this.#discovery)
+      && (this.#config.botKind !== 'app' || appOperations.has(operation))
   }
 
   // Unlike sync, this official route applies the App's server-managed Space
@@ -877,14 +894,15 @@ export class ChannelApi {
       })), attachments_truncated: attachments.length > 2 }) }
   }
 
-  async #readMessage(scope, sender, messageId, signal, details = false, editType, expectedNeighbor) {
+  async #readMessage(scope, sender, messageId, signal, details = false, editType, expectedNeighbor, rawSource = false) {
     if (!id(messageId)) fail('invalid_arguments')
     const base = scope.group ? scope.root + (scope.thread ? '/threads/' + scope.thread : '')
       : '/v1/bot/messages/person/' + encodeURIComponent(scope.route.channel_id)
     const path = scope.group ? base + '/messages/' + messageId : base + '/' + messageId
-    const result = this.#message(await this.#call(path, undefined, signal), scope, sender, details, editType, expectedNeighbor)
+    const raw = await this.#call(path, undefined, signal)
+    const result = this.#message(raw, scope, sender, details, editType, expectedNeighbor)
     if (result.message_id !== messageId) fail('message_outside_channel')
-    return result
+    return rawSource ? raw : result
   }
 
   async #search(scope, sender, operation, args, signal) {
@@ -1075,6 +1093,65 @@ export class ChannelApi {
       ...(topic && { parent_name: access.group.name }) } }
   }
 
+  async #activeSendTopic(scope, sender, signal) {
+    const { path, selected } = this.#threadPath(scope, {})
+    const topic = this.#thread(await this.#call(path, undefined, signal), scope, selected)
+    if (topic.status !== 1) fail('thread_not_active')
+    // Octo's bot thread endpoint itself only requires the Bot's active parent
+    // membership. The actual topic roster is needed; do not seed it with the
+    // event sender, the Bot, the topic creator, or other parent members.
+    const raw = await this.#call(path + '/members', undefined, signal)
+    if (!Array.isArray(raw)) fail('invalid_thread_response')
+    const seen = new Set(), members = new Set()
+    for (const row of list(raw, MAX_MEMBERS)) {
+      if (!object(row) || !validUid(row.uid) || ![0, 1].includes(row.role) || seen.has(row.uid)) fail('invalid_thread_response')
+      seen.add(row.uid)
+      if (row.is_deleted !== undefined && ![0, false].includes(row.is_deleted)
+        || row.status !== undefined && row.status !== 1) continue
+      members.add(row.uid)
+    }
+    if (!members.has(sender)) fail('requester_not_topic_member')
+    if (!members.has(this.#config.botUid)) fail('bot_not_topic_member')
+    return { topic, members }
+  }
+
+  async #sendFromShared(scope, sender, operation, args, signal, prepared, runtime, authorizeOperator) {
+    const { channel_type, channel_id } = args.target
+    const selected = ruleScope(channel_type, channel_id)
+    if (!selected?.thread || selected.group !== scope.group || channel_id === scope.route.channel_id) fail('shared_topic_target_required')
+    const target = this.#scope(args.target)
+    // Host-only synchronous guard, bound to the admitted job and current
+    // account/tool grant. Model arguments cannot supply or override it.
+    const operatorAllowed = () => {
+      try { return authorizeOperator() === true } catch { return false }
+    }
+    const assertOperator = () => {
+      if (this.#revoked) fail('account_configuration_changed')
+      if (signal.aborted) fail('aborted')
+      if (!operatorAllowed()) fail('shared_topic_operator_required')
+    }
+    const authorize = async () => {
+      assertOperator()
+      const { group } = await this.#access(scope, sender, true, signal, true)
+      if (await this.#principal(sender, signal) !== 'human'
+        || await this.#principal(this.#config.botUid, signal) !== 'user_bot') fail('requester_not_allowed')
+      if (scope.thread) await this.#activeSendTopic(scope, sender, signal)
+      const { topic, members } = await this.#activeSendTopic(target, sender, signal)
+      // Recheck parent membership and the human's role after topic metadata.
+      // Topic roles are creator flags and do not authorize broadcasts.
+      const rows = await this.#membership(target, signal)
+      const actor = rows.find(row => row.uid === sender && row.robot === 0)
+      if (!actor) fail('requester_not_member')
+      assertOperator()
+      return { scope: target, access: { actor, rows: rows.filter(row => members.has(row.uid)) },
+        target: { ...target.route, name: topic.name, parent_name: group.name } }
+    }
+    // Before a profile read or file preparation, prove both routes. Text has
+    // no preparation and only needs the authorization immediately before send.
+    if (operation !== 'messages.send_target') await authorize()
+    return this.#sendTarget(operation, args, signal, prepared, runtime, authorize, operatorAllowed)
+  }
+
   async #proactive(scope, sender, operation, args, signal, prepared, runtime) {
     if (scope.route.channel_type !== 1 || scope.route.channel_id !== sender) fail('private_operation_required')
     if (await this.#principal(sender, signal) !== 'human' || await this.#principal(this.#config.botUid, signal) !== 'user_bot') fail('requester_not_allowed')
@@ -1152,6 +1229,10 @@ export class ChannelApi {
       await this.#access(scope, sender, true, signal, true)
       return this.#targetAccess(args.target, sender, signal)
     }
+    return this.#sendTarget(operation, args, signal, prepared, runtime, authorize)
+  }
+
+  async #sendTarget(operation, args, signal, prepared, runtime, authorize, sharedOperatorAllowed) {
     let payload, fallbackBlocks
     if (operation === 'messages.send_target_card') {
       const profile = await this.#call('/v1/bot/card/profile', undefined, signal)
@@ -1176,11 +1257,13 @@ export class ChannelApi {
     const fresh = await authorize()
     const uids = args.uids ?? []
     if (args.all && !admin(fresh.access.actor)) fail('requester_admin_required')
+    if (sharedOperatorAllowed && uids.some(uid => ['all', 'all_bots', '-1', '-2', '-3'].includes(uid.toLowerCase()))) fail('invalid_mention_target')
     if (uids.some(uid => !fresh.access.rows.some(row => row.uid === uid))) fail('mention_not_member')
     payload ??= notificationPayload(args.text, uids, fresh.access.rows, args.all)
+    if (sharedOperatorAllowed && !sharedOperatorAllowed()) fail('shared_topic_operator_required')
     const raw = await this.#mutation('/v1/bot/sendMessage', { ...fresh.scope.route, payload }, signal)
     if (!id(raw?.message_id)) fail('mutation_unconfirmed')
-    if (raw.authority_changed) return { ok: operation !== 'messages.send_target_file' || args.caption === undefined,
+    if (raw.authority_changed || sharedOperatorAllowed && !sharedOperatorAllowed()) return { ok: operation !== 'messages.send_target_file' || args.caption === undefined,
       message_id: id(raw.message_id), sent_as: 'bot', authority_changed: true, requiresFinalSummary: true,
       ...(operation === 'messages.send_target_file' && args.caption !== undefined
         && { partial: true, caption_status: 'not_sent', retry_whole_delivery: false }) }
@@ -1195,12 +1278,14 @@ export class ChannelApi {
       // file receipt if permission changes or that second send is uncertain.
       try {
         await authorize()
+        if (sharedOperatorAllowed && !sharedOperatorAllowed()) fail('shared_topic_operator_required')
         const caption = await this.#mutation('/v1/bot/sendMessage', { ...fresh.scope.route,
           payload: notificationPayload(args.caption, [], [], false) }, signal)
-        if (!id(caption?.message_id)) fail('mutation_unconfirmed')
-        if (caption.authority_changed) return { ok: true, message_id: receipt.message_id,
-          caption_message_id: id(caption.message_id), sent_as: 'bot', authority_changed: true, requiresFinalSummary: true }
-        return { ok: true, ...receipt, caption_message_id: id(caption.message_id), caption: args.caption }
+        const captionId = id(caption?.message_id)
+        if (!captionId || sharedOperatorAllowed && captionId === receipt.message_id) fail('mutation_unconfirmed')
+        if (caption.authority_changed || sharedOperatorAllowed && !sharedOperatorAllowed()) return { ok: true, message_id: receipt.message_id,
+          caption_message_id: captionId, sent_as: 'bot', authority_changed: true, requiresFinalSummary: true }
+        return { ok: true, ...receipt, caption_message_id: captionId, caption: args.caption }
       } catch (error) {
         return { ok: false, ...receipt, partial: true,
           caption_status: error?.code === 'mutation_unconfirmed' ? 'unconfirmed' : 'not_sent',
@@ -1208,7 +1293,8 @@ export class ChannelApi {
       }
     }
     return { ok: true, message_id: id(raw.message_id), ...fresh.target, sent_as: 'bot',
-      text: payload.content, ...(payload.mention && { mention: payload.mention }) }
+      text: payload.content, ...(payload.mention && { mention: payload.mention }),
+      ...(sharedOperatorAllowed && { requiresFinalSummary: true }) }
   }
 
   async dispatch(route, sender, operation, args = {}, signal = new AbortController().signal, runtime) {
@@ -1216,6 +1302,28 @@ export class ChannelApi {
     const definition = specs.get(operation)
     if (!definition) fail('unknown_operation')
     if (this.#config.botKind === 'app' && !this.supports(operation)) fail('api_unsupported')
+    if (isOctoDiscoveryOperation(operation)) {
+      if (!this.#discovery) fail('api_unsupported')
+      return this.#discovery.dispatch(route, sender, operation, args, signal)
+    }
+    if (registryOperations.has(operation)) {
+      const scope = this.#scope(route)
+      const authorize = async active => {
+        if (this.#revoked || active.aborted || !await runtime?.authorizeRegistry?.(active)) return false
+        const access = await this.#access(scope, sender, definition.mutating, active, true)
+        if (scope.thread) await this.#activeSendTopic(scope, sender, active)
+        if (scope.group && operation === 'cards.registry.edit' && !admin(access.actor)) return false
+        return !this.#revoked && !active.aborted && runtime.registryActive?.() === true
+      }
+      const call = (path, body, active) => this.#call(path, body, active, undefined, path === '/v1/bot/sendMessage')
+      if (operation === 'cards.registry.list') {
+        validate(args, definition.parameters)
+        return discoverRegistryCards({ call, authorize, signal })
+      }
+      if (operation === 'cards.registry.send') return sendRegistryCard({ call, authorize, route: scope.route, args, signal })
+      return editRegistryCard({ call, authorize, route: scope.route, botUid: this.#config.botUid, args, signal,
+        readSource: (messageId, active) => this.#readMessage(scope, sender, messageId, active, false, undefined, undefined, true) })
+    }
     const structuredEdit = structuredEdits.has(operation)
     const identityRead = identityReads.has(operation)
     const scopedRead = identityRead || webhookReads.has(operation)
@@ -1279,6 +1387,12 @@ export class ChannelApi {
     if (['rules.edit', 'thread.rules.edit'].includes(operation) && Buffer.byteLength(args.content, 'utf8') > 10240) fail('invalid_arguments')
     if (operation === 'group.edit' && !Object.keys(args).length) fail('invalid_arguments')
     const scope = this.#scope(route)
+    if (scope.group && definition.sharedTopicSend) {
+      const authorizeOperator = runtime?.authorizeSharedSend
+      if (typeof authorizeOperator === 'function') {
+        return this.#sendFromShared(scope, sender, operation, args, signal, prepared, runtime, authorizeOperator)
+      }
+    }
     if (definition.privateOnly && scope.route.channel_type !== 1) fail(proactive ? 'private_operation_required' : 'private_search_required')
     if (!definition.available) fail(definition.unavailableReason)
     const voice = operation.startsWith('voice.context.')

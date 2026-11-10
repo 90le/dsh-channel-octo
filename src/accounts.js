@@ -12,6 +12,7 @@ import { Worker } from './worker.js'
 import { sessionExists } from './session-state.js'
 import { botCommandMenu, setBotCommands } from './bot-commands.js'
 import { administerWebhooks, validateWebhookInput, webhookWrites } from './webhook-admin.js'
+import { createWebhookChat, isWebhookChatAction, validateWebhookChatInput } from './webhook-chat.js'
 import { directoryRecoveryEnabled } from './directory-discovery.js'
 
 const legacy = 'legacy'
@@ -66,6 +67,8 @@ function savedRecords(path, endpoint) {
 }
 
 export class Accounts {
+  #webhookChat = createWebhookChat()
+
   constructor(ctx, deployment, { fetchImpl = fetch, env = process.env } = {}) {
     Object.assign(this, { ctx, deployment, fetchImpl, env })
     this.log = ctx.logger('dsh-channel-octo')
@@ -223,6 +226,7 @@ export class Accounts {
       api: new OctoClient({ ...config, fetchImpl: this.fetchImpl }), store,
       host: new DshHost(this.ctx, config.cwd, config.timeoutMs, record),
       config, attach, isArchived: sessionId => this.ctx.get('workspaceRegistry')?.archivedSessionIds?.includes(sessionId),
+      proposeWebhookChat: (message, requestSignal) => this.#proposeWebhookChat(runtime, worker, message, requestSignal),
       log: (line) => {
         if (runtime.changing) return
         if (line === 'octo_ws_connected' || line === 'octo_poll_ok') runtime.status = 'online'
@@ -412,10 +416,10 @@ export class Accounts {
     return this.identify(token)
   }
 
-  async identify(token) {
+  async identify(token, signal = this.lifetime.signal) {
     try {
       const api = new OctoClient({ apiBase: this.endpoint, token, fetchImpl: this.fetchImpl })
-      const identity = await api.identify(this.lifetime.signal)
+      const identity = await api.identify(signal)
       if (!validBotIdentity(identity) || (identity.botKind === 'app') !== token.startsWith('app_')
         || [identity.botUid, identity.spaceId, identity.ownerUid].some(value => typeof value === 'string' && value.includes(token))) {
         fail('bot_verification_failed')
@@ -610,26 +614,74 @@ export class Accounts {
     return identity
   }
 
-  manageWebhooks(accountId, input, requestSignal) {
+  #webhookChatContext(runtime, worker, signal, authorized) {
+    const { record, controller, settings } = runtime
+    const config = worker?.config
+    const revision = this.revision
+    const settingsRevision = settings.revision()
+    const token = config?.token
+    const isActive = () => this.ready === true && !signal.aborted && !!controller && !controller.signal.aborted
+      && !runtime.changing && runtime.status !== 'worker_stopped' && !!worker && !worker.paused && !worker.stopIntake
+      && this.revision === revision && settings.revision() === settingsRevision && this.records.get(record.id) === record
+      && record.enabled && this.runtimes.get(record.id) === runtime && runtime.record === record
+      && runtime.controller === controller && runtime.worker === worker && worker.config === config
+      && !!config && config.token === token && authorized() === true
+    return { apiBase: this.endpoint, fetchImpl: this.fetchImpl, record, config, revision, settingsRevision, token, signal, isActive }
+  }
+
+  async #proposeWebhookChat(runtime, worker, message, requestSignal) {
+    if (!(requestSignal instanceof AbortSignal) || !runtime.controller) return { status: 'ignored' }
+    const signal = AbortSignal.any([requestSignal, runtime.controller.signal, this.lifetime.signal])
+    const context = this.#webhookChatContext(runtime, worker, signal, () => true)
+    try {
+      const { config, token } = context
+      if (!context.isActive() || message?.webhookChat?.kind !== 'request' || message.ambient !== false
+        || !validUid(config.ownerUid) || message.sender !== config.ownerUid
+        || config.groupCommands !== 'safe' || ['text-only', 'read-only'].includes(config.toolPermission)
+        || !validToken(token) || !token.startsWith('bf_')) return { status: 'ignored' }
+      const identity = await this.identify(token, signal)
+      return await this.#webhookChat.propose({ ...context, identity }, message, { live: true })
+    } catch {
+      // Neither the credential nor an upstream error is a chat result.
+      return { status: signal.aborted ? 'ignored' : 'unavailable' }
+    }
+  }
+
+  manageWebhooks(accountId, input, requestSignal, requestAuthorized) {
     return this.locked(async () => {
       this.checkRevision(input)
-      validateWebhookInput(input)
+      const chat = isWebhookChatAction(input?.action)
+      if (chat) validateWebhookChatInput(input)
+      else validateWebhookInput(input)
       const record = this.record(accountId)
       if (record.botKind === 'app') fail('app_bot_operation_unavailable')
       const runtime = this.runtimes.get(accountId)
       if (!runtime?.settings?.config) fail('channel_not_configured')
       if (runtime.changing) fail('account_transition')
+      const signal = AbortSignal.any([this.lifetime.signal, ...(requestSignal ? [requestSignal] : [])])
+      const context = chat && this.#webhookChatContext(runtime, runtime.worker, signal, () => requestAuthorized?.() === true)
+      if (chat && !context.isActive()) fail('webhook_proposal_unavailable')
       let token
       try { token = await this.tokenFor(record) } catch { fail('invalid_bot_token') }
       if (!validToken(token)) fail('invalid_bot_token')
-      const identity = await this.identify(token)
+      if (chat && token !== context.token) fail('bot_identity_mismatch')
+      const identity = await this.identify(token, signal)
       if (!sameBot(identity, record)) fail('bot_identity_mismatch')
-      const signal = AbortSignal.any([this.lifetime.signal, ...(requestSignal ? [requestSignal] : [])])
       signal.throwIfAborted()
-      const result = await administerWebhooks({ apiBase: this.endpoint, token, fetchImpl: this.fetchImpl,
-        signal, record, conversations: runtime.store.overview().conversations }, input)
+      const writing = input.action === 'chat_approve' || webhookWrites(input.action)
+      let result
+      try {
+        result = chat ? await this.#webhookChat.manage({ ...context, identity }, input)
+          : await administerWebhooks({ apiBase: this.endpoint, token, fetchImpl: this.fetchImpl,
+            signal, record, conversations: runtime.store.overview().conversations }, input)
+      } catch (error) {
+        // An ambiguous direct settings write also invalidates chat approvals:
+        // an upstream rotation is invisible in the webhook metadata version.
+        if (writing && error?.message === 'webhook_outcome_unknown') this.revision = id()
+        throw error
+      }
+      if (writing) this.revision = id()
       signal.throwIfAborted()
-      if (webhookWrites(input.action)) this.revision = id()
       // Deliberately no overview(), persistence, logger, vault writes or worker
       // publication. Only the authenticated HTTP caller gets this result.
       return { accountId, accountRevision: this.revision, ...result }

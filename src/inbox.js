@@ -19,7 +19,7 @@ export class InboxRecovery {
   receive(id, message) {
     // Only authenticated live intake can request a stop. A recovery backlog
     // must not delay this control or apply an old command to a new task.
-    if (message.command === 'stop') return this.accept(id, message)
+    if (message.command === 'stop' || message.webhookChat) return this.accept(id, message)
     if (!this.enabled || !channelSequence(message.messageSeq)) return this.accept(id, message)
     const route = this.store.enrolInbox(message, !this.online)
     if (this.store.inboxSeen(message.messageId)) return

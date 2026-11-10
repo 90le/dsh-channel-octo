@@ -1,23 +1,36 @@
 # Octo IM 能力核对与完整交付方案
 
-核对日期：2026-11-10，目标版本 0.21.0。服务端有接口、机器人有权限、客户端能渲染、插件实际跑通是四种不同证据。通话、文档评论、Loop 后台任务和用户代发是不同权限面。
+核对日期：2026-11-10，目标版本 0.22.0。服务端有接口、机器人有权限、客户端能渲染、插件实际跑通是四种不同证据。通话、文档评论、Loop 后台任务和用户代发是不同权限面。
 
 ## 尚未覆盖的操作与已知限制
 
-当前注册表包含 52 项 User Bot 渠道操作，App Bot 私聊可用其中 11 项。展示卡、获准音频的转写和同步／持久表单另行挂载；每轮实际可用的工具取决于 Bot 类型、频道、宿主工具范围和操作权限。[工具注册表](src/channel-api.js)、[真实客户端验收](IM-CONNECT-PARITY.md)。
+在 0.21 的 52 项 User Bot 渠道操作上新增 10 项，App Bot 私聊可用其中 14 项。展示卡、获准音频的转写、同步与持久表单及条件启用的代发另行挂载；每轮实际可用工具受 Bot 类型、频道、宿主工具范围和操作权限约束。[工具注册表](src/channel-api.js)、[真实客户端验收](IM-CONNECT-PARITY.md)。
 
 | 项目 | 当前边界 |
 | --- | --- |
-| 子区改名、手动取消归档、清空规则 | 审阅的 Bot 路由没有这些操作。子区规则可替换，Bot 的 PUT 拒绝空白；清空使用 Octo 客户端的用户 DELETE。Bot 退出子区已实现，但创建者不能退出自己的子区。 |
+| 子区改名、手动取消归档、清空规则 | 官方 Bot 路由目前没有这些操作。子区规则可替换，Bot 的 PUT 拒绝空白；清空使用 Octo 客户端的用户 DELETE。取消归档与按版本清空规则有独立上游候选补丁，尚未进入正式 Octo。Bot 退出子区已实现，但共享服务禁止创建者退出自己的子区。 |
 | 消息表情反应、置顶、删除／撤回、读取卡片修订历史 | 审阅的服务端路由要求用户会话，插件不借用用户登录态。Bot 编辑自己的消息、标记已读和清理合规展示卡修订已实现。 |
-| Registry 任意模板、原生正文流、代用户发送、不受当前权限范围约束的全局发现 | 未作为模型工具开放。现有展示卡、进度卡、受限目标解析、代理授权检索和 Bot 身份发送各有明确边界。 |
-| 群里直接跨区投递、聊天中创建／轮换 Webhook | 在当前共享群回合不开放。指定子区的文字、文件及展示卡从获准的私聊发起；Webhook 在账号设置创建或轮换，以免一次性密钥进入模型。 |
+| Registry 卡片 | 支持发现、发送和编辑当前部署公布的 octo/v1 展示模板，版本、状态与写入权限均实时核对；不开放任意模板、交互模板或由进度流程管理的推理卡。正式 Bot 当前只公布推理进度模板。 |
+| 原生正文流 | 当前仍用动态进度卡及最终正文。Bot API 有流编号字段，但没有为 Bot 开放创建、增量追加、结束和回读的完整契约；不能把进度卡或 Markdown 分段算成原生正文流。 |
+| 代用户发送、全局发现 | 代发实现为服务端契约已验证且有精确目标白名单时才挂载的工具，需要活跃授权和用户在原私聊卡片确认；正式账号未开启。发现工具仅限 Bot 已验证空间与加入的群、子区元数据；授权检索须指定目标，不提供无范围的全局扫描。 |
+| 共享群回合跨区投递、聊天中创建／轮换 Webhook | 获准工具的用户可直接投递文字、文件或展示卡到同父群的另一活跃子区，双方成员身份和频道配置须匹配。Bot 所有者可在当前群或子区明确 @ 并用 `/webhook create 名称` 或 `/webhook rotate ID` 发起申请；有权限的 DSH 管理员在账号设置核对确认，密钥只在一次性界面显示。 |
 | Bot 间自动协作 | 可明确原生提及经过核验的指定成员；是否触发对方由对方 Bot 决定，不保证形成自动协作循环。群广播只通知人类。 |
 | App Bot 与历史恢复 | App 仍是授权私聊。未知归档子区、App 未知离线会话、服务端已丢失或过期消息没有全量恢复保证。 |
 
 群实测报告的两次 `search_around` 错误并不说明接口整体不可用。0.21 修复了个别相邻消息对操作者不可见时导致整个窗口失败的情况；锚点本身不可见仍拒绝，结果不会越权补齐。待正式环境使用当前子区或群内可见消息的精确 ID 复验。
 
 来源：[Bot 子区路由](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/bot_api.go#L426-L444)、[子区规则写入](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api/threads.go#L303-L352)、[消息用户路由](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/message/api.go#L361-L414)、[锚点查询](https://github.com/Mininglamp-OSS/octo-server/blob/f984d40549f66d56b1e90a048d28315eb12c92df/modules/messages_search/search_around.go#L31-L145)。
+
+## 官方源码分工与 octo-cli 对照
+
+| 官方来源 | 用于核对 |
+| --- | --- |
+| [OpenClaw 渠道](https://github.com/Mininglamp-OSS/openclaw-channel-octo/tree/3cdb7e794ba40ae617fb0215177d1493dd26460a)、[Gateway](https://github.com/Mininglamp-OSS/octo-channel-gateway/tree/a6e661b9c81826b56e79c333949bb1e470dd4d17) | 进度卡、频道绑定、附件、群规则与消息回复；宿主事件输出不等于 Octo Bot 有原生正文流。 |
+| [Runtime](https://github.com/Mininglamp-OSS/octo-runtime/tree/7892ebdf2ed9b1fa859bd51f15da6d7f03c247e2)、[Adapters](https://github.com/Mininglamp-OSS/octo-adapters/tree/a187f0f425926e1d7b92176b1f259a958115a798)、[Lib](https://github.com/Mininglamp-OSS/octo-lib/tree/233dd6fcdda60ccf347811d1e7a069f1e9703bf8) | 宿主事件、渠道 DTO、会话与旧协议辅助方法。以当前服务端路由、身份与部署能力为准；旧机器人应用密钥和内部 IM 接口不能拿来替代 Bot Token。 |
+| [octo-cli 的命令规格](https://github.com/Mininglamp-OSS/octo-cli/tree/fa07e9150ec75d542546006921611144b7268f3b/internal/registry/specs)、[凭据类型](https://github.com/Mininglamp-OSS/octo-cli/blob/fa07e9150ec75d542546006921611144b7268f3b/internal/credential/token.go) | `message/group/thread/bot/file/event` 规格分别列出 10/9/8/6/4/2 项，仍走 Bot 路由。文件签名凭据与事件 ACK 供传输层使用，不向模型披露；`message search groups` 是显式目标的授权检索。Drive、Docs、HTML、Loop、Mail 等有独立身份和授权，不等同 IM 工具。 |
+| [Octo Server](https://github.com/Mininglamp-OSS/octo-server/tree/f984d40549f66d56b1e90a048d28315eb12c92df/modules/bot_api)、[Octo Web](https://github.com/Mininglamp-OSS/octo-web/tree/7ace0e96df36a2c03657178564c182fc23af6e25) | 服务端验证路由和权限，客户端验证渲染和操作。只使用正式部署实际开放的能力。 |
+
+本地 Graphify 图谱用于定位调用和比较桥接实现，包括上表及官方 Codex、Claude Code、Hermes、AgentScope 渠道与 Plugin Lib。图谱仅提取受版本控制的代码，结论以源码及验收为准。
 
 ## 0.20 免 @ 群与子区的目录恢复
 
@@ -150,7 +163,7 @@ Octo Gateway 给子区提供父群与子区两份规则；OpenClaw 和 Codex 渠
 
 规则在消息已通过发送者、频道与 @ 准入之后、每次模型执行之前读取。权限失败、HTTP 404、超时、非法版本、格式不符或超过每份 10 KiB 时，任务标记为 `review`（`rules_…`），不进入模型，也不自动回复。HTTP 200 的空正文是正常状态；空规则快照使旧版本不再作为现行规则。规则通知不触发模型；下一条正常消息读取时生效，不维持磁盘缓存。私聊、已经生成回复待投递的任务不会调用规则接口。
 
-规则以当前 DSH 会话的用户层上下文快照送给模型，不参与宿主系统提示词的变量插值。DSH 可能在本地会话历史保留旧快照；规则删除不是会话历史清理，模型以最新快照为准。子区继承和独立模式使用各自的 DSH 会话，避免切换时把曾读取的父群规则带到独立会话。规则正文不会扩大权限或自动执行操作。管理写入通过独立的 Octo 工具校验，不以规则里的声明授权。
+0.21 起，规则通过当前 Octo 回合的原生 DSH 系统提示附加段进入模型，正文按字面加入，不参与变量插值。极简预设无法使用这段扩展时，回退到本轮输入附加规则。规则变化会重开该模型请求系列，避免继续沿用旧系统段；子区继承和独立模式使用各自的 DSH 会话。规则正文不能授权工具、扩大权限或自动执行操作。Debian 隔离验收已检查实际序列化的系统段、更新、频道隔离与极简回退。
 
 正式验收使用专用群和子区：放置两个不同的无敏感测试规则，验证主区只读父群、默认子区只读本区、继承模式以子区优先。编辑与清空后再发新消息确认生效；移除访问权限后检查模型不执行。再核对私聊和别的子区不受影响。两种官方实现：[Gateway](https://github.com/Mininglamp-OSS/octo-channel-gateway/blob/ec4ac3ed01a3385cf8077c6b3d02c8c7b9b17ad1/packages/gateway/src/transport/contexts.ts)、[OpenClaw](https://github.com/Mininglamp-OSS/openclaw-channel-octo/blob/3cdb7e794ba40ae617fb0215177d1493dd26460a/src/group-md.ts)。
 

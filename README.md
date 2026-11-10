@@ -17,7 +17,7 @@ npm pack --dry-run
 以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.20.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.22.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
@@ -60,6 +60,13 @@ WebSocket 注册占用该 Bot 的连接，同一 Bot 只运行一个消费者。
 需要为测试 profile 设置可用的 DSH 模型。使用独立 Bot，不与其他连接程序同时消费其事件；启用后会确认该 Bot 收到的事件，超出当前支持范围的事件不进入模型。暂停时将 `enabled` 改回 `false` 并按环境流程重载 Web；本地状态和会话保留。
 
 成功确认发送后，本地队列表只保留去重及投递记录，原生 DSH 会话仍保存对话。异常时查看服务中的 `dsh-channel-octo` 日志和状态库 `jobs` 的 `state`、`issue` 字段。对于 `review`，先在 Octo 查实际送达情况；插件不会自动重放不确定的任务或回复。
+
+## 0.22.0
+
+- 获准使用工具的群主区或子区回合，可以向同一父群的另一活跃子区发送文字、文件与展示卡。成员身份和目标频道权限实时核验。
+- Bot 所有者的私聊新增空间成员、已加入群、子区、目标解析和授权范围查询。Registry 卡片工具只使用当前部署公布且可写的展示模板。
+- 群或子区中明确 @ Bot，可用 `/webhook create 名称` 或 `/webhook rotate ID` 发起申请。打开 DSH 账号设置 → 管理 Webhook → 聊天请求，核对并确认。一次性密钥只在该管理页面显示。
+- 代发默认关闭。只有在管理员已验证部署契约、设置 `oboSendContract` 和精确频道白名单、用户授予代发权限后，才可从所有者私聊发起并在卡片内确认。普通聊天文字不能批准代发。
 
 ## 0.21.0
 

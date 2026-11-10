@@ -48,11 +48,11 @@ function checkAccess(authorize) { if (authorize() !== true) throw new Error('oct
 export class QuestionBridge {
   constructor({ api, store, log }) { Object.assign(this, { api, store, log }) }
 
-  async form(form, job, config, signal, onWaiting, authorize = () => true) {
+  async form(form, job, config, signal, onWaiting, authorize = () => true, { cardOnly = false } = {}) {
     checkAccess(authorize)
     if (this.current) throw new Error('octo_question_busy')
     form = structuredClone(form)
-    createCard(form) // Validate the entire form before waiting or sending anything.
+    createCard(form, { literalReview: cardOnly }) // Validate before waiting or sending.
     if (!form.inputs?.length || !form.actions?.length) throw new Error('invalid_card_form')
     const wait = AbortSignal.any([signal, AbortSignal.timeout(15 * 60_000)])
     wait.throwIfAborted()
@@ -61,17 +61,18 @@ export class QuestionBridge {
     const stop = () => response.reject(wait.reason)
     wait.addEventListener('abort', stop, { once: true })
     const active = { key: randomUUID(), form, index: 0, total: 1, sender: job.sender, sessionId: job.session_id,
-      route: { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }, response, ready: false, signal: wait, authorize }
+      route: { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }, response, ready: false, signal: wait, authorize, cardOnly }
     this.current = active
     onWaiting(true)
     try {
       try {
-        const sent = await sendCard(config, { ...active.route, operatorUid: job.sender }, form, wait, authorize)
+        const sent = await sendCard(config, { ...active.route, operatorUid: job.sender }, form, wait, authorize,
+          undefined, { literalReview: cardOnly })
         active.binding = { ...sent.binding, questionKey: active.key, questionTitle: form.title }
         this.store.bindCard(active.binding)
       } catch (error) {
         // An uncertain POST may already be delivered. Never create a second form.
-        if (error?.code !== 'card_profile_unavailable' && !error?.cardNotSent) throw error
+        if (cardOnly || error?.code !== 'card_profile_unavailable' && !error?.cardNotSent) throw error
         for (const line of formInstructions(form).match(/[\s\S]{1,1500}/gu) ?? []) {
           checkAccess(authorize)
           await this.api.send(active.route.channel_id, line, wait, active.route.channel_type)
@@ -189,14 +190,14 @@ export class QuestionBridge {
     }
   }
 
-  match({ sender, channelId, channelType }) {
+  match({ sender, channelId, channelType }, { textOnly = false } = {}) {
     const current = this.current
-    return current?.ready && sender === current.sender && channelId === current.route.channel_id
+    return current?.ready && (!textOnly || !current.cardOnly) && sender === current.sender && channelId === current.route.channel_id
       && channelType === current.route.channel_type ? current : undefined
   }
 
   text(current, input) {
-    if (this.current !== current || !current.ready) return false
+    if (this.current !== current || !current.ready || current.cardOnly) return false
     if (current.form) {
       if (/^(跳过|skip)$/iu.test(input.trim())) return this.completeForm(current, { skipped: true })
       let response
@@ -229,6 +230,12 @@ export class QuestionBridge {
   async rejectCard(current) {
     if (this.current !== current || !current.ready || current.signal.aborted) return
     checkAccess(current.authorize ?? (() => true))
+    if (current.cardOnly) {
+      current.ready = false
+      current.summary = '本次确认格式无效，未执行。请重新发起。'
+      current.response.resolve({ skipped: true })
+      return
+    }
     // Octo deduplicates submits by message/action/operator. Retire this action
     // and explicitly retain the waiting turn for a fresh text answer.
     await this.closeCard(current.binding, '本次卡片答案格式无效，尚未提交。请按随后提示直接回复文字；DSH 仍在等待你的答案。', current.signal)

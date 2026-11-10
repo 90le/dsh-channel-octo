@@ -8,9 +8,11 @@ const path = '/api/dsh-channel-octo'
 const editor = readFileSync(new URL('./account-editor.js', import.meta.url), 'utf8')
 const view = readFileSync(new URL('./account-view.js', import.meta.url), 'utf8')
 const webhookView = readFileSync(new URL('./webhook-view.js', import.meta.url), 'utf8')
-const uiVersion = createHash('sha256').update(editor).update(view).update(webhookView).digest('hex').slice(0, 16)
+const webhookChatView = readFileSync(new URL('./webhook-chat-view.js', import.meta.url), 'utf8')
+const uiVersion = createHash('sha256').update(editor).update(view).update(webhookView).update(webhookChatView).digest('hex').slice(0, 16)
 const modules = new Map([[path + '/account-editor.js', editor],
-  [path + '/webhook-view.js', webhookView],
+  [path + '/webhook-chat-view.js', webhookChatView],
+  [path + '/webhook-view.js', webhookView.replace('./webhook-chat-view.js', './webhook-chat-view.js?v=' + uiVersion)],
   [path + '/account-view.js', view.replace('./account-editor.js', './account-editor.js?v=' + uiVersion)
     .replace('./webhook-view.js', './webhook-view.js?v=' + uiVersion)]])
 const editable = ['senderPolicy', 'channelPolicy', 'mentionPolicy', 'threadRuleMode',
@@ -130,13 +132,23 @@ export function registerWeb(ctx, accounts) {
           const controller = new AbortController()
           const disconnected = () => { if (!res.writableEnded) controller.abort() }
           res.once?.('close', disconnected)
+          if (res.destroyed) disconnected()
+          const rejection = () => {
+            const current = ctx.get('connection')
+            return typeof current?.requestRejection === 'function' ? current.requestRejection(req) : 503
+          }
+          const authorized = () => !controller.signal.aborted && rejection() === undefined
           try {
-            const result = await accounts.manageWebhooks(match[1], input, controller.signal)
+            const result = await accounts.manageWebhooks(match[1], input, controller.signal, authorized)
             // Recheck the host session before disclosing a one-time credential.
-            const rejection = connection.requestRejection(req)
-            if (rejection !== undefined) return send(rejection, { error: 'authentication_required' })
-            if (!controller.signal.aborted) return send(200, result)
-            return
+            if (controller.signal.aborted) return
+            const rejected = rejection()
+            return rejected === undefined ? send(200, result) : send(rejected, { error: 'authentication_required' })
+          } catch (error) {
+            if (controller.signal.aborted) return
+            const rejected = rejection()
+            if (rejected !== undefined) return send(rejected, { error: 'authentication_required' })
+            throw error
           } finally { res.off?.('close', disconnected) }
         }
         if (req.method === 'PUT' && (target === path + '/settings' || match?.[2] === 'settings')) {

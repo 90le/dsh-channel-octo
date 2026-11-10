@@ -6,6 +6,8 @@ import { normalizeOctoContent } from './octo-content.js'
 import { quoteDisplayName } from './octo-quote.js'
 import { parseSafeCommand } from './im-controls.js'
 import { ChannelApi, ChannelApiError } from './channel-api.js'
+import { createOboSend } from './obo-send.js'
+import { parseWebhookChatCommand } from './webhook-chat-command.js'
 import { OctoError, readApiError } from './api-errors.js'
 
 export { OctoError } from './api-errors.js'
@@ -104,10 +106,15 @@ export class OctoClient {
 
   configureChannel(config) {
     const next = validBotIdentity(config)
-      ? new ChannelApi({ config, request: (path, body, signal, options) => this.#request(path, body, signal, options) })
+      ? new ChannelApi({ config, verifyAccount: signal => this.verify(config.botUid, config.spaceId, signal),
+        request: (path, body, signal, options) => this.#request(path, body, signal, options) })
       : undefined
     this.channel?.revoke()
     this.channel = next
+  }
+
+  createOboSender(context) {
+    return createOboSend({ ...context, request: (path, body, signal, options) => this.#request(path, body, signal, options) })
   }
 
   async #request(path, body, signal, { timeout = 15_000, auth = true, method, multipart = false,
@@ -677,6 +684,12 @@ export function admit(event, config) {
   }
   // For a DM the raw channel ID is not necessarily the recipient's UID. Group
   // and topic replies use the original channel address, never the sender UID.
+  const webhookChat = parseWebhookChatCommand(payload.type === 1 ? payload.content : text, {
+    config, sender, channelType, channelId, mention, plain: payload.type === 1 && !attachment && !attachments?.length && !parts,
+  })
+  if (webhookChat?.kind === 'blocked') return
+  if (webhookChat?.kind === 'request') return { messageId, sender, text: '', channelId, channelType, ambient,
+    messageSeq, webhookChat, webhookSentAt: message.timestamp }
   const command = payload.type === 1 ? parseSafeCommand(text, config, {
     routeAllowed: true, channelType, hasAttachments: !!(attachment || attachments?.length || parts), botUid: config.botUid, mention,
     actorApproved: sender === config.ownerUid || config.allowed.has(sender), isBotOwner: sender === config.ownerUid,

@@ -19,6 +19,9 @@ import { InboxRecovery } from './inbox.js'
 import { DirectoryDiscovery } from './directory-discovery.js'
 import { OCTO_STOP } from './im-controls.js'
 import { octoQuoteFromHistory } from './octo-quote.js'
+import { operationAvailable } from './channel-operation-policy.js'
+import { OBO_SEND_CONTRACT, OBO_SEND_TOOL } from './obo-send.js'
+import { webhookChatReceipt } from './webhook-chat-command.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
@@ -118,20 +121,21 @@ const failureDetails = {
 const unknownFailure = '本次回复未完成。请先在 DSH 查看执行状态，再决定是否继续，避免重复操作。'
 
 export class Worker {
-  constructor({ api, store, host, config, log, attach, isArchived }) {
-    Object.assign(this, { api, store, host, config, log, attach, isArchived })
+  constructor({ api, store, host, config, log, attach, isArchived, proposeWebhookChat }) {
+    Object.assign(this, { api, store, host, config, log, attach, isArchived, proposeWebhookChat })
     this.progress = new Progress(api, log)
     this.questions = new QuestionBridge({ api, store, log })
     this.cursor = '0'
     this.steering = new Set()
     this.stopControls = new Set()
     this.inbox = new InboxRecovery({ api, store, log, config: () => this.config,
-      questionKey: message => this.questions.match(message)?.key,
+      questionKey: message => this.questions.match(message, { textOnly: true })?.key,
       accept: (id, message, options) => this.acceptInbound(id, message, options) })
   }
 
   reconfigure(config, host) {
     this.revokeApproval?.()
+    this.oboReview?.abort()
     config.ownerUid = this.config.ownerUid
     this.api.configureChannel?.(config)
     this.config = config
@@ -188,6 +192,27 @@ export class Worker {
   }
 
   acceptInbound(eventId, message, { historical = false, delayed = false, questionKey, appVerified = false } = {}) {
+    if (message.webhookChat) {
+      if (this.stopIntake) return false
+      const first = this.store.rememberAnswer(eventId, message, null)
+      const config = this.config
+      const signal = this.intakeSignal
+      const allowed = () => !!signal && !signal.aborted && !this.stopIntake && !this.paused && config === this.config
+        && config.ownerUid === message.sender && config.groupCommands === 'safe'
+        && permitsRoute(config, message.sender, message.channelType, message.channelId)
+      if (first && !historical && !delayed && this.proposeWebhookChat && allowed()) {
+        const work = Promise.resolve().then(async () => {
+          if (!allowed()) return
+          const outcome = await this.proposeWebhookChat(message, signal)
+          if (outcome?.status === 'pending' && allowed()) {
+            await this.api.send(message.channelId, webhookChatReceipt, signal, message.channelType)
+          }
+        }).catch(() => this.log('webhook_chat_receipt_unconfirmed'))
+          .finally(() => this.stopControls.delete(work))
+        this.stopControls.add(work)
+      }
+      return true
+    }
     if (message.command === 'stop') {
       if (this.stopIntake) return false
       if (this.store.rememberAnswer(eventId, message, null) && !historical && !delayed) this.handleStop(message)
@@ -197,7 +222,7 @@ export class Worker {
       // Persist before the synchronous WS ACK. Serialize live authorization so
       // a question answer or steering input cannot skip the server Space guard.
       if (!channelSequence(message.messageSeq)) return this.store.add(eventId, message)
-      const capturedQuestion = questionKey ?? this.questions.match(message)?.key ?? null
+      const capturedQuestion = questionKey ?? this.questions.match(message, { textOnly: true })?.key ?? null
       this.store.stageInbox(eventId, message, !historical, capturedQuestion)
       const config = this.config
       const work = async () => {
@@ -219,7 +244,8 @@ export class Worker {
       this.appIntake = (this.appIntake ?? Promise.resolve()).then(work, work)
       return this.appIntake
     }
-    const question = !historical && !message.attachment && !message.attachments?.length && !message.command && message.text.trim() && this.questions.match(message)
+    const question = !historical && !message.attachment && !message.attachments?.length && !message.command && message.text.trim()
+      && this.questions.match(message, { textOnly: true })
     if (question && (!delayed && !appVerified || question.key === questionKey) && this.config.toolPermission !== 'text-only'
       && permitsRoute(this.config, message.sender, message.channelType, message.channelId)
       && authorizedTools(this.config, { sender: message.sender, channel_type: message.channelType })) {
@@ -235,6 +261,7 @@ export class Worker {
       && !message.command && !message.parts && !message.attachment && !message.attachments?.length
       && message.text.trim() && this.steering.size < 32) {
       this.steering.add(message.messageId)
+      this.oboReview?.abort()
       this.attemptSteering()
     }
     return true
@@ -707,6 +734,39 @@ export class Worker {
           ] : order
           const authorCard = safeCommand(config, job) && !attachments.length
             && /卡片|\bcard\b/iu.test(input)
+          const availableOperation = spec => operationAvailable(spec, { config, job, channel: sourceChannel, toolsAllowed })
+          const oboActive = () => !signal.aborted && !this.stopIntake && this.currentJob === job
+            && this.config === sourceConfig && this.api.channel === sourceChannel
+            && this.liveToolAllowed(job, sourceConfig) && this.config.toolPermission !== 'read-only'
+          const oboSend = channelType === 1 && !meta.deferredForm && config.botKind !== 'app'
+            && config.ownerUid === job.sender && toolsAllowed && config.toolPermission !== 'read-only'
+            && config.toolPermission !== 'text-only' && config.channelPolicy === 'allowlist'
+            && (config.groups?.size || config.threads?.size) && config.oboSendContract === OBO_SEND_CONTRACT
+            && decimalId(job.message_id) && channelSequence(job.message_seq)
+            && this.api.createOboSender?.({ config: sourceConfig, origin: { ...job, ...route }, signal,
+              verifiedContract: config.oboSendContract, isActive: oboActive,
+              authorize: async active => {
+                await this.liveToolAccess(job, active)
+                await authorizeDelivery({ tool: true }, active)
+                return !active.aborted && oboActive()
+              },
+              confirm: async (review, active) => {
+                if (!oboActive()) throw new Error('octo_access_denied')
+                const controller = new AbortController()
+                this.oboReview = controller
+                try {
+                  const answer = await this.questions.form({
+                    title: '确认以你的 Octo 身份发送',
+                    text: ['发送者：' + review.operatorUid, '目标（频道类型 / ID）：' + review.destination.channel_type
+                      + ' / ' + review.destination.channel_id, '消息原文（JSON 字符串）：', JSON.stringify(review.text)].join('\n'),
+                    inputs: [{ id: 'confirm', kind: 'toggle', label: '我已核对发送者、目标和完整正文', required: true }],
+                    actions: [{ id: 'allow', label: '确认代发' }, { id: 'cancel', label: '取消' }],
+                  }, { ...job, session_id: session.session_id }, sourceConfig, AbortSignal.any([active, controller.signal]),
+                  waiting => progress.trace({ kind: waiting ? 'question-open' : 'question-closed' }), oboActive, { cardOnly: true })
+                  const decision = answer.action === 'allow' && answer.values?.confirm === true ? 'allow' : 'cancel'
+                  return { id: review.id, operatorUid: review.operatorUid, decision }
+                } finally { if (this.oboReview === controller) this.oboReview = undefined }
+              } })
           const run = async () => {
             if (job.directoryRecovery) await authorizeDelivery()
             // A topic mode change can occur while rules or attachments are
@@ -725,19 +785,18 @@ export class Worker {
             }, config.timeoutMs, toolsAllowed,
             { attachments, order: inputOrder, authorCard, channelContext, taskContext: true, onTrace: trace => progress.trace(trace),
               ...((channelType !== 1 || toolsAllowed) && config.toolPermission !== 'text-only' && this.api.channel && { channelTools: {
-                specs: [...operationSpecs.filter(spec => spec.available && this.api.channel.supports?.(spec.name) !== false
-                  && (config.toolPermission !== 'read-only' || !spec.mutating)
-                  && (!spec.requiresFiles || toolsAllowed && config.allowFiles)
-                  && (!spec.privateOnly || channelType === 1)
-                  && (channelType !== 1 ? !spec.name.startsWith('voice.context.')
-                    : spec.name === 'inspect' || spec.name.startsWith('messages.')
-                      || job.sender === config.ownerUid && (spec.name.startsWith('voice.context.')
-                        || ['space.members.search', 'groups.create'].includes(spec.name)))).map(spec => ({
+                specs: [...operationSpecs.filter(availableOperation).map(spec => ({
                   name: 'octo_' + spec.name.replaceAll('.', '_'), description: spec.description, parameters: spec.parameters,
                 })),
-                  displayCardSpec, ...(voice ? [voice.spec] : []), ...(toolsAllowed ? [formToolSpec, ...deferredFormSpecs] : [])],
-                waitNames: toolsAllowed ? [formToolSpec.name] : [],
+                  displayCardSpec, ...(voice ? [voice.spec] : []), ...(toolsAllowed ? [formToolSpec, ...deferredFormSpecs] : []),
+                  ...(oboSend ? [OBO_SEND_TOOL] : [])],
+                waitNames: toolsAllowed ? [formToolSpec.name, ...(oboSend ? [OBO_SEND_TOOL.name] : [])] : [],
                 execute: (name, args, toolSignal, model) => {
+                  if (name === OBO_SEND_TOOL.name && oboSend) return oboSend(args, toolSignal).then(result => {
+                    const receipt = decimalId(result.message_id)
+                    if (receipt) this.store.recordDelivery(job.seq, receipt)
+                    return result
+                  })
                   if (name === 'octo_form_publish') {
                     const detached = structuredClone(args)
                     const publish = () => publishDeferredForm({ config: sourceConfig, store: this.store, job,
@@ -772,15 +831,12 @@ export class Worker {
                     return receipt
                   })()
                   const operation = operationSpecs.find(spec => 'octo_' + spec.name.replaceAll('.', '_') === name)
-                  if (!operation?.available || this.api.channel.supports?.(operation.name) === false
-                    || config.toolPermission === 'read-only' && operation.mutating
-                    || operation.requiresFiles && (!toolsAllowed || !config.allowFiles)
-                    || operation.privateOnly && channelType !== 1) throw new Error('octo_operation_unavailable')
+                  if (!availableOperation(operation)) throw new Error('octo_operation_unavailable')
                   return (async () => {
                     const allowed = () => this.config === sourceConfig && this.api.channel === sourceChannel
                       && this.config.toolPermission !== 'text-only'
                       && (this.config.toolPermission !== 'read-only' || !operation.mutating)
-                      && (!operation.privateOnly || this.liveToolAllowed(job, sourceConfig))
+                      && (!(operation.privateOnly || operation.requiresHostTools) || this.liveToolAllowed(job, sourceConfig))
                       && (!operation.requiresFiles || this.config.allowFiles && this.liveToolAllowed(job, sourceConfig))
                       && permitsRoute(this.config, job.sender, channelType, recipient)
                     const check = async () => {
@@ -790,7 +846,14 @@ export class Worker {
                       }
                     }
                     await check()
-                    const runtime = operation.requiresFiles ? { prepareFile: async (path, authorize, mediaSignal) => {
+                    const runtime = {
+                      ...(operation.sharedTopicSend && channelType !== 1 && { authorizeSharedSend: () => !toolSignal?.aborted && allowed() }),
+                      ...(operation.name.startsWith('cards.registry.') && {
+                        registryActive: () => !toolSignal?.aborted && allowed(),
+                        authorizeRegistry: async active => !active.aborted && allowed()
+                          && await this.api.allowsMessage(sourceConfig, job, active) && !active.aborted && allowed(),
+                      }),
+                      ...(operation.requiresFiles && { prepareFile: async (path, authorize, mediaSignal) => {
                       await check()
                       const file = await readDeliverable(config.cwd, path, mediaSignal)
                       return prepareAttachment(config, file, mediaSignal, { authorize: async () => {
@@ -799,13 +862,14 @@ export class Worker {
                         mediaSignal.throwIfAborted()
                         if (!allowed()) throw new Error('octo_access_denied')
                       } })
-                    } } : undefined
+                    } }) }
                     // A failed/uncertain target tool already supplies a specific
                     // result to DSH. Do not replace its final explanation with
                     // the unrelated "present was not called" heuristic.
                     if (operation.requiresFiles) targetFileAttempted = true
                     const result = await sourceChannel.dispatch(route, job.sender, operation.name, args, toolSignal, runtime)
-                    const acknowledgedTarget = operation.name.startsWith('messages.send_target') && decimalId(result?.message_id)
+                    const acknowledgedTarget = (operation.name.startsWith('messages.send_target') || operation.name === 'cards.registry.send')
+                      && decimalId(result?.message_id)
                     if (acknowledgedTarget) {
                       // Preserve mutation evidence before a later admission
                       // check can throw. A completed send cannot be undone by

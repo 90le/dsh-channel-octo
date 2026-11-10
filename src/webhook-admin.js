@@ -5,7 +5,8 @@ import { apiErrorCode, readApiError } from './api-errors.js'
 
 // Management-only transport. Never registered as a model tool. Contracts pinned
 // to octo-server f984d40549f66d56b1e90a048d28315eb12c92df.
-const fail = code => { throw new Error(code) }
+class WebhookError extends Error {}
+const fail = code => { throw new WebhookError(code) }
 const object = value => value && typeof value === 'object' && !Array.isArray(value)
 const text = (value, max = 4096) => typeof value === 'string' && value.length <= max && !/[\x00-\x1f\x7f]/.test(value)
 const integer = value => Number.isSafeInteger(value) && value >= 0
@@ -18,6 +19,7 @@ export const webhookErrors = {
   invalid_webhook_request: 400, webhook_forbidden: 403, webhook_disabled: 403,
   webhook_not_found: 404, webhook_conflict: 409, webhook_changed: 409,
   webhook_rate_limited: 429, webhook_unavailable: 502, webhook_outcome_unknown: 502,
+  webhook_proposal_unavailable: 409,
 }
 export function validateWebhookInput(input) {
   if (!object(input) || Object.keys(input).some(key => !['revision', 'action', 'route', 'webhookId', 'changes', 'expected', 'confirmed', 'limit', 'page'].includes(key))
@@ -82,7 +84,7 @@ function transport({ apiBase, token, fetchImpl = fetch, signal }) {
       const requestSignal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(8000)])
       requestSignal.throwIfAborted()
       const response = await fetchImpl(base + path, {
-        method, redirect: 'manual', signal: requestSignal,
+        method, redirect: 'manual', cache: 'no-store', signal: requestSignal,
         headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
         ...(body !== undefined && { body: JSON.stringify(body) }),
       })
@@ -121,7 +123,7 @@ function transport({ apiBase, token, fetchImpl = fetch, signal }) {
       if (response.status !== 200) throw Error()
       return data
     } catch (error) {
-      if (Object.hasOwn(webhookErrors, error?.message)) throw error
+      if (error instanceof WebhookError) throw error
       fail(writing ? 'webhook_outcome_unknown' : 'webhook_unavailable')
     } finally { try { Promise.resolve(reader?.cancel()).catch(() => {}) } catch {} }
   }
@@ -145,7 +147,7 @@ function metadata(value, scope) {
 }
 
 function secretResult(value, webhook, apiBase) {
-  if (!/^[a-f0-9]{64}$/.test(value.token ?? '') || !object(value.urls) || !Array.isArray(value.adapter_examples)) throw Error()
+  if (typeof value.token !== 'string' || !/^[a-f0-9]{64}$/.test(value.token) || !object(value.urls) || !Array.isArray(value.adapter_examples)) throw Error()
   const prefix = '/v1/incoming-webhooks/' + webhook.webhook_id + '/' + value.token
   if (value.url !== prefix) throw Error()
   const base = endpointOf(apiBase)
@@ -171,8 +173,11 @@ function secretResult(value, webhook, apiBase) {
   return { token: value.token, url: base + prefix, urls, adapter_examples: examples }
 }
 
-export async function administerWebhooks(context, input) {
+// Trusted server-only option, never derived from account HTTP or model input.
+// The standard management UI continues to act as the authenticated DSH admin.
+export async function administerWebhooks(context, input, chat) {
   validateWebhookInput(input)
+  if (chat && !['list', 'create', 'regenerate'].includes(input.action)) fail('invalid_webhook_request')
   const request = transport(context)
   const { record, conversations = [] } = context
   try {
@@ -192,8 +197,9 @@ export async function administerWebhooks(context, input) {
       return { routes: [...routes.values()] }
     }
     const scope = routeOf(input.route)
-    const group = joined.find(group => group.group_no === scope.group)
-    if (!group) fail('webhook_forbidden')
+    const matches = joined.filter(group => group.group_no === scope.group)
+    if (matches.length !== 1) fail('webhook_forbidden')
+    const [group] = matches
     const groupPath = '/v1/bot/groups/' + encodeURIComponent(scope.group)
     const base = groupPath + (scope.thread ? '/threads/' + encodeURIComponent(scope.thread) : '') + '/incoming-webhooks'
     // The authoritative management list rechecks internal active membership and
@@ -203,10 +209,29 @@ export async function administerWebhooks(context, input) {
     const list = current.list.map(item => metadata(item, scope))
     if (new Set(list.map(item => item.webhook_id)).size !== list.length) throw Error()
     // Existing scoped webhooks remain cleanable even after a thread is deleted.
-    // For an empty selection or creation, verify the actual discovered thread.
-    if (scope.thread && (input.action === 'create' || input.action === 'list' && !list.length)) {
+    // For a chat request, empty selection or creation, verify the actual thread.
+    if (scope.thread && (chat || input.action === 'create' || input.action === 'list' && !list.length)) {
       const thread = await request(groupPath + '/threads/' + encodeURIComponent(scope.thread))
-      if (thread?.group_no !== scope.group || thread.short_id !== scope.thread || ![1, 2].includes(thread.status)) fail('webhook_not_found')
+      if (thread?.group_no !== scope.group || thread.short_id !== scope.thread || ![1, 2].includes(thread.status)
+        || chat && (thread.status !== 1 || thread.channel_type !== 5 || thread.channel_id !== input.route.address)) fail('webhook_not_found')
+    }
+    if (chat) {
+      if (!validUid(chat.ownerUid) || chat.ownerUid === record.botUid) fail('webhook_forbidden')
+      const detail = await request(groupPath)
+      if (detail?.group_no !== scope.group || detail.status !== 1) fail('webhook_forbidden')
+      const owner = await request('/v1/bot/space/principals/' + encodeURIComponent(chat.ownerUid) + '?space_id=' + encodeURIComponent(record.spaceId))
+      if (owner?.uid !== chat.ownerUid || owner.principal_type !== 'human') fail('webhook_forbidden')
+      const members = await request(groupPath + '/members')
+      if (!Array.isArray(members)) throw Error()
+      const human = members.filter(row => row?.uid === chat.ownerUid)
+      const bot = members.filter(row => row?.uid === record.botUid)
+      const admin = row => [1, 2].includes(row?.role)
+      if (human.length !== 1 || human[0].robot !== 0 || !admin(human[0]) || bot.length !== 1 || bot[0].robot !== 1) fail('webhook_forbidden')
+      const selected = chat.selected ?? input.webhookId
+      const item = selected && list.find(row => row.webhook_id === selected)
+      if (selected && !item) fail('webhook_not_found')
+      if (item && item.creator_uid !== record.botUid && !admin(bot[0])) fail('webhook_forbidden')
+      if (input.action === 'list') return item ? { webhook: item } : {}
     }
     if (input.action === 'threads') {
       if (scope.thread) fail('invalid_webhook_request')
@@ -242,6 +267,7 @@ export async function administerWebhooks(context, input) {
     const method = input.action === 'update' ? 'PUT' : input.action === 'delete' ? 'DELETE' : 'POST'
     const suffix = ['regenerate', 'test'].includes(input.action) ? '/' + input.action : ''
     const body = ['create', 'update'].includes(input.action) ? changesOf(input.changes, input.action) : undefined
+    if (chat && chat.canWrite?.() !== true) fail('webhook_proposal_unavailable')
     const result = await request(target + suffix, method, body)
     // Once submitted, invalid success bodies are ambiguous too: never replay.
     try {
@@ -258,7 +284,7 @@ export async function administerWebhooks(context, input) {
       return { webhook, ...(['create', 'regenerate'].includes(input.action) && { secret: secretResult(result, webhook, context.apiBase) }) }
     } catch { fail('webhook_outcome_unknown') }
   } catch (error) {
-    if (Object.hasOwn(webhookErrors, error?.message)) throw error
+    if (error instanceof WebhookError) throw error
     fail('webhook_unavailable')
   }
 }

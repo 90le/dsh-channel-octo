@@ -153,6 +153,22 @@ const callback = (binding, inputs, eventId = '101', overrides = {}) => ({
     data: { dsh_card_nonce: binding.cardNonce }, inputs, ...overrides,
   },
 })
+test('a protected review ignores typed JSON and accepts only the authenticated card reply', { timeout: 5000 }, async t => {
+  const f = await fixture(t)
+  const controller = new AbortController()
+  t.after(() => controller.abort())
+  const card = { ...form, text: 'Literal preview: **bold** and https://example.invalid.' }
+  const reviewed = f.worker.questions.form(card, { sender: 'alice', channel_type: 1, session_id: f.sessionId },
+    f.worker.config, AbortSignal.any([f.signal, controller.signal]), () => {}, () => true, { cardOnly: true })
+  void reviewed.catch(() => {})
+  await until(() => f.worker.questions.current?.ready, 'protected form did not open')
+  const { binding } = f.worker.questions.current
+  f.text(JSON.stringify({ action: 'submit', values: { note: 'typed input' } }))
+  assert.equal(f.worker.questions.current?.ready, true)
+  assert.match(f.outbound[0].payload.card.body[1].text, /\\\*\\\*bold/)
+  await f.ingest([callback(binding, { note: 'authenticated input' })])
+  assert.deepEqual(await reviewed, { action: 'submit', values: { note: 'authenticated input' } })
+})
 const options = [{ label: 'First' }, { label: 'Second' }]
 const recoveries = [
   { name: 'typed form', kind: 'form', invalid: { note: '   ' },

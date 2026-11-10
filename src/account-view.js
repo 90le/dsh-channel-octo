@@ -269,11 +269,19 @@ export function createAccountView(React, primitives, { request, status, label })
       account && account.botKind !== 'app' && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
         perform: action => perform('POST', endpoint(account.id) + '/commands', { action, revision: revision.current }) }),
       account && account.botKind !== 'app' && h(WebhookView, { accountId: account.id, accountLabel: account.label, lang, busy, disabled: !data.canManage || !account.config,
+        chatEnabled: account.enabled && account.groupCommands === 'safe' && !!account.permission
+          && !['text-only', 'read-only'].includes(account.permission) && account.config?.apiBase?.startsWith('https:'),
         perform: async (input, signal) => {
-          const result = await request(endpoint(account.id) + '/webhooks', {
-            method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
-            body: JSON.stringify({ ...input, revision: revision.current }),
-          })
+          let result
+          try {
+            result = await request(endpoint(account.id) + '/webhooks', {
+              method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
+              body: JSON.stringify({ ...input, revision: revision.current }),
+            })
+          } catch (error) {
+            if (!signal.aborted && ['webhook_outcome_unknown', 'account_changed'].includes(error?.message)) refresh()
+            throw error
+          }
           if (!signal.aborted && result.accountId === account.id) {
             revision.current = result.accountRevision
             // Refresh ordinary account metadata separately; the protected result

@@ -23,11 +23,12 @@ test('headless development page: both languages, secret lifetime, confirmations 
       const Widget = createWebhookView(React, { Button });
       let nextId = 0;
       const framework = {...React,useId:()=>React.useRef('fixture-'+(++nextId)).current};
-      const account = {id:'legacy',label:'Octo Bot',legacy:true,enabled:false,config:{},botUid:'fixture-bot',spaceId:'fixture-space',cwd:'C:/fixture'};
+      const account = {id:'legacy',label:'Octo Bot',legacy:true,enabled:true,groupCommands:'safe',permission:'ask',
+        config:{apiBase:'https://octo.invalid'},botUid:'fixture-bot',spaceId:'fixture-space',cwd:'C:/fixture'};
       const AccountView = createAccountView(framework,{Button,Input:'input',Switch:()=>null},{
         status:()=>React.createElement('span',null,'Fixture'),label:()=>'',
         request:async(suffix,options)=>{
-          if(suffix==='/account-options') return {workspaces:[{path:'C:/fixture',title:'Octo'}],models:[],policies:[{id:'text-only',label:'Text only'}],presets:[]};
+          if(suffix==='/account-options') return {workspaces:[{path:'C:/fixture',title:'Octo'}],models:[],policies:[{id:'text-only',label:'Text only'},{id:'ask',label:'Ask'}],presets:[]};
           const response = await fetch('/api/dsh-channel-octo'+suffix,options);
           const body = await response.json(); if(!response.ok) throw Error(body.error); return body;
         }
@@ -103,6 +104,61 @@ test('headless development page: both languages, secret lifetime, confirmations 
         await mock.dispose(); await page.close()
       })
     }
+    await t.test('chat proposals mount in account settings, require confirmation, and clear the secret on close', async () => {
+      const page = await browser.newPage()
+      page.setDefaultTimeout(5000)
+      try {
+        const group = '00112233445566778899aabbccddeeff', webhookId = 'iwh_' + 'a'.repeat(32)
+        const fixtureSecret = 'c'.repeat(64), fixtureUrl = 'https://octo.invalid/v1/incoming-webhooks/' + webhookId + '/' + fixtureSecret
+        const proposal = { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', action: 'regenerate',
+          route: { type: 5, address: group + '____123456789012345678' }, webhookId, name: 'CI fixture', expiresAt: Date.now() + 300000 }
+        let pending = true, revision = 'fixture-revision'
+        const requests = []
+        await page.route('**/api/dsh-channel-octo/accounts/legacy/webhooks', async route => {
+          const req = route.request(), input = req.postDataJSON()
+          assert.equal(req.headers()['x-dsh-octo-client'], '1')
+          assert.equal(input.revision, revision)
+          requests.push(input)
+          let result
+          if (input.action === 'chat_pending') result = { proposals: pending ? [proposal] : [] }
+          else {
+            assert.deepEqual(input, { action: 'chat_approve', proposalId: proposal.id, confirmed: true, revision })
+            assert.equal(pending, true)
+            pending = false
+            revision = 'confirmed-revision'
+            result = { webhook: { webhook_id: webhookId }, secret: { token: fixtureSecret, url: fixtureUrl } }
+          }
+          await route.fulfill({ json: { accountId: 'legacy', accountRevision: revision, ...result } })
+        })
+        await page.goto(base + '/?account=1&lang=en')
+        await page.getByRole('button', { name: 'Settings · Octo Bot', exact: true }).click()
+        const manage = page.getByRole('button', { name: 'Manage webhooks', exact: true })
+        await manage.click()
+        const manager = page.locator('dialog.dsho-webhook-modal[open]')
+        const chat = manager.getByRole('region', { name: 'Chat requests', exact: true })
+        await chat.getByRole('button', { name: 'Load chat requests' }).click()
+        await chat.getByRole('button', { name: 'Review request' }).click()
+        const review = chat.getByRole('group', { name: 'Review request' })
+        await review.getByText(new RegExp(proposal.route.address)).waitFor()
+        await review.getByText(/invalidates the old push URLs/).waitFor()
+        assert.deepEqual(requests.map(input => input.action), ['chat_pending'])
+        assert.ok(!(await manager.innerText()).includes(fixtureSecret))
+        await review.getByRole('button', { name: 'Confirm and execute' }).click()
+        const masked = manager.locator('.dsho-webhook-secret')
+        await masked.waitFor()
+        assert.ok(!(await masked.innerText()).includes(fixtureSecret))
+        await manager.getByRole('button', { name: 'Reveal secrets and setup' }).click()
+        assert.ok((await masked.innerText()).includes(fixtureUrl))
+        assert.equal(await manager.locator('.dsho-webhook-list').count(), 0, 'chat result never becomes a manual route row')
+        await page.keyboard.press('Escape')
+        await manager.waitFor({ state: 'detached' })
+        assert.ok(!(await page.locator('body').innerText()).includes(fixtureSecret))
+        await manage.click()
+        await chat.getByRole('button', { name: 'Load chat requests' }).click()
+        await chat.getByText('There are no pending chat requests for this account.').waitFor()
+        assert.deepEqual(requests.map(input => input.action), ['chat_pending', 'chat_approve', 'chat_pending'])
+      } finally { await page.close() }
+    })
     await t.test('account switch and unmount clear secrets and discard in-flight responses', async () => {
       const page = await browser.newPage()
       page.setDefaultTimeout(5000)

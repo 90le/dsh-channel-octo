@@ -1,3 +1,5 @@
+import { createWebhookChatView, webhookProposalUnavailable } from './webhook-chat-view.js'
+
 const captions = {
   title: ['传入 Webhook', 'Incoming webhooks'], open: ['管理 Webhook', 'Manage webhooks'], close: ['关闭并清除密钥', 'Close and clear secrets'],
   policy: ['以当前 Bot 身份管理；Octo 实时校验成员与管理员权限。头像仅群管理员可改。', 'Manage as this bot. Octo checks current membership and management permissions. Only group administrators can change avatars.'],
@@ -31,6 +33,7 @@ const captions = {
   webhook_not_found: ['目标已不存在或不属于此频道。', 'The target is missing or does not belong to this channel.'],
   webhook_conflict: ['已达配额或创建者已退群，请核对后再操作。', 'Quota reached or the creator left the group. Check before continuing.'],
   webhook_changed: ['配置已变化，请刷新后重新确认。', 'Configuration changed. Refresh and confirm again.'],
+  webhook_proposal_unavailable: webhookProposalUnavailable,
   account_changed: ['账号设置已变化，请关闭并重新打开设置。', 'Account settings changed. Close and reopen settings.'],
   account_transition: ['账号正在切换连接，请稍后再操作。', 'The account is changing its connection. Try again shortly.'],
   webhook_rate_limited: ['请求过于频繁，请稍后手动刷新。', 'Rate limited. Refresh manually later.'],
@@ -89,10 +92,11 @@ dialog.dsho-webhook-modal[open] {
 
 export function createWebhookView(React, { Button }) {
   const { createElement: h, useEffect, useRef, useState } = React
+  const ChatRequests = createWebhookChatView(React, { Button })
   const talk = lang => key => (captions[key] || captions.failure)[lang === 'zh' ? 0 : 1]
   const routeKey = route => route ? route.type + ':' + route.address : ''
 
-  function Panel({ accountId, accountLabel, lang, disabled, busy, perform, close }) {
+  function Panel({ accountId, accountLabel, lang, disabled, busy, perform, close, chatEnabled }) {
     const tr = talk(lang)
     const [routes, setRoutes] = useState([]), [route, setRoute] = useState(null)
     const [list, setList] = useState(null), [working, setWorking] = useState(false)
@@ -197,6 +201,9 @@ export function createWebhookView(React, { Button }) {
         list && button('create', () => edit(null))),
       working && h('p', { role: 'status' }, tr('loading')),
       notice && h('p', { role: notice.error ? 'alert' : 'status', className: notice.error ? 'dsho-alert' : 'dsho-account-note' }, notice.text),
+      chatEnabled && !route && h(ChatRequests, { lang, blocked, request,
+        // A chat receipt is not a row for the manual manager's selected route.
+        onComplete: ({ secret: issued }) => completed({ secret: issued }) }),
       list?.length === 0 && h('p', null, tr('empty')),
       draft && h('div', { ref: detail, tabIndex: -1, className: 'dsho-webhook-detail' },
         h('h3', null, tr(draft.original ? 'edit' : 'create')),

@@ -5,8 +5,11 @@ import { basename, dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Readable } from 'node:stream'
 import { Accounts } from '../src/accounts.js'
+import { Worker } from '../src/worker.js'
+import { admit } from '../src/octo.js'
 import { registerWeb } from '../src/web.js'
 import { administerWebhooks } from '../src/webhook-admin.js'
+import { webhookChatReceipt } from '../src/webhook-chat-command.js'
 import { createAccountView } from '../src/account-view.js'
 
 const group = '00112233445566778899aabbccddeeff'
@@ -16,7 +19,7 @@ const threadRoute = { type: 5, address: group + '____' + thread }
 const hookId = 'iwh_' + 'a'.repeat(32)
 const token = 'bf_synthetic_webhook_bot'
 const secret = 'b'.repeat(64)
-const botUid = 'fixture-bot', spaceId = 'fixture-space'
+const botUid = 'fixture-bot', spaceId = 'fixture-space', ownerUid = 'fixture-owner'
 const path = '/v1/bot/groups/' + group + '/incoming-webhooks'
 const hook = (extra = {}) => ({ webhook_id: hookId, group_no: group, name: 'Fixture hook', avatar: '', creator_uid: botUid,
   status: 1, allow_mention_all: 0, allow_mention_bots: 0, mention_uids: ['fixture-person'],
@@ -39,13 +42,21 @@ function server() {
     assert.equal(parsed.origin, 'https://octo.invalid')
     if (endpoint === '/v1/auth/verify-bot') {
       return Response.json({ bot_uid: state.botUid || (JSON.parse(init.body).bot_token === 'bf_second' ? 'second-bot' : botUid),
-        space_id: spaceId, owner_uid: 'fixture-owner' })
+        space_id: spaceId, owner_uid: state.ownerUid ?? ownerUid })
     }
     assert.equal(init.headers.Authorization, 'Bearer ' + token)
+    if (endpoint === '/v1/bot/sendMessage') return Response.json({ message_id: '9001' })
     if (endpoint.startsWith('/v1/bot/space/principals/')) return state.space
-      ? Response.json({ uid: botUid, principal_type: 'user_bot' }) : errorResponse('err.server.bot_api.user_not_found', 404)
+      ? Response.json(endpoint.endsWith('/' + ownerUid) ? { uid: ownerUid, principal_type: 'human' }
+        : { uid: botUid, principal_type: 'user_bot' }) : errorResponse('err.server.bot_api.user_not_found', 404)
     if (endpoint === '/v1/bot/groups') return Response.json([{ group_no: group, name: 'Fixture group', space_id: state.spaceId || spaceId }])
-    if (endpoint === '/v1/bot/groups/' + group + '/threads/' + thread) return Response.json({ group_no: group, short_id: thread, status: state.threadStatus, name: 'Thread' })
+    if (endpoint === '/v1/bot/groups/' + group) return Response.json({ group_no: group, status: 1 })
+    if (endpoint === '/v1/bot/groups/' + group + '/members') {
+      await state.onMembers?.()
+      return Response.json([{ uid: ownerUid, robot: 0, role: 1 }, { uid: botUid, robot: 1, role: 0 }])
+    }
+    if (endpoint === '/v1/bot/groups/' + group + '/threads/' + thread) return Response.json({ group_no: group, short_id: thread,
+      status: state.threadStatus, name: 'Thread', channel_type: 5, channel_id: threadRoute.address })
     if (endpoint === '/v1/bot/groups/' + group + '/threads') return Response.json({ count: 101, list: [{ group_no: group, short_id: thread, status: 1, name: 'Thread' }] })
     const base = endpoint.includes('/threads/') ? '/v1/bot/groups/' + group + '/threads/' + thread + '/incoming-webhooks' : path
     const item = endpoint.includes('/threads/') ? { ...state.item, thread_short_id: thread } : state.item
@@ -66,7 +77,9 @@ function server() {
     }
     assert.equal(endpoint, base, 'synthetic transport rejects any unexpected destination')
     assert.equal(init.method, 'POST')
-    return Response.json(created({ ...item, ...JSON.parse(init.body) }))
+    const changes = JSON.parse(init.body)
+    for (const key of ['allow_mention_all', 'allow_mention_bots']) if (key in changes) changes[key] = Number(changes[key])
+    return Response.json(created({ ...item, ...changes }))
   }
   const context = { apiBase: 'https://octo.invalid/api', token, fetchImpl, signal: new AbortController().signal,
     record: { botUid, spaceId }, conversations: [{ ...threadRoute }, { type: 1, address: 'private-user' }] }
@@ -225,23 +238,39 @@ test('Go Unicode name trimming and signed int64 boundaries match official contra
   assert.deepEqual((await run(mutation('test', item))).test, { message_id: '0' })
 })
 
-async function fixture(t) {
+async function fixture(t, active = false) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-octo-webhook-'))
   const secrets = new Map(), logs = [], upstream = server()
   const accounts = new Accounts({ logger: () => ({ info: (...args) => logs.push(args), error: (...args) => logs.push(args) }),
     get: name => name === 'credentials' ? { set: async (key, value) => secrets.set(key, value),
-      resolve: async key => ({ value: secrets.get(key) }), unset: async key => secrets.delete(key) } : undefined,
-  }, { apiBase: upstream.context.apiBase, stateDir: root, cwd: root }, { env: {}, fetchImpl: upstream.context.fetchImpl })
-  accounts.start = runtime => { runtime.status = 'disabled' }
+      resolve: async key => ({ value: secrets.get(key) }), unset: async key => secrets.delete(key) }
+      : name === 'permissionPresets' ? { names: ['ask'] } : undefined,
+  }, { apiBase: upstream.context.apiBase, stateDir: root, cwd: root, hostPermissions: ['ask'] }, { env: {}, fetchImpl: upstream.context.fetchImpl })
+  const started = Promise.withResolvers()
+  if (active) {
+    t.mock.method(Worker.prototype, 'run', async function (signal) {
+      this.config.ownerUid = ownerUid
+      this.intakeSignal = signal
+      started.resolve()
+      await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+    })
+  } else accounts.start = runtime => { runtime.status = 'disabled' }
   t.after(async () => {
     await accounts.dispose()
     assert.equal(dirname(root), tmpdir()); assert.ok(basename(root).startsWith('dsh-octo-webhook-'))
     rmSync(root, { recursive: true, force: true })
   })
   await accounts.initialize()
-  const saved = await accounts.save(null, { revision: accounts.revision, account: { token, label: 'Synthetic', cwd: root, enabled: false } })
+  const saved = await accounts.save(null, { revision: accounts.revision, account: { token, label: 'Synthetic', cwd: root, enabled: active,
+    ...(active && { permission: 'ask', groupCommands: 'safe' }) } })
+  const runtime = accounts.runtimes.get(saved.accountId)
+  if (active) {
+    await started.promise
+    await accounts.saveRules(saved.accountId, { revision: runtime.settings.revision(),
+      settings: { allowedGroupIds: [route.address], allowedThreadIds: [threadRoute.address] } })
+  }
   upstream.calls.length = 0
-  return { accounts, id: saved.accountId, root, secrets, logs, ...upstream }
+  return { accounts, id: saved.accountId, runtime, root, secrets, logs, ...upstream }
 }
 
 test('account management secrets are request-local, never overview, vault, disk, log or sequencing-promise results', async t => {
@@ -280,12 +309,13 @@ test('account revisions, transitions, identity switching and duplicate submits i
 function web(accounts, rejection = req => req.headers.authorization === 'fixture-manager-session' ? undefined : 401) {
   let handler
   registerWeb({ get: () => ({ requestRejection: rejection }), webServer: { register(route) { handler = route.handler } } }, accounts)
-  return async ({ id = 'legacy', method = 'POST', headers = {}, body = {}, suffix = '/webhooks', raw } = {}) => {
+  return async ({ id = 'legacy', method = 'POST', headers = {}, body = {}, suffix = '/webhooks', raw, url } = {}) => {
     const req = Readable.from([Buffer.from(raw ?? JSON.stringify(body))])
-    Object.assign(req, { method, url: '/api/dsh-channel-octo/accounts/' + id + suffix,
+    Object.assign(req, { method, url: url ?? '/api/dsh-channel-octo/accounts/' + id + suffix,
       headers: { authorization: 'fixture-manager-session', 'content-type': 'application/json', 'x-dsh-octo-client': '1', ...headers } })
     let status, responseHeaders, data
-    await handler(req, { writeHead(code, fields) { status = code; responseHeaders = fields }, end(value) { data = JSON.parse(value) } })
+    await handler(req, { writeHead(code, fields) { status = code; responseHeaders = fields },
+      end(value) { data = responseHeaders['Content-Type'].startsWith('application/javascript') ? value : JSON.parse(value) } })
     return { status, headers: responseHeaders, data }
   }
 }
@@ -314,6 +344,142 @@ test('HTTP rechecks session revocation before releasing a newly created secret',
     body: { revision: accounts.revision, action: 'create', route, changes: {} } })
   assert.equal(response.status, 401)
   assert.doesNotMatch(JSON.stringify(response), new RegExp(secret))
+})
+
+function chatMessage(target = route, command = { kind: 'request', action: 'create', name: 'CI fixture' }) {
+  return { sender: ownerUid, channelType: target.type, channelId: target.address, ambient: false,
+    webhookSentAt: Math.floor(Date.now() / 1000), webhookChat: command }
+}
+
+test('the real Accounts host and authenticated HTTP route hand off chat creation and rotation once', async t => {
+  const { accounts, id, runtime, root, secrets, logs, calls } = await fixture(t, true)
+  const disk = readFileSync(join(root, 'accounts.json'), 'utf8'), vault = [...secrets]
+  const invoke = web(accounts)
+  const { worker, store } = runtime
+  const propose = message => worker.proposeWebhookChat(message, new AbortController().signal)
+  const send = (action, fields = {}, options = {}) => invoke({ id, body: { revision: accounts.revision, action, ...fields }, ...options })
+  const writes = () => calls.filter(c => c.init.method === 'POST' && c.url.includes('/incoming-webhooks'))
+  const hidden = data => assert.doesNotMatch(JSON.stringify(data), new RegExp(secret + '|/v1/incoming-webhooks/'))
+  assert.deepEqual(await propose({ ...chatMessage(), sender: 'not-the-owner' }), { status: 'ignored' })
+  assert.equal(calls.length, 0)
+  let seq = 0
+  const inbound = (target, content) => {
+    const messageId = String(++seq)
+    return admit({ message: { message_id: messageId, message_seq: seq, from_uid: ownerUid, channel_id: target.address,
+      channel_type: target.type, timestamp: Math.floor(Date.now() / 1000), payload: { type: 1, content, mention: { uids: [botUid] } } } }, worker.config)
+  }
+  const recovered = inbound(route, '/webhook create Recovered fixture')
+  assert.equal(worker.acceptInbound('history:' + recovered.messageId, recovered, { historical: true }), true)
+  assert.deepEqual((await send('chat_pending')).data.proposals, [])
+  assert.equal(inbound(route, '/webhook create ' + secret), undefined)
+  for (const target of [route, threadRoute]) {
+    const rotation = target.type === 5
+    const command = rotation ? '/webhook rotate ' + hookId : '/webhook create CI fixture'
+    const message = inbound(target, command)
+    assert.equal(message.text, '')
+    worker.inbox.receive('ws:' + message.messageId, message)
+    worker.inbox.receive('duplicate:' + message.messageId, message)
+    await Promise.all([...worker.stopControls])
+    const stored = store.db.prepare('SELECT input, state FROM jobs WHERE message_id = ?').get(message.messageId)
+    assert.equal(stored.input, '')
+    assert.equal(stored.state, 'ignored')
+    const receipts = calls.filter(call => call.url.endsWith('/v1/bot/sendMessage'))
+    assert.equal(receipts.length, Number(rotation) + 1)
+    assert.deepEqual(JSON.parse(receipts.at(-1).init.body), { channel_id: target.address, channel_type: target.type,
+      payload: { type: 1, content: webhookChatReceipt } })
+    const list = await send('chat_pending')
+    assert.equal(list.status, 200)
+    assert.equal(list.data.accountId, id)
+    assert.equal(list.data.proposals.length, 1)
+    const [proposal] = list.data.proposals
+    assert.deepEqual(proposal.route, target)
+    hidden(list.data)
+    const fields = { proposalId: proposal.id, confirmed: true }
+    await assert.rejects(accounts.manageWebhooks(id, { revision: accounts.revision, action: 'chat_approve', ...fields }),
+      { message: 'webhook_proposal_unavailable' })
+    assert.equal((await send('chat_approve', fields, { headers: { authorization: '' } })).status, 401)
+    assert.equal((await send('chat_approve', fields, { headers: { 'sec-fetch-site': 'cross-site' } })).status, 403)
+    assert.equal(writes().length, Number(rotation))
+    const revision = accounts.revision
+    const both = await Promise.all([send('chat_approve', fields), send('chat_approve', fields)])
+    assert.deepEqual(both.map(response => response.status).sort(), [200, 409])
+    const issued = both.find(response => response.status === 200)
+    assert.equal(issued.headers['Cache-Control'], 'no-store')
+    assert.equal(issued.data.secret.token, secret)
+    assert.equal(issued.data.accountRevision, accounts.revision)
+    assert.notEqual(issued.data.accountRevision, revision)
+    assert.equal(writes().length, Number(rotation) + 1)
+    assert.equal(writes().at(-1).url, 'https://octo.invalid/api' + (rotation
+      ? '/v1/bot/groups/' + group + '/threads/' + thread + '/incoming-webhooks/' + hookId + '/regenerate' : path))
+    hidden(both.find(response => response.status === 409))
+  }
+  hidden((await invoke({ method: 'GET', url: '/api/dsh-channel-octo' })).data)
+  hidden(logs)
+  assert.equal(await accounts.ops, undefined)
+  assert.equal(readFileSync(join(root, 'accounts.json'), 'utf8'), disk)
+  assert.deepEqual([...secrets], vault)
+})
+
+test('chat confirmation rechecks the web session at submission and disclosure; unknown writes invalidate pending approval', async t => {
+  const { accounts, id, runtime, state, calls } = await fixture(t, true)
+  let signedIn = true
+  const invoke = web(accounts, () => signedIn ? undefined : 401)
+  const send = (action, fields = {}) => invoke({ id, body: { revision: accounts.revision, action, ...fields } })
+  const queue = async () => {
+    assert.deepEqual(await runtime.worker.proposeWebhookChat(chatMessage(), new AbortController().signal), { status: 'pending' })
+    return { proposalId: (await send('chat_pending')).data.proposals[0].id, confirmed: true }
+  }
+  const writes = () => calls.filter(c => c.init.method === 'POST' && c.url.includes('/incoming-webhooks')).length
+  const revokedBefore = await queue()
+  const before = accounts.revision
+  state.onMembers = () => { signedIn = false }
+  assert.equal((await send('chat_approve', revokedBefore)).status, 401)
+  assert.equal(writes(), 0)
+  assert.equal(accounts.revision, before)
+  state.onMembers = undefined
+  signedIn = true
+  assert.equal((await send('chat_approve', revokedBefore)).status, 409)
+  const revokedAfter = await queue()
+  state.response = () => { signedIn = false; return Response.json(created(hook())) }
+  const withheld = await send('chat_approve', revokedAfter)
+  assert.equal(withheld.status, 401)
+  assert.doesNotMatch(JSON.stringify(withheld), new RegExp(secret))
+  assert.equal(writes(), 1)
+  assert.notEqual(accounts.revision, before)
+  signedIn = true
+  assert.equal((await send('chat_approve', revokedAfter)).status, 409)
+  const oldRules = await queue()
+  await accounts.saveRules(id, { revision: runtime.settings.revision(), settings: { mentionPolicy: 'required' } })
+  assert.equal((await send('chat_approve', oldRules)).status, 409)
+  assert.equal(writes(), 1)
+  const stale = await queue()
+  const revision = accounts.revision
+  state.response = () => { throw new Error(secret) }
+  const unknown = await send('create', { route, changes: {} })
+  assert.deepEqual(unknown.data, { error: 'webhook_outcome_unknown' })
+  assert.notEqual(accounts.revision, revision)
+  assert.equal((await send('chat_approve', stale)).status, 409)
+  assert.equal(writes(), 2)
+})
+
+test('the authenticated account asset graph includes the versioned chat review module', async () => {
+  const root = '/api/dsh-channel-octo'
+  const invoke = web({ overview: () => ({}) })
+  const get = (suffix = '', headers) => invoke({ method: 'GET', url: root + suffix, headers })
+  const overview = await get()
+  const version = overview.data.accountUiVersion
+  assert.match(version, /^[a-f0-9]{16}$/)
+  const account = await get('/account-view.js?v=' + version)
+  assert.ok(account.data.includes("'./webhook-view.js?v=" + version + "'"))
+  const webhook = await get('/webhook-view.js?v=' + version)
+  assert.ok(webhook.data.includes("'./webhook-chat-view.js?v=" + version + "'"))
+  const chat = await get('/webhook-chat-view.js?v=' + version)
+  assert.equal(chat.status, 200)
+  assert.match(chat.headers['Content-Type'], /^application\/javascript/)
+  assert.equal(chat.headers['Cache-Control'], 'no-store')
+  assert.equal(chat.headers['X-Content-Type-Options'], 'nosniff')
+  assert.match(chat.data, /export function createWebhookChatView/)
+  assert.equal((await get('/webhook-chat-view.js', { authorization: '' })).status, 401)
 })
 
 test('account settings wiring sends current account/version and never publishes secret results to the shared snapshot', async () => {

@@ -30,13 +30,14 @@ function text(value, limit) {
 
 // Octo TextBlock and Input.label use Markdown. Do not let text supply link syntax or HTML.
 const literal = value => value.replace(/[\\[\]<>]/g, '\\$&')
+const literalReviewText = value => value.replace(/[\\[\]<>*_~#!|&()+.:{}^-]/g, '\\$&').replaceAll('\x60', '\\\x60')
 
 /**
  * A small authoring surface: {title, text?, actions?: [{id, label}],
  * choice?: {id, label, options: [{title, value}]}}. Buttons confirm or submit one choice.
  * No raw Adaptive Card tree, server markers, URLs as actions, or arbitrary submit data.
  */
-export function createCard(form) {
+export function createCard(form, { literalReview = false } = {}) {
   if (!shape(form, ['title', 'text', 'actions', 'choice', 'inputs'])) invalid()
   const title = text(form.title, 160)
   const description = form.text === undefined ? undefined : text(form.text, 2048)
@@ -53,7 +54,7 @@ export function createCard(form) {
     return { type: 'Action.Submit', id: takeId(action.id), title: text(action.label, 100) }
   })
   const body = [{ type: 'TextBlock', text: literal(title), weight: 'Bolder', wrap: true }]
-  if (description) body.push({ type: 'TextBlock', text: literal(description), wrap: true })
+  if (description) body.push({ type: 'TextBlock', text: (literalReview ? literalReviewText : literal)(description), wrap: true })
   if (form.inputs !== undefined) {
     if (form.choice !== undefined || !buttons.length) invalid()
     try { body.push(...cardInputs(form.inputs, used)) } catch { invalid() }
@@ -159,10 +160,10 @@ function supports(profile, payload, choice) {
  * operator for interaction. Returns {messageId, binding}; save only a confirmed
  * binding in trusted local state. A display card returns binding: null.
  */
-export async function sendCard(config, route, form, signal = new AbortController().signal, authorize = () => true, beforeSend) {
+export async function sendCard(config, route, form, signal = new AbortController().signal, authorize = () => true, beforeSend, options) {
   if (authorize() !== true) throw new OctoError('octo_access_denied')
   form = structuredClone(form)
-  const payload = createCard(form)
+  const payload = createCard(form, options)
   const account = accountScope(config)
   const { token, fetchImpl } = config ?? {}
   if (!account || !validToken(token) || (fetchImpl !== undefined && typeof fetchImpl !== 'function')) {

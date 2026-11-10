@@ -70,6 +70,10 @@ export function resolveConfig(config, env = process.env) {
   const waitSeconds = config.waitSeconds ?? 15
   const timeoutMs = config.timeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS
   const progress = config.progress ?? 'auto'
+  const oboSendContract = config.oboSendContract
+  if (oboSendContract !== undefined && (typeof oboSendContract !== 'string' || !/^octo-server:[a-f0-9]{40}$/.test(oboSendContract))) {
+    throw new Error('invalid_obo_send_contract')
+  }
   if (!['auto', 'typing', 'off'].includes(progress)) throw new Error('invalid_progress_mode')
   if (!Number.isInteger(waitSeconds) || waitSeconds < 5 || waitSeconds > 30
     || (timeoutMs !== UNLIMITED_REPLY_TIMEOUT && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000))) {
@@ -79,6 +83,7 @@ export function resolveConfig(config, env = process.env) {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
     ...identity, allowed: new Set(allowedUids), groups, threads, threadRuleMode,
     senderPolicy, channelPolicy, mentionPolicy, transport, progress, toolScope,
+    oboSendContract,
     mediaDownloadOrigins: config.mediaDownloadOrigins, mediaUploadOrigins: config.mediaUploadOrigins,
     mediaMaxBytes: config.mediaMaxBytes, mediaTimeoutMs: config.mediaTimeoutMs,
   }

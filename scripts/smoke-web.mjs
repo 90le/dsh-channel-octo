@@ -103,11 +103,11 @@ async function assertAppBotSmoke(child, output, deadline) {
   const markers = ['REGISTER_OK', 'WIRE_ACK_OK', 'HUMAN_OK=fixture-user', 'HUMAN_OK=fixture-owner',
     'FRIEND_OK=fixture-user', 'FRIEND_OK=fixture-owner', 'NONOWNER_TEXT_ONLY_OK', 'ORDINARY_OK',
     'MESSAGE_GET_OK=fixture-user:1', 'MESSAGE_GET_OK=fixture-owner:2', 'MESSAGE_GET_OK=fixture-owner:720',
-    'CHANNEL_TOOLS_OK=11',
+    'CHANNEL_TOOLS_OK=14',
     'QUESTION_CARD_OK', 'INVALID_CALLBACKS_IGNORED', 'CALLBACK_ACK_OK', 'QUESTION_FEEDBACK_OK',
     'UPLOAD_OK', 'FILE_OK', 'FULL_CAPTION_OK', 'DISPLAY_OK', 'FINAL_OK',
-    ...[0, 1, 2, 3, 4].map(step => 'TOOL_SCOPE_OK=' + step),
-    ...[1, 2, 3, 4].map(step => 'NATIVE_TOOL_OK=' + step)].map(marker => 'FIXTURE_APP_' + marker)
+    ...[0, 1, 2, 3, 4, 5].map(step => 'TOOL_SCOPE_OK=' + step),
+    ...[1, 2, 3, 4, 5].map(step => 'NATIVE_TOOL_OK=' + step)].map(marker => 'FIXTURE_APP_' + marker)
   const complete = () => sentCount() === 2 && markers.every(marker => output().includes(marker))
   while (Date.now() < deadline && child.exitCode === null && !complete() && !output().includes('FIXTURE_APP_FAIL=')) await delay(100)
   if (!complete() || output().includes('FIXTURE_APP_FAIL=')) {
@@ -154,7 +154,7 @@ async function assertAppBotSmoke(child, output, deadline) {
   console.log('PASS: native AppBot register identity and cached encrypted WebSocket; no verify-bot or invented Space.')
   console.log('PASS: active-human batch lookup and friendship sync; ordinary DM text-only, registered owner native workspace tools; isolated DM sessions.')
   console.log('PASS: official person-message GET verified both DM triggers and the stored question card against their exact peers and IDs.')
-  console.log('PASS: owner menu contains exactly 11 App DM channel operations plus display-card, waiting-form and deferred publish/manage tools.')
+  console.log('PASS: owner menu contains exactly 14 App DM channel operations plus display-card, waiting-form and deferred publish/manage tools; native Registry discovery safely reports no catalog.')
   console.log('PASS: native question-card callback with server Space, wrong operator/route/message/nonce rejection, write/present, file plus full Markdown caption, display receipt and final.')
   console.log('PASS: group/topic inputs rejected; unavailable group/search/proactive/voice tools absent; fake local APIs only.')
 }
@@ -659,7 +659,7 @@ export function apply(ctx) {
     console.log('PASS: native private delegated message/file/group searches and bound continuation, without raw cursors or attachments.')
     console.log('PASS: native target discovery and explicit group/topic sends with member mentions, without impersonation or empty quotes.')
     console.log('PASS: native target file upload, full Markdown caption and topic display card with confirmed receipts and final summary.')
-    console.log('PASS: 13 delegated host tool steps; bounded human directory resolution and Bot DM text, file plus full caption, display card, receipts and final summary; fixed-Space principals, private-only tools, no target history/sync or OBO.')
+    console.log('PASS: 13 delegated host tool steps; bounded human directory resolution and Bot DM text, file plus full caption, display card, receipts and final summary; fixed-Space principals, no target history/sync or OBO. Shared sessions expose only same-parent topic delivery.')
   }
   if (ownerSmoke) {
     if (groupToolsSmoke && (readFileSync(join(home, 'group-tool-fixture.txt'), 'utf8') !== 'group native tools executed'

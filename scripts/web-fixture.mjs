@@ -608,7 +608,12 @@ globalThis.fetch = async (input, init) => {
     const titleRequest = tail.includes('Generate the session title from this JSON array of human messages:')
     const round = titleRequest ? 0 : Number(Array.from((ownerSmoke ? history : tail).matchAll(/fixture prompt ([1-6])/g)).at(-1)?.[1] ?? 0)
     if (delegatedSmoke && [3, 4, 5].includes(round)) {
-      if ((body.tools ?? []).some(tool => personOperations.includes(tool.name))) {
+      const tools = body.tools ?? []
+      const shared = tools.filter(tool => personOperations.slice(1).includes(tool.name))
+      if (tools.some(tool => [personOperations[0], 'octo_messages_resolve_targets', 'octo_groups_list_joined',
+        'octo_messages_send_on_behalf_of'].includes(tool.name))
+        || shared.length !== (groupToolsSmoke ? 3 : 0)
+        || shared.some(tool => !tool.description.includes('same parent group'))) {
         console.error('FIXTURE_PERSON_PRIVATE_SCOPE_MISMATCH')
         return new Response(null, { status: 400 })
       }
@@ -944,10 +949,12 @@ async function appBotFixture() {
     ['write', { file_path: fileName, content: fileText }],
     ['present', { files: [{ path: fileName }] }],
     ['octo_display_card', display],
+    ['octo_cards_registry_list', {}],
   ]
   const channelTools = ['inspect', 'messages.recent', 'messages.read', 'messages.user_info', 'messages.users_batch',
     'messages.notify', 'messages.mark_read', 'messages.edit', 'messages.edit_richtext', 'messages.edit_display_card',
-    'messages.clear_card_revisions'].map(name => 'octo_' + name.replaceAll('.', '_'))
+    'messages.clear_card_revisions', 'cards.registry.list', 'cards.registry.send', 'cards.registry.edit']
+    .map(name => 'octo_' + name.replaceAll('.', '_'))
   const peer = await wirePeer({ bot, token: 'fixture-app-im-secret' })
   const realFetch = globalThis.fetch
   const checked = new Map(), synced = new Map(), events = new Map()
@@ -1023,7 +1030,7 @@ async function appBotFixture() {
             end_message_seq: 0, limit: 1, pull_mode: 0 })) return fail('FRIEND_SCOPE')
         synced.set(uid, (synced.get(uid) ?? 0) + 1)
         if (synced.get(uid) === 1) console.log('FIXTURE_APP_FRIEND_OK=' + uid)
-        return json({ messages: [] })
+        return json({ messages: [...messages.values()].filter(row => row.channel_id === uid).slice(-1) })
       }
       const messagePath = /^\/api\/v1\/bot\/messages\/person\/([^/]+)\/([^/]+)$/.exec(path)
       if (messagePath) {
@@ -1176,6 +1183,10 @@ async function appBotFixture() {
           let receipt; try { receipt = JSON.parse(text) } catch {}
           if (!displaySent || !isDeepStrictEqual(receipt, { messageId: '730', format: 'display_card',
             fallbackBlocks: [], requiresFinalSummary: true })) return fail('DISPLAY_RECEIPT')
+        }
+        if (step === 5) {
+          let catalog; try { catalog = JSON.parse(text) } catch {}
+          if (!isDeepStrictEqual(catalog, { available: false, templates: [] })) return fail('REGISTRY_DISCOVERY')
         }
         console.log('FIXTURE_APP_NATIVE_TOOL_OK=' + step)
       }
