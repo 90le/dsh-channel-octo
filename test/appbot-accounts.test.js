@@ -245,10 +245,10 @@ test('legacy config derives App kind and WebSocket while preserving implicit Use
 const nodes = node => node && typeof node === 'object' ? [node, ...(node.children ?? []).flatMap(nodes)] : [node]
 const textOf = tree => nodes(tree).filter(value => typeof value === 'string').join('\n')
 function renderer() {
-  const values = []
+  const values = [], effects = []
   let index = 0
   const React = {
-    Fragment: 'fragment', useEffect() {}, useId: () => 'fixture',
+    Fragment: 'fragment', useEffect(effect) { effects.push(effect) }, useId: () => 'fixture',
     useState(initial) {
       const key = index++
       if (!(key in values)) values[key] = typeof initial === 'function' ? initial() : initial
@@ -258,7 +258,7 @@ function renderer() {
     createElement: (type, props, ...children) => typeof type === 'function'
       ? type({ ...props, children }) : { type, props: props ?? {}, children: children.flat(Infinity) },
   }
-  return { React, render(component, props) { index = 0; return component(props) } }
+  return { React, effects, render(component, props) { index = 0; effects.length = 0; return component(props) } }
 }
 
 test('UI accepts a verified null-space App, clears its credential and localizes type and scope', async () => {
@@ -318,7 +318,39 @@ test('UI rejects null-space User and malformed App verification while preserving
   }
 })
 
-test('App management modal hides native menu and Webhooks while retaining DM shortcuts and all tool scopes', () => {
+test('token replacement distinguishes a valid foreign Bot from failure and saves only a matching Bot', async () => {
+  for (const [result, message] of [
+    [new Error('bot_identity_mismatch'), 'does not match the Bot linked'],
+    [{ ...userIdentity, botUid: 'foreign-bot' }, 'does not match the Bot linked'],
+    [new Error('bot_verification_failed'), 'could not confirm the token'],
+    [userIdentity, 'Token verified'],
+  ]) {
+    const ui = renderer(), Editor = createAccountEditor(ui.React, { Button: 'button', Input: 'input' })
+    const saved = []
+    const props = { account: { ...userIdentity, id: 'legacy', cwd: process.cwd(), label: 'Fixture' }, lang: 'en',
+      allowCredentials: true, options: { workspaces: [{ path: process.cwd() }] },
+      onVerify: async () => { if (result instanceof Error) throw result; return result },
+      onSave: async fields => { saved.push(fields) } }
+    const button = (tree, label) => nodes(tree).find(node => node?.type === 'button' && textOf(node) === label)
+    let tree = ui.render(Editor, props)
+    button(tree, 'Replace bot token').props.onClick()
+    tree = ui.render(Editor, props)
+    const field = nodes(tree).find(node => node?.props?.type === 'password')
+    field.props.ref.current = { value: 'bf_rotate_fixture' }
+    await button(tree, 'Verify token').props.onClick()
+    assert.equal(field.props.ref.current.value, '')
+    tree = ui.render(Editor, props)
+    assert.ok(textOf(tree).includes(message))
+    const save = button(tree, 'Save new token')
+    assert.equal(Boolean(save), result === userIdentity)
+    if (save) {
+      await save.props.onClick()
+      assert.deepEqual(saved, [{ token: 'bf_rotate_fixture' }])
+    } else assert.deepEqual(saved, [])
+  }
+})
+
+test('App management modal hides native menu and Webhooks while retaining DM shortcuts and all tool scopes', async () => {
   for (const app of [true, false]) {
     const ui = renderer(), account = { id: 'fixture', label: 'Fixture', cwd: process.cwd(),
       ...(app ? appIdentity : userIdentity), config: {}, enabled: false }
@@ -328,6 +360,11 @@ test('App management modal hides native menu and Webhooks while retaining DM sho
     const props = { data: { accounts: [account], canManage: true, credentialAvailable: true }, lang: 'en', choose() {} }
     let tree = ui.render(View, props)
     nodes(tree).find(node => node?.props?.['aria-label'] === 'Settings · Fixture').props.onClick()
+    tree = ui.render(View, props)
+    // Account management now renders inside the editor after loading options.
+    nodes(tree).find(node => node?.type === 'dialog').props.ref.current = { open: true }
+    ui.effects.at(-1)()
+    await new Promise(resolve => setImmediate(resolve))
     tree = ui.render(View, props)
     assert.equal(textOf(tree).includes('Octo command menu'), !app)
     assert.equal(textOf(tree).includes('Manage webhooks'), !app)

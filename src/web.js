@@ -138,7 +138,7 @@ export function registerWeb(ctx, accounts) {
         const input = await body(req, creatingAssistant || editingAssistant || savingAccount ? 110_000 : undefined)
         if (creatingAssistant || editingAssistant) return send(200, await accounts.saveAssistant(assistant?.[1], input))
         if (req.method === 'POST' && target === path + '/accounts/verify') {
-          return send(200, await accounts.verify(input?.token))
+          return send(200, await accounts.verify(input?.token, input?.accountId))
         }
         const match = /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})(?:\/(settings|state|diagnose|reconnect|remove|commands|webhooks))?$/.exec(target)
         if (req.method === 'POST' && match?.[2] === 'webhooks') {

@@ -42,12 +42,13 @@ const copy = {
   replacement: ['新 Bot 令牌', 'New bot token'],
   replaceToken: ['更换 Bot 令牌', 'Replace bot token'],
   cancelReplacement: ['取消更换令牌', 'Cancel token replacement'],
-  keepToken: ['验证并保存后才会更换原有令牌。', 'The existing token stays in use until you verify and save the new one.'],
+  keepToken: ['这里只能更换同一个 Bot 的令牌。验证并保存后才会替换旧令牌。', 'Use a new token for this same Bot. Verify and save it to replace the old token.'],
   noVault: ['DSH 凭据库暂不可用。', 'The DSH credential store is unavailable.'],
   verify: ['验证令牌', 'Verify token'],
   verifying: ['正在验证令牌…', 'Verifying token…'],
   verified: ['令牌已验证', 'Token verified'],
-  verifyFailed: ['无法验证令牌。请检查后重试。', 'Could not verify the token. Check it and try again.'],
+  verifyFailed: ['Octo 未能确认此令牌，请检查令牌或连接后重试。', 'Octo could not confirm the token. Check the token or connection and try again.'],
+  differentBot: ['令牌有效，但与当前账号绑定的 Bot 不一致。请使用此 Bot 的新令牌；若要连接另一个 Bot，请点「添加账号」。', 'This token is valid but does not match the Bot linked to this account. Use a new token for this Bot, or choose Add account to connect another Bot.'],
   clearToken: ['重新输入令牌', 'Enter a different token'],
   saveToken: ['保存新令牌', 'Save new token'],
   botUid: ['Bot ID', 'Bot ID'],
@@ -107,7 +108,7 @@ const copy = {
   groupCommands: ['群聊快捷命令', 'Group shortcuts'],
   commandsOff: ['仅正常对话', 'Conversation only'],
   commandsSafe: ['允许频道快捷命令', 'Allow channel shortcuts'],
-  commandsHint: ['开启后可用 /help、/status、/new、/stop；群聊和子区仅 Bot 所有者可用。/stop 只停止当前频道正在处理的任务。此设置不转发其他插件命令；工具访问由“工具使用范围”和“权限策略”控制。', 'Enables /help, /status, /new and /stop. In groups and topics, only the bot owner can use them. /stop stops only the current task in that conversation. This setting does not forward other plugins’ commands. Tool access is controlled by tool scope and permission.'],
+  commandsHint: ['开启后可用 /help、/status、/new、/stop。私聊限已准入的 Bot 所有者或名单用户；群聊和子区仅 Bot 所有者可用。/stop 只停止当前频道正在处理的任务。此设置不转发其他插件命令；工具访问由“工具使用范围”和“权限策略”控制。', 'Enables /help, /status, /new and /stop. In DMs, only the admitted bot owner or allowlisted users can use them. In groups and topics, only the bot owner can use them. /stop stops only the current task in that conversation. This setting does not forward other plugins’ commands. Tool access is controlled by tool scope and permission.'],
   allowFiles: ['允许处理文件附件', 'Allow file attachments'],
   filesNote: ['允许处理符合聊天准入规则的附件。工作区文件交付还须符合“工具使用范围”和账号权限策略；选择包含群聊、子区的工具范围时，可在相应已准入会话交付文件。', 'Process attachments from admitted chats. Workspace file delivery also requires tool access under the selected scope and account permission. Scopes that include groups and topics allow delivery in those admitted conversations.'],
   appFilesNote: ['允许处理获准私聊中的附件。工作区文件交付仍须符合“工具使用范围”和账号权限策略。', 'Process attachments from admitted DMs. Workspace file delivery still requires tool access under the selected scope and account permission.'],
@@ -219,8 +220,9 @@ export function createAccountEditor(React, { Button, Input }) {
       pending.current = null
       setBusy('')
     }
-    const failure = (error, fallback, retry = false) =>
-      setFeedback({ text: errorMessage?.(error) || tr(fallback), error: true, retry })
+    const failure = (error, fallback, retry = false, area) =>
+      setFeedback({ text: error?.message === 'bot_identity_mismatch' && area === 'credentials'
+        ? tr('differentBot') : errorMessage?.(error) || tr(fallback), error: true, retry, area })
     const verify = async () => {
       if (!allowCredentials || pending.current) return
       const token = tokenField.current?.value.trim()
@@ -235,15 +237,19 @@ export function createAccountEditor(React, { Button, Input }) {
           && /^app_[A-Za-z0-9_-]+_bot$/.test(botUid) && spaceId === null
         const verifiedUser = (botKind === undefined || botKind === 'user') && token.startsWith('bf_')
           && validId(botUid) && validId(spaceId)
-        if ((!verifiedApp && !verifiedUser) || editing && (botUid !== account.botUid || spaceId !== account.spaceId
+        if (!verifiedApp && !verifiedUser) {
+          failure(null, 'verifyFailed', false, 'credentials')
+          return
+        }
+        if (editing && (botUid !== account.botUid || spaceId !== account.spaceId
           || (botKind ?? 'user') !== (account.botKind ?? 'user'))) {
-          failure(null, 'verifyFailed')
+          failure(null, 'differentBot', false, 'credentials')
           return
         }
         verifiedToken.current = token
         setIdentity({ botUid, spaceId, ...(verifiedApp && { botKind: 'app' }) })
       } catch (error) {
-        if (pending.current === request) failure(error, 'verifyFailed')
+        if (pending.current === request) failure(error, 'verifyFailed', false, 'credentials')
       } finally {
         finish(request)
       }
@@ -342,7 +348,7 @@ export function createAccountEditor(React, { Button, Input }) {
       } catch (error) {
         queued.current = null
         if (pending.current === request) failure(error, 'saveFailed',
-          editing && !withCredential && error?.message !== 'account_changed')
+          editing && !withCredential && error?.message !== 'account_changed', withCredential ? 'credentials' : undefined)
       } finally {
         finish(request)
       }
@@ -477,13 +483,14 @@ export function createAccountEditor(React, { Button, Input }) {
             editing && identity && h(Button, { type: 'button', variant: 'primary', disabled: !!busy,
               onClick: () => save(draft, uidText, true) }, tr('saveToken')),
             (editing || identity) && h(Button, { type: 'button', variant: 'outline', disabled: !!busy, onClick: cancelToken },
-              tr(editing ? 'cancelReplacement' : 'clearToken'))))
+              tr(editing ? 'cancelReplacement' : 'clearToken'))),
+          feedback?.area === 'credentials' && h('p', { className: 'dsho-alert dsho-credential-feedback', role: 'alert' }, feedback.text))
 
     const actions = [['diagnose', onDiagnose], ['reconnect', onReconnect], ['remove', onRemove]]
       .filter(([, handler]) => editing && typeof handler === 'function')
     const feedbackLine = h('div', { className: 'dsho-account-feedback' },
       busy && hint(busy === 'verify' ? 'verifying' : busy === 'save' ? 'saving' : 'working', { role: 'status' }),
-      feedback && h('p', { className: feedback.error ? 'dsho-alert' : 'dsho-account-note',
+      feedback && feedback.area !== 'credentials' && h('p', { className: feedback.error ? 'dsho-alert' : 'dsho-account-note',
         role: feedback.error ? 'alert' : 'status' }, feedback.text),
       feedback?.retry && h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!busy,
         onClick: () => save(draft, uidText) }, tr('retry')))

@@ -56,6 +56,13 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(first.accounts[0].reasoningEffort, 'high')
     assert.equal(first.accounts[0].idleMinutes, 15)
     assert.equal(first.accounts[0].toolScope, 'private')
+    const beforeVerify = accounts.revision
+    assert.equal((await accounts.verify('bf_rotated_fixture', firstId)).botUid, 'bot-fixture')
+    assert.equal((await accounts.verify('bf_other_fixture')).botUid, 'bot-other')
+    await assert.rejects(accounts.verify('bf_other_fixture', firstId), /bot_identity_mismatch/)
+    assert.equal(secrets.size, 1, 'verification does not change credentials')
+    assert.equal(accounts.revision, beforeVerify)
+
     await assert.rejects(save(null, { token: 'bf_first_fixture' }), /duplicate_bot/)
     await assert.rejects(save(firstId, { token: 'bf_other_fixture' }), /bot_identity_mismatch/)
     config.hostPermissions = ['workspace-write']
@@ -143,21 +150,30 @@ test('authenticated HTTP can manage credentials; forged origins and anonymous re
     webServer: { register(value) { route = value; return () => {} } },
     get: () => ({ requestRejection: request => request.headers.authorization === 'fixture-session' ? undefined : 401 }),
   }
-  registerWeb(ctx, { async verify(token) { verified++; assert.equal(token, 'bf_synthetic'); return { botUid: 'fixture' } } })
+  registerWeb(ctx, { async verify(token, accountId) {
+    verified++
+    assert.equal(token, 'bf_synthetic')
+    if (accountId === 'legacy') throw new Error('bot_identity_mismatch')
+    assert.equal(accountId, undefined)
+    return { botUid: 'fixture' }
+  } })
   const server = createServer(route.handler)
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   try {
     const headers = { authorization: 'fixture-session', 'content-type': 'application/json', 'x-dsh-octo-client': '1' }
     const base = 'http://127.0.0.1:' + server.address().port
-    const post = fields => fetch(base + '/api/dsh-channel-octo/accounts/verify', {
-      method: 'POST', headers: fields, body: JSON.stringify({ token: 'bf_synthetic' }),
+    const post = (fields, accountId) => fetch(base + '/api/dsh-channel-octo/accounts/verify', {
+      method: 'POST', headers: fields, body: JSON.stringify({ token: 'bf_synthetic', accountId }),
     })
     assert.equal((await post({ ...headers, 'sec-fetch-site': 'same-site' })).status, 403)
     assert.equal((await post({ ...headers, authorization: 'wrong' })).status, 401)
     const result = await post({ ...headers, origin: base, 'sec-fetch-site': 'same-origin' })
     assert.equal(result.status, 200)
     assert.deepEqual(await result.json(), { botUid: 'fixture' })
-    assert.equal(verified, 1)
+    const mismatch = await post({ ...headers, origin: base, 'sec-fetch-site': 'same-origin' }, 'legacy')
+    assert.equal(mismatch.status, 400)
+    assert.deepEqual(await mismatch.json(), { error: 'bot_identity_mismatch' })
+    assert.equal(verified, 2)
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) }
 })
 

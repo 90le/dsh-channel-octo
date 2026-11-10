@@ -70,6 +70,7 @@ dialog.dsho-account-modal[open] {
 .dsho-account-credentials>.dsho-field,.dsho-account-verified { flex:1 1 230px; min-width:0; }
 .dsho-account-credentials .dsho-account-buttons { align-self:flex-start; margin-top:21px; }
 .dsho-account-verified .dsho-account-note { margin-bottom:4px; }
+.dsho-credential-feedback { flex:1 0 100%; box-sizing:border-box; }
 .dsho-account-feedback { display:grid; justify-items:start; gap:6px; min-width:0; }
 .dsho-account-feedback:empty { display:none; }
 .dsho-account-confirm { color:inherit; }
@@ -133,7 +134,7 @@ const caption = {
   duplicate_bot: ['这个 Bot 已经添加，请编辑原账号。', 'This bot already has an account. Edit the existing account.'],
   invalid_assistant: ['助理指令格式无效，每份最多 8 KB。', 'Invalid assistant instructions. Each document allows up to 8 KB.'],
   invalid_bot_token: ['Bot 令牌无效或尚未配置。', 'The bot token is invalid or missing.'],
-  bot_identity_mismatch: ['新令牌的 Bot、类型或空间与原账号不一致。', 'The replacement token has a different bot, type or space.'],
+  bot_identity_mismatch: ['令牌对应的 Bot、类型或空间与当前账号不一致。', 'The token has a different bot, type or space.'],
   bot_verification_failed: ['Octo 未确认令牌，请检查令牌和服务地址。', 'Octo could not verify this token. Check the token and server.'],
   credential_provider_unavailable: ['DSH 凭据库暂不可用。', 'The DSH credential store is unavailable.'],
   permission_unavailable: ['该权限预设未在 Octo 的服务器配置中开放。', 'This permission preset is not enabled for Octo.'],
@@ -317,7 +318,7 @@ export function createAccountView(React, primitives, { request, status, label })
                 } })),
           options, allowCredentials, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
           connectionStatus: account && status(account.enabled === false ? 'disabled' : account.status, lang),
-          onVerify: ({ token }) => perform('POST', '/accounts/verify', { token }),
+          onVerify: ({ token }) => perform('POST', '/accounts/verify', { token, accountId: account?.id }),
           onSave: fields => perform(account ? 'PUT' : 'POST', account ? endpoint(account.id) : '/accounts',
             { account: fields, revision: revision.current }, !account),
           onDiagnose: account && (() => perform('POST', endpoint(account.id) + '/diagnose', {})),

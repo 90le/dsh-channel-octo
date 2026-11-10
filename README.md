@@ -12,6 +12,8 @@
 
 「专属助理」页签的 AGENTS.md 和 SOUL.md 是插件管理的提示词文件，只注入对应助理的 Octo 回合，不覆盖项目目录的同名文件，也不赋予工具权限。
 
+「更换 Bot 令牌」仅用于同一个 Bot 的令牌轮换。要连接另一个 Bot，请使用「添加账号」。令牌有效但与当前 Bot 不一致时，验证会明确提示；验证不会替换当前保存的凭据。
+
 ## 本地检查
 
 要求 Node.js 24 或 26。运行时使用 `ws` 连接 Octo，用 `mdast-util-from-markdown` 保留 Markdown 段落及识别正文提及。
@@ -27,7 +29,7 @@ npm pack --dry-run
 以 DSH `0.2.2-rc.1` 或 `0.2.1-rc.5` 为兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.1.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.2.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。

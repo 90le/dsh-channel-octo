@@ -539,11 +539,14 @@ export class Accounts {
     return { models, agentPresets, workspaces: this.workspaces(), policies: this.policies() }
   }
 
-  async verify(token) {
+  async verify(token, accountId) {
     if (!this.ready) fail('accounts_unavailable')
     if (!this.canStore) fail('credential_provider_unavailable')
     if (!validToken(token)) fail('invalid_bot_token')
-    return this.identify(token)
+    const account = accountId === undefined ? undefined : this.record(accountId)
+    const identity = await this.identify(token)
+    if (account && !sameBot(account, identity)) fail('bot_identity_mismatch')
+    return identity
   }
 
   async identify(token, signal = this.lifetime.signal) {
