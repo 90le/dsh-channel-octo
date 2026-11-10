@@ -7,6 +7,11 @@ const shells = new Set(['bash', 'pwsh', 'exec'])
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const idOK = value => typeof value === 'string' && /^[\w:./-]{1,256}$/.test(value)
 
+export function progressToolName(value) {
+  if (typeof value !== 'string' || !/^[\w.-]{1,96}$/.test(value)) return '未提供工具名称'
+  return safeProgressText(value, 96).replaceAll('＿', '_')
+}
+
 export function safeProgressText(text, max = TEXT_LIMIT) {
   if (typeof text !== 'string') return ''
   const limit = Number.isSafeInteger(max) ? Math.max(0, Math.min(max, 2000)) : TEXT_LIMIT
@@ -90,7 +95,19 @@ const errorCauses = new Map([
 ])
 function errorSummary(error) {
   const code = typeof error?.code === 'string' && error.code.length <= 64 ? error.code.toLowerCase() : ''
-  return errorCauses.has(code) ? `工具报告错误（${code}）：${errorCauses.get(code)}` : '工具报告错误'
+  if (errorCauses.has(code)) return errorCauses.get(code)
+  // Classify a bounded host error reason; never forward raw error text or output.
+  const reason = typeof error?.reason === 'string' ? error.reason.slice(0, INPUT_LIMIT) : ''
+  for (const [pattern, label] of [
+    [/not configured|missing (?:provider|configuration|api.?key)|未配置/i, '服务配置缺失，暂时无法执行'],
+    [/ECONNREFUSED|connection refused/i, '目标服务拒绝连接'],
+    [/ENOTFOUND|EAI_AGAIN|dns.*fail/i, '无法解析目标服务地址'],
+    [/ETIMEDOUT|timed? out|timeout|超时/i, '目标服务响应超时'],
+    [/permission denied|access denied|权限不足/i, '当前权限不足'],
+    [/rate limit|too many requests/i, '请求过于频繁，请稍后重试'],
+    [/provider.*unavailable|service.*unavailable/i, '服务暂不可用'],
+  ]) if (pattern.test(code + ' ' + reason)) return label
+  return '未提供可识别的错误原因'
 }
 
 function resultFor(data, name) {
@@ -116,6 +133,16 @@ function resultFor(data, name) {
     // background/promoted results and malformed payloads are also marker-free.
   } else if (!failed) {
     summary = structuredSummary(data.meta)
+    // DSH web tools publish these exact presentation metadata fields.
+    if (name === 'web_fetch' && Number.isInteger(data.meta?.statusCode) && data.meta.statusCode >= 100 && data.meta.statusCode <= 599) {
+      const code = data.meta.statusCode
+      failed = code >= 400
+      const cause = code === 401 || code === 403 ? '目标拒绝访问' : code === 404 ? '目标内容不存在'
+        : code === 429 ? '请求频率受限' : code >= 500 ? '目标服务异常' : '网页请求未成功'
+      summary = failed ? `${cause}（HTTP ${code}）` : `已收到网页响应（HTTP ${code}）`
+    } else if (name === 'web_search' && Array.isArray(data.meta?.sources)) {
+      summary = `返回 ${data.meta.sources.length} 条搜索来源`
+    }
     if (!summary && content.length === 1 && content[0]?.type === 'text') summary = structuredSummary(parsed(content[0].text))
   }
   // Generated only from fixed labels, allowlisted codes and bounded integers.

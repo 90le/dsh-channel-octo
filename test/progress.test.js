@@ -5,8 +5,34 @@ const approvedIcons = new Set(Object.values(JSON.parse(readFileSync(new URL('./f
 import { setImmediate } from 'node:timers/promises'
 import { OctoClient, OctoError } from '../src/octo.js'
 import { cardMode, Progress } from '../src/progress.js'
+import { createProgressEvents } from '../src/progress-events.js'
 
 const job = { message_id: '123', sender: 'member', channel_id: 'thread', channel_type: 5 }
+
+test('live host tool events preserve purpose, identity and cause while heartbeat changes only total time', async t => {
+ const tick=clock(t), f=fixture({profile:()=>compact}), events=createProgressEvents()
+ const h=f.progress.start(job,'auto',new AbortController().signal,undefined,undefined,'all')
+ h.trace(events.extract({type:'tool/call',data:{callId:'fetch',name:'web_fetch',arguments:JSON.stringify({description:'查阅插件安装说明',url:'https://private.invalid?token=PRIVATE'})}}))
+ await tick(450)
+ const before=f.calls.at(-1).frame
+ assert.match(JSON.stringify(before.card),/查阅插件安装说明/)
+ assert.match(JSON.stringify(before.card),/工具：web_fetch/)
+ await tick(5000)
+ const after=f.calls.at(-1).frame
+ assert.notEqual(after.plain,before.plain)
+ assert.deepEqual(localCard(after.card).byId.get('dsh_progress_details'),localCard(before.card).byId.get('dsh_progress_details'))
+ h.trace(events.extract({type:'tool/result',data:{message:{toolCallId:'fetch',isError:true,content:[{type:'text',text:'PRIVATE OUTPUT'}]},error:{code:'unavailable',reason:'provider not configured PRIVATE'}}}))
+ h.trace(events.extract({type:'tool/call',data:{callId:'custom',name:'custom_lookup',arguments:'{}'}}))
+ await tick(800)
+ const json=JSON.stringify(f.calls.at(-1).frame.card)
+ assert.match(json,/服务配置缺失，暂时无法执行/)
+ assert.match(json,/custom_lookup/)
+ assert.doesNotMatch(json,/调用工具|耗时|PRIVATE|private/)
+ await h.finish('error')
+ const count=f.calls.length
+ await tick(10000)
+ assert.equal(f.calls.length,count)
+})
 const ref = { id: 'ai.reasoning-process', version: '0.4.1' }
 const display = {
   enabled: 1, card_version: '1.5', profiles: ['octo/v1'],
@@ -436,13 +462,13 @@ test('outer and group arrows preserve siblings while bulk arrows set every discl
   await handle.finish('completed')
 })
 
-test('group IDs stay stable, all six tools remain visible, and idle refresh remains 15 seconds', async t => {
+test('group IDs stay stable, all six tools remain visible, and idle refresh runs every 5 seconds', async t => {
   const tick = clock(t), f = fixture({ profile: () => compact })
   const handle = f.progress.start(job, 'auto', new AbortController().signal)
   handle.trace({ kind: 'file-sent' })
   await tick(450)
   const fileIds = [...localCard(f.calls.at(-1).frame.card).byId.keys()].filter(id => id.includes('_files_'))
-  for (const [i, name] of ['read', 'write', 'shell', 'edit', 'present', 'private-tool'].entries()) {
+  for (const [i, name] of ['read', 'write', 'shell', 'edit', 'present', 'custom_lookup'].entries()) {
     handle.trace({ kind: 'tool-start', id: 'private-call-' + i, name, arguments: 'private-input' })
     handle.trace({ kind: 'tool-end', id: 'private-call-' + i, failed: i === 5, result: 'private-result' })
   }
@@ -459,7 +485,7 @@ test('group IDs stay stable, all six tools remain visible, and idle refresh rema
   const ids = [...local.byId.keys()]
   local.click('dsh_progress_all_open')
   const count = f.calls.filter(c => c.type === 'edit').length
-  await tick(14_999)
+  await tick(4_999)
   assert.equal(f.calls.filter(c => c.type === 'edit').length, count)
   await tick(1)
   const refreshed = localCard(f.calls.at(-1).frame.card)
@@ -518,11 +544,11 @@ test('compact frames pass the official Octo InteractiveCard validator', {
   }
 })
 
-test('idle cards refresh less often, while questions and completion update promptly', async t => {
+test('idle cards refresh every five seconds, while questions and completion update promptly', async t => {
   const tick = clock(t), f = fixture()
   const handle = f.progress.start(job, 'auto', new AbortController().signal)
   await tick(450)
-  await tick(14_999)
+  await tick(4_999)
   assert.equal(f.calls.filter(row => row.type === 'edit').length, 0)
   await tick(1)
   assert.equal(f.calls.filter(row => row.type === 'edit').length, 1)

@@ -10,6 +10,24 @@ const result = (text, extra = {}, toolCallId = 'call-1') => event('tool/result',
   message: { toolCallId, content: [{ type: 'text', text }] }, ...extra,
 })
 
+test('web summaries use host metadata and classify errors without copying private details', () => {
+  for (const [name, meta, error, failed, summary] of [
+    ['web_fetch', { statusCode: 200, url: 'https://private.invalid?token=private' }, undefined, false, '已收到网页响应（HTTP 200）'],
+    ['web_fetch', { statusCode: 403 }, undefined, true, '目标拒绝访问（HTTP 403）'],
+    ['web_fetch', { statusCode: 503 }, undefined, true, '目标服务异常（HTTP 503）'],
+    ['web_search', { sources: [{ title: 'PRIVATE', url: 'private' }] }, undefined, false, '返回 1 条搜索来源'],
+    ['web_fetch', {}, { code: 'FAILURE', reason: 'provider not configured: token=PRIVATE' }, true, '服务配置缺失，暂时无法执行'],
+    ['web_fetch', {}, { code: 'ECONNREFUSED', reason: 'PRIVATE HOST' }, true, '目标服务拒绝连接'],
+    ['web_fetch', { statusCode: 200 }, { reason: 'PRIVATE ERROR' }, true, '未提供可识别的错误原因'],
+  ]) {
+    const progress = createProgressEvents()
+    progress.extract(call(name, { description: '核对上游说明', command: 'PRIVATE' }))
+    const item = progress.extract(result('PRIVATE OUTPUT', { meta, error }))
+    assert.deepEqual(item, { kind: 'tool-end', id: 'call-1', failed, summary })
+    assert.doesNotMatch(JSON.stringify(item), /PRIVATE|private/)
+  }
+})
+
 test('steps retain actual numbers and titles select only public metadata', () => {
   const progress = createProgressEvents()
   assert.deepEqual(progress.extract(event('step/start', { step: 7 })), { kind: 'step', step: 7 })
@@ -68,17 +86,17 @@ test('truthy errors preserve failure semantics without exposing malformed metada
     progress.extract(call('read', {}))
     const item = progress.extract(result('PRIVATE OUTPUT', { meta: { status: 'success', content: 'PRIVATE FILE' }, ...extra }))
     assert.equal(item.failed, failed)
-    assert.equal(item.summary, failed ? '工具报告错误' : '状态：成功')
+    assert.equal(item.summary, failed ? '未提供可识别的错误原因' : '状态：成功')
     assert.doesNotMatch(JSON.stringify(item), /PRIVATE/)
   }
 })
 
 test('only known error codes yield fixed Chinese diagnoses; raw reasons never enter summaries', () => {
   for (const [code, summary] of [
-    ['permission_denied', '工具报告错误（permission_denied）：权限不足'],
-    ['TaskTimeout', '工具报告错误（tasktimeout）：任务超时'],
-    ['INVALID_ARGS', '工具报告错误（invalid_args）：工具参数不符合要求'],
-    ['PRIVATE_RAW_ERROR', '工具报告错误'],
+    ['permission_denied', '权限不足'],
+    ['TaskTimeout', '任务超时'],
+    ['INVALID_ARGS', '工具参数不符合要求'],
+    ['PRIVATE_RAW_ERROR', '未提供可识别的错误原因'],
   ]) {
     const progress = createProgressEvents()
     progress.extract(call('read', {}))

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { decimalId, OctoError } from './octo.js'
 import { ProgressTimeline } from './progress-timeline.js'
-import { safeProgressText } from './progress-events.js'
+import { safeProgressText, progressToolName } from './progress-events.js'
 
 const labels = {
   queued: '已收到，等待 DSH 开始处理',
@@ -22,7 +22,7 @@ const wireStates = { queued: 'reasoning', running: 'reasoning', responding: 'ans
 const templateStates = ['reasoning', 'answering', ...outcomes]
 const initialDelay = 450
 const editInterval = 800
-const refreshInterval = 15_000
+const refreshInterval = 5_000
 const typingInterval = 4000
 const terminalWaitBudget = 6000
 
@@ -49,6 +49,7 @@ export function cardMode(profile) {
 }
 
 const toolLabels = new Map([
+  ['web_fetch', '读取网页'], ['web_search', '搜索网页'], ['pwsh', '运行工作区命令'],
   ['shell', '运行工作区命令'], ['bash', '运行工作区命令'], ['exec', '运行工作区命令'],
   ['read', '读取文件'], ['write', '写入文件'], ['edit', '修改文件'],
   ['apply_patch', '修改文件'], ['present', '准备交付文件'], ['run_code', '执行工具程序'],
@@ -386,7 +387,7 @@ export class Progress {
           stats.calls = Math.min(999, stats.calls + 1)
           stats.pending.add(event.id)
           stats.active = stats.pending.size
-          stats.recent.set(event.id, { label: safeProgressText(event.title, 100) || toolLabels.get(event.name) || '调用工具', status: 'active' })
+          stats.recent.set(event.id, { label: safeProgressText(event.title, 100) || toolLabels.get(event.name) || progressToolName(event.name), status: 'active' })
           if (stats.recent.size > 4) stats.recent.delete(stats.recent.keys().next().value)
         } else if (event?.kind === 'tool-end' && stats.pending.delete(event.id)) {
           stats.active = stats.pending.size
@@ -395,7 +396,7 @@ export class Progress {
           if (row) row.status = event.failed ? 'failed' : 'done'
         } else if (event?.kind === 'file-sent') stats.files = Math.min(5, stats.files + 1)
         else return
-        stats.timeline.observe(event, safeProgressText(event.title, 100) || toolLabels.get(event.name) || '调用工具')
+        stats.timeline.observe(event, safeProgressText(event.title, 100) || toolLabels.get(event.name) || progressToolName(event.name))
         changed()
       },
       finish: (outcome, options) => finishing ??= finish(outcome, options),
