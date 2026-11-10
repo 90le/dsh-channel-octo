@@ -356,6 +356,15 @@ export class Worker {
     void work.finally(() => this.stopControls.delete(work))
   }
 
+  sessionRemoved(sessionId) {
+    for (const active of this.activeByRoute.values()) {
+      if ((active.sessionId ?? active.job.session_id) !== sessionId || active.controller.signal.aborted) continue
+      active.deleted = true
+      for (const seq of [active.job.seq, ...active.merged]) this.store.discard(seq, 'session_missing', 'review')
+      active.controller.abort(OCTO_STOP)
+    }
+  }
+
   async drain(signal) {
     const shutdown = new AbortController()
     const lifetime = AbortSignal.any([signal, shutdown.signal])
@@ -381,7 +390,7 @@ export class Worker {
                 failure = error
               }
             } finally {
-              if (active.controller.signal.reason === OCTO_STOP && !lifetime.aborted) {
+              if (active.controller.signal.reason === OCTO_STOP && !active.deleted && !lifetime.aborted) {
                 try {
                   if (active.question && await active.authorizeTerminal?.()) {
                     await active.questions.closeCard(active.question, '任务已停止，旧卡片不能继续提交。', lifetime)
@@ -701,6 +710,10 @@ export class Worker {
       }
     }
     const route = { channel_id: recipient, channel_type: channelType }
+    const names = this.api.navigationNames?.(channelType, recipient)
+    if (names?.length) {
+      try { this.store.rememberNavigationNames(names) } catch { this.log('channel_navigation_names_unavailable') }
+    }
     if (meta.deferredForm) job = { ...job, deferredForm: true }
     if (job.state !== 'queued' && (!/^[a-f0-9]{64}$/.test(meta.deliveryProfile ?? '')
       || meta.deliverables?.length && !/^[a-f0-9]{64}$/.test(meta.deliveryMediaProfile ?? ''))) {
@@ -789,6 +802,7 @@ export class Worker {
             if (meta.deferredForm) throw new Error('deferred_session_unavailable')
             session = this.store.session(conversation, config.idleMinutes, Date.now(), true)
           }
+          if (activeWork) activeWork.sessionId = session.session_id
           this.store.running(job.seq, session.session_id)
           const isFileOnly = attachments.length > 0 && !job.input.trim()
           const canMerge = () => !meta.deferredForm && config.transport === 'websocket' && !this.paused && this.config.sendMode === 'steer'
@@ -868,7 +882,9 @@ export class Worker {
               throw new Error('delivery_access_changed')
             }
             return host.run(session, input, async () => {
-            if (!meta.deferredForm) this.store.sessionCreated(conversation)
+            if (!meta.deferredForm && this.store.sessionCreated(conversation, session.session_id) === false) {
+              throw new Error('session_missing')
+            }
             await this.attach?.(session.session_id, config.cwd)
           }, signal, rules,
             phase => {
@@ -1017,6 +1033,7 @@ export class Worker {
             if (meta.deferredForm) throw new Error('deferred_session_unavailable')
             this.store.forgetSession(session.session_id)
             session = this.store.session(conversation)
+            if (activeWork) activeWork.sessionId = session.session_id
             for (const seq of [job.seq, ...merged]) this.store.running(seq, session.session_id)
             reply = await run()
           }

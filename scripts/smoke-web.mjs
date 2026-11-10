@@ -18,6 +18,7 @@ const home = mkdtempSync(join(temporary, 'dsh-octo-smoke-'))
 const state = join(home, 'octo-state')
 const npm = process.env.npm_execpath
 const wire = process.argv[3] !== 'events'
+const imSourcePackage = process.env.DSH_OCTO_SMOKE_IM_SOURCE
 const browserModule = process.argv[4]
 const browserExecutable = process.argv[5]
 const appBotSmoke = process.env.DSH_OCTO_SMOKE_APP_BOT === '1'
@@ -160,7 +161,7 @@ async function assertAppBotSmoke(child, output, deadline) {
 }
 let child, browser
 try {
-  if (node([cli, '--version']).trim() !== '0.2.1-rc.5') throw new Error('Expected DSH 0.2.1-rc.5')
+  if (!['0.2.1-rc.5', '0.2.2-rc.1'].includes(node([cli, '--version']).trim())) throw new Error('Expected a supported DSH host')
   const packed = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
   const { filename } = Array.isArray(packed) ? packed[0] : packed['dsh-channel-octo']
   if (typeof filename !== 'string' || !/^dsh-channel-octo-\d+\.\d+\.\d+\.tgz$/.test(filename)) throw new Error('Unexpected fixture package')
@@ -171,7 +172,7 @@ try {
     mkdirSync(fixtureProfile, { recursive: true })
     writeFileSync(join(fixtureProfile, 'pnpm-workspace.yaml'), 'allowBuilds:\n  protobufjs: false\n')
   }
-  for (const spec of [join(home, filename), ...(includeImConnect ? ['@michengai/dsh-im-connect@1.0.30'] : []),
+  for (const spec of [join(home, filename), ...(includeImConnect ? [imSourcePackage || '@michengai/dsh-im-connect@1.0.30'] : []),
     ...(codexUi ? ['@michengai/dsh-codex-ui@' + codexUi] : []),
     ...(automation ? ['@michengai/dsh-automation@' + automation] : [])]) {
     node([cli, 'plugin', '--profile', 'web', 'add', spec, '--registry=https://registry.npmjs.org/'], 180_000)
@@ -333,7 +334,9 @@ export function apply(ctx) {
     })
     await page.addInitScript(() => { Object.defineProperty(window, 'isSecureContext', { value: false }) })
     await page.goto(launch)
-    const native = page.getByRole('tab', { name: 'Octo', exact: true })
+    const native = imSourcePackage
+      ? page.getByRole('tab', { name: /^(频道|Channels)$/ })
+      : page.getByRole('tab', { name: 'Octo', exact: true })
     const fallback = page.locator('[data-octo-shortcut]')
     const shortcut = native.or(fallback).first()
     try { await shortcut.waitFor({ timeout: 15000 }) } catch (error) {
@@ -352,11 +355,29 @@ export function apply(ctx) {
       throw new Error('Octo sidebar unavailable: ' + browserErrors.join(' | ') + ' ' + overlays, { cause: error })
     }
     if (await native.isVisible() && await fallback.count()) throw new Error('Duplicate Octo sidebar entries')
-    const channel = page.locator('.dsho-row').first()
+    while (Date.now() < deadline && sentCount() < 1) await delay(150)
+    const inventory = new DatabaseSync(join(state, 'channel.sqlite'), { readOnly: true })
+    const sessionId = inventory.prepare('SELECT session_id FROM jobs WHERE state=? ORDER BY seq LIMIT 1').get('sent')?.session_id
+    inventory.close()
+    if (!sessionId) throw Error('Fixture has no delivered native session: ' + output.replace(/https?:\/\/\S+/g, '[url]').slice(-3300))
+    const nativeRow = page.locator('[data-row-key="session:' + sessionId + '"]')
+    const nativeList = await native.isVisible() && !await page.locator('.dsho-rail').count()
+    const channel = nativeList ? nativeRow : page.locator('.dsho-row').first()
     while (Date.now() < deadline && sentCount() < 1) await delay(150)
     if (!sentCount()) throw new Error('First fixture reply was not delivered: ' + output.replace(/https?:\/\/\S+/g, '[url]'))
-    await channel.waitFor({ timeout: 8000 })
-    if (await native.isVisible()) {
+    await channel.waitFor({ timeout: 8000 }).catch(async error => {
+      const nav = await page.locator('[data-row-key]').evaluateAll(els => els.map(e => [e.getAttribute('data-row-key'), e.textContent]))
+      const debug = await page.evaluate(async () => {
+        const response = await fetch('/api/dsh-channel-octo')
+        const snapshot = await response.json()
+        return { http: response.status, routes: snapshot.sessionRoutes?.map(row => row.id),
+          tabs: [...document.querySelectorAll('[role=tab]')].map(e => [e.textContent, e.getAttribute('aria-selected')]),
+          mode: document.querySelector('.ima-channel-official')?.getAttribute('data-mode') }
+      })
+      throw Error('Native channel row missing: ' + JSON.stringify(nav).slice(0, 1100)
+        + ' ' + JSON.stringify(debug) + ' errors=' + browserErrors.join(' | '), { cause: error })
+    })
+    if (!nativeList && await native.isVisible()) {
       const viewport = page.viewportSize()
       await page.setViewportSize({ width: 1280, height: 1000 })
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
@@ -386,6 +407,20 @@ export function apply(ctx) {
     if (screenshots) {
       await page.screenshot({ path: join(screenshots, 'octo-channel.png'), animations: 'disabled' })
     }
+    if (nativeList) {
+      const sidebar = page.locator('[data-row-key^=\"workspace:\"]').filter({ hasText: 'Octo' }).first()
+      if (imSourcePackage) {
+        await sidebar.waitFor({ timeout: 8000 })
+        if (await page.getByRole('tab', { name: 'Octo', exact: true }).count()) throw Error('Unexpected independent Octo tab')
+        await page.getByRole('tab', { name: /^(任务|Tasks)$/ }).click()
+        if (await nativeRow.count()) throw Error('Octo session leaked into Tasks')
+        await native.click()
+      }
+      await channel.click({ button: 'right' })
+      await page.getByRole('menuitem', { name: /重命名|Rename/ }).first().waitFor({ timeout: 7000 })
+      await page.keyboard.press('Escape')
+      console.log('PASS: Octo uses the native sidebar session row and context menu.')
+    } else {
     const search = page.getByRole('searchbox', { name: '搜索会话', exact: true })
     await search.fill('this-does-not-match')
     await page.getByText('没有匹配的会话', { exact: true }).waitFor()
@@ -403,6 +438,7 @@ export function apply(ctx) {
       await page.locator('.dsho-rail [data-octo-pinned]').first().waitFor({ state: 'detached', timeout: 7000 })
       console.log('PASS: Octo overflow and context menu use native DSH actions and reflect pin changes.')
     }
+    }
     await channel.click({ timeout: 15000 })
     try { await page.getByText('fixture response 1', { exact: true }).waitFor({ timeout: 12000 }) } catch (error) {
       throw new Error('native session unavailable: ' + (await page.locator('body').innerText()).slice(-550)
@@ -416,7 +452,8 @@ export function apply(ctx) {
     await config.getByText('Octo Bot', { exact: true }).waitFor({ timeout: 7000 })
     if (await config.getByText('fixture-bot', { exact: true }).isVisible()) throw new Error('Technical details should start collapsed')
     if (screenshots) await page.screenshot({ path: join(screenshots, 'octo-account.png'), animations: 'disabled' })
-    await config.getByRole('tablist', { name: 'Octo 设置分类' }).getByRole('tab', { name: '渠道设置', exact: true }).click()
+    await config.getByRole('tablist', { name: 'Octo 设置分类' }).getByRole('tab', { name: '消息规则', exact: true }).click()
+    await config.getByText('高级设置', { exact: true }).click()
     if (screenshots) {
       await config.getByRole('combobox', { name: '进度显示', exact: true }).waitFor({ timeout: 7000 })
       await page.screenshot({ path: join(screenshots, 'octo-settings.png'), animations: 'disabled' })
@@ -479,6 +516,7 @@ export function apply(ctx) {
       throw new Error('Tool scope choices or legacy default are incorrect: ' + JSON.stringify(scopeChoices))
     }
     console.log('FIXTURE_TOOL_SCOPE_CHOICES_ZH_OK')
+    await edit.getByText('高级消息行为', { exact: true }).click()
     const sendMode = edit.getByLabel('发送方式', { exact: true })
     const accountName = edit.getByLabel('账号名称', { exact: true })
     const overviewUrl = new URL('/api/dsh-channel-octo', launch).href
@@ -537,8 +575,8 @@ export function apply(ctx) {
       console.log('FIXTURE_RAPID_ACCOUNT_EDITS_OK')
     } finally {
       editsQueued.resolve()
-      await page.unroute(accountUrl, delayAccountPut)
       await Promise.allSettled([...pendingRoutes])
+      await page.unroute(accountUrl, delayAccountPut)
     }
     await edit.getByRole('button', { name: '关闭', exact: true }).click()
     await roster.getByRole('button', { name: '设置 · Fixture spare renamed', exact: true }).waitFor({ timeout: 9000 })
@@ -561,6 +599,7 @@ export function apply(ctx) {
     await preset.locator('option', { hasText: '标准模式' }).waitFor({ state: 'attached' })
     const full = rotated.getByLabel('权限策略', { exact: true }).locator('option[value="danger-full-access"]')
     if (await full.getAttribute('disabled') !== null || await full.textContent() !== '完全访问') throw new Error('full access not selectable in Chinese')
+    await rotated.getByText('连接与诊断', { exact: true }).click()
     await rotated.getByRole('button', { name: '更换 Bot 令牌', exact: true }).click()
     await rotated.getByLabel('新 Bot 令牌', { exact: true }).fill('bf_fixture_second_rotated')
     await rotated.getByRole('button', { name: '验证令牌', exact: true }).click()

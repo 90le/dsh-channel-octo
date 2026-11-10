@@ -2,6 +2,12 @@
 
 在 DeepSeek Harness Web 中并列加载的 Octo IM 插件。使用宿主模型和原生会话，支持私聊、群聊和子区的文字、文件与媒体附件，以及展示卡、确认卡和动态回复进度。可选本地白名单或 Octo 好友与成员准入。见[基础方案](PLAN.md)与[完整能力及验收计划](OCTO-COVERAGE.md)。
 
+## Octo 会话在哪里
+
+支持渠道注册接口的 IM Connect 会把 Octo 放在原生「频道」页。按频道视图中，私聊与群聊分开，群主区和子区归在各自的群下。工作区、原生会话 ID、归档与置顶不迁移；「任务」不重复列出已被频道接管的会话。已确认删除的会话不再出现在频道，归档仍可从原生归档视图恢复。
+
+当前兼容包基于 IM Connect 1.0.34，构建、验证和回退见[渠道接入说明](compat/im-connect/README.md)。其他版本仍可使用独立 Octo 入口。Bot 管理和消息规则仍在「设置 → Octo 渠道」。
+
 ## 本地检查
 
 要求 Node.js 24 或 26。运行时使用 `ws` 连接 Octo，用 `mdast-util-from-markdown` 保留 Markdown 段落及识别正文提及。
@@ -14,10 +20,10 @@ npm pack --dry-run
 
 ## 隔离试用
 
-以 DSH `0.2.1-rc.5` 为初始兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
+以 DSH `0.2.2-rc.1` 或 `0.2.1-rc.5` 为兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.24.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.25.0.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。

@@ -5,17 +5,20 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const { createElement: h, useEffect, useRef, useState, useSyncExternalStore } = React
-    const { Button, Input, SegmentedTabs, Menu, IconEllipsisOutlineRegular, IconPinFillRegular } = primitives
+    const { Button, Input, SegmentedTabs, Menu, IconEllipsisOutlineRegular, IconPinFillRegular, MenuItemButton } = primitives
     const path = 'api/dsh-channel-octo'
     const words = {
       settings: ['Octo 渠道', 'Octo channel'], shortcut: ['Octo 频道', 'Octo conversations'],
       subtitle: ['管理 Octo 机器人、消息规则和会话。', 'Manage your Octo bot, message rules and conversations.'],
-      account: ['Bot 账号', 'Bot account'], rules: ['渠道设置', 'Channel settings'], sessions: ['频道会话', 'Conversations'],
+      account: ['Bot 账号', 'Bot account'], rules: ['消息规则', 'Message rules'], sessions: ['频道会话', 'Conversations'],
+      openChannel: ['打开频道', 'Open channel'], mainArea: ['主区', 'Main area'],
+      ungroupedTopics: ['未归组子区', 'Ungrouped topics'], advanced: ['高级设置', 'Advanced settings'],
+      copyOctoId: ['复制 Octo 会话 ID', 'Copy Octo conversation ID'], waiting: ['等待回答', 'Waiting for an answer'],
       nav: ['Octo 设置分类', 'Octo settings sections'], close: ['关闭', 'Close'],
       selectedBot: ['选择账号', 'Choose account'], previousSession: ['历史会话', 'Past conversation'],
       loading: ['正在加载 Octo…', 'Loading Octo…'], retry: ['重新加载', 'Reload'],
       online: ['已连接', 'Connected'], connecting: ['正在连接', 'Connecting'],
-      reconnecting: ['正在重连', 'Reconnecting'], disconnecting: ['正在停止接收', 'Stopping'], disabled: ['尚未启用', 'Disabled'],
+      reconnecting: ['正在重连', 'Reconnecting'], disconnecting: ['正在停止接收', 'Stopping'], disabled: ['已暂停接收', 'Receiving paused'],
       invalid_configuration: ['连接配置有误', 'Invalid connection settings'],
       configuration_or_state_error: ['无法读取渠道设置', 'Channel settings are unavailable'],
       worker_stopped: ['连接已停止', 'Connection stopped'],
@@ -115,6 +118,8 @@ window.__ModuleLoader__.load({
 .dsho-session-menu-trigger:hover,.dsho-session-menu-trigger[aria-expanded=true] { background:var(--dsho-row); }
 .dsho-root [hidden] { display:none!important; }
 .dsho-root [role="tabpanel"] { min-width:0; }
+.dsho-advanced > summary { cursor:pointer; font-weight:560; margin-block:8px; }
+.dsho-native-state { max-width:100px; color:var(--dsw-alias-label-secondary,currentColor); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsho-root h2,.dsho-root h3,.dsho-rail h3,.dsho-modal h2 { margin:0; font-weight:650; line-height:1.32; }
 .dsho-root h2,.dsho-modal h2 { font-size:21px; }
 .dsho-root h3,.dsho-rail h3 { font-size:14px; }
@@ -247,6 +252,9 @@ window.__ModuleLoader__.load({
       const useT = () => tFor(useSyncExternalStore(subscribeLocale, locale))
       const sessionSnapshot = () => ctx.sessions.list.getSnapshot()
       const subscribeSessions = fn => ctx.sessions.list.subscribe(fn)
+      let showChannel = () => false
+      let openOctoSettings = () => {}
+      const shortcutListeners = new Set()
       const activeStatus = (data, t) => badge(t(data.status) || t('loading'), connectionTone[data.status])
       async function openSession(id) {
         if (!sessionSnapshot().byId[id]) await ctx.sessions.refresh()
@@ -316,11 +324,12 @@ window.__ModuleLoader__.load({
           () => workspaceList?.getSnapshot() ?? null)
         const archived = new Set(workspaces?.archivedSessionIds ?? [])
         const pins = new Map((workspaces?.pinnedSessionIds ?? []).map((id, index) => [id, index]))
+        const statusRows = new Map((data.conversations ?? []).map(row => [row.id, row]))
         const [filter, setFilter] = useState('all')
         const [query, setQuery] = useState('')
         const [opening, setOpening] = useState('')
         const [failed, setFailed] = useState(false)
-        const entries = (data.conversations ?? []).filter(row => !archived.has(row.id))
+        const entries = (data.sessionRoutes ?? data.conversations ?? []).map(row => ({ ...row, ...statusRows.get(row.id) })).filter(row => sessions.byId[row.id] && !archived.has(row.id))
           .sort((a, b) => (pins.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (pins.get(b.id) ?? Number.MAX_SAFE_INTEGER))
           .map(row => {
           const rawTitle = sessions.byId[row.id]?.title
@@ -482,10 +491,11 @@ window.__ModuleLoader__.load({
             draft.channelPolicy === 'allowlist' && multi('allowedThreadIds', 'threads', 'threadFormat')),
           !app && card('triggers', 'triggersHint', select('mentionPolicy', config.transport !== 'websocket' && 'requiresWebSocket'),
             select('threadRuleMode')),
+          h('details', { className: 'dsho-advanced' }, h('summary', null, t('advanced')),
           card('response', 'responseHint', select('progress', draft.progress === 'auto' && 'cardHint'), timeoutControl,
             field('maxConcurrentTurns', 'concurrentTurns', h('select', { id: 'dsho-maxConcurrentTurns',
               value: draft.maxConcurrentTurns, onChange: e => set('maxConcurrentTurns', e.target.value) },
-            ...Array.from({ length: 8 }, (_, i) => h('option', { key: i + 1, value: i + 1 }, i + 1))), 'concurrentTurnsHint')),
+            ...Array.from({ length: 8 }, (_, i) => h('option', { key: i + 1, value: i + 1 }, i + 1))), 'concurrentTurnsHint'))),
           (feedback || stale) && h('p', { className: 'dsho-alert', role: stale ? 'alert' : feedback[0] },
             t(stale ? 'settings_changed' : feedback[1])),
           h('div', { className: 'dsho-actions dsho-savebar' },
@@ -494,6 +504,70 @@ window.__ModuleLoader__.load({
               h(Button, { type: 'button', variant: 'outline', disabled: saving || !dirty, onClick: reset }, t('reset'))),
             dirty && !feedback && hint(t('unsaved'))))
       }
+      function nativeMembers(raw, ids) {
+        const visible = raw.ids.filter(id => ids.has(id) && raw.byId[id])
+        return { ...raw, ids: visible, byId: Object.fromEntries(visible.map(id => [id, raw.byId[id]])) }
+      }
+
+      // Older sidebar registries can still render the native component in a separate tab.
+      function NativeOcto({ official, props, getIds }) {
+        const t = useT()
+        const ids = useSyncExternalStore(subscribe, getIds)
+        const [view, setView] = useState({ groupBy: 'flat', archivedFilter: 'default', orderBy: 'updated',
+          groupExpansion: {}, sessionOrderByAccount: {} })
+        const state = patch => setView(current => ({ ...current, ...patch }))
+        const actions = {
+          setGroupBy: groupBy => state({ groupBy }), setArchivedFilter: archivedFilter => state({ archivedFilter }),
+          setOrderBy: (orderBy, orders) => state({ orderBy, sessionOrderByAccount: orderBy === 'manual' ? orders ?? {} : {} }),
+          setSessionOrder: (key, order, initial) => setView(current => ({ ...current, orderBy: 'manual',
+            sessionOrderByAccount: { ...(current.orderBy === 'manual' ? current.sessionOrderByAccount : initial), [key]: order } })),
+          setGroupExpanded: (key, expanded) => setView(current => ({ ...current,
+            groupExpansion: { ...current.groupExpansion, [key]: expanded } })),
+          retainAccountKeys: () => {},
+        }
+        if (!official || !props?.useSessions || !props?.useWorkspaces) return h(ChannelList, { rail: true, renderSlot: props?.renderSlot })
+        const native = { ...props, actions, useStore: select => select(view),
+          useSessions: (select, equal) => props.useSessions(raw => select(nativeMembers(raw, ids)), equal),
+          useWorkspaces: (select, equal) => props.useWorkspaces(raw => select({
+            ...raw, items: raw.items.map(workspace => ({ ...workspace, sessionIds: workspace.sessionIds.filter(id => ids.has(id)) }))
+              .filter(workspace => workspace.sessionIds.length),
+          }), equal),
+          useDirectoryFlow: select => select(false),
+          requestAddWorkspace: () => openOctoSettings(), startSession: () => {},
+          t: (key, params) => key === 'section.workspaces' ? 'Octo' : props.t?.(key, params) ?? t(key) }
+        if (props.searchSessions) native.searchSessions = async (...args) => {
+          const result = await props.searchSessions(...args)
+          return { ...result, items: result.items.filter(row => ids.has(row.id)) }
+        }
+        return h(official, native)
+      }
+
+      function NativeState({ sessionId }) {
+        const t = useT()
+        const data = useSyncExternalStore(subscribe, read)
+        const row = data.conversations?.find(row => row.id === sessionId)
+        if (!row || !['running', 'sending', 'waiting', 'review'].includes(row.state)) return null
+        const label = t(row.state)
+        return h('span', { className: 'dsho-native-state', title: issueLabel(row.issue, t) || label }, label)
+      }
+
+      function OctoMenuItem({ sessionId, useMenuOpenState }) {
+        const t = useT()
+        const data = useSyncExternalStore(subscribe, read)
+        const [, closeMenu] = useMenuOpenState?.() ?? []
+        const row = (data.sessionRoutes ?? data.conversations)?.find(row => row.id === sessionId)
+        if (!row?.address) return null
+        return h(MenuItemButton, { onSelect: () => {
+          closeMenu?.(false)
+          if (navigator.clipboard) { void navigator.clipboard.writeText(row.address).catch(() => {}); return }
+          const field = document.createElement('textarea')
+          field.value = row.address
+          field.style.cssText = 'position:fixed;opacity:0;pointer-events:none'
+          document.body.appendChild(field)
+          try { field.select(); document.execCommand('copy') } finally { field.remove() }
+        } }, t('copyOctoId'))
+      }
+
       function Settings({ close }) {
         const t = useT()
         const data = useSyncExternalStore(subscribe, read)
@@ -501,15 +575,18 @@ window.__ModuleLoader__.load({
         const [selected, setSelected] = useState('')
         const accounts = data.accounts ?? []
         const current = accounts.find(account => account.id === selected) ?? accounts[0]
-        const sections = ['account', 'rules', 'sessions']
+        const sections = ['account', 'rules']
         const panel = (key, content) => h('div', { id: 'dsho-panel-' + key, role: 'tabpanel',
           'aria-labelledby': 'dsho-tab-' + key, hidden: page !== key, key }, content)
         return h('div', { className: 'dsho-root', 'data-octo-settings': true },
           h('header', { className: 'dsho-head' }, h('div', null, h('h2', null, t('settings')), hint(t('subtitle'))),
-            activeStatus(current ?? data, t)),
+            h(Button, { type: 'button', size: 'sm', variant: 'outline', onClick: () => {
+              close?.()
+              requestAnimationFrame(() => { if (!showChannel()) for (const fn of shortcutListeners) fn() })
+            } }, t('openChannel'))),
           h(SegmentedTabs, { className: 'dsho-nav', label: t('nav'), value: page, onChange: setPage,
             items: sections.map(key => ({ value: key, label: t(key), id: 'dsho-tab-' + key, panelId: 'dsho-panel-' + key })) }),
-          data.error && page !== 'sessions' && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
+          data.error && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
           panel('account', h(Account, { data, t, current, choose: setSelected })),
           panel('rules',
             h('div', { className: 'dsho-panel' },
@@ -518,25 +595,33 @@ window.__ModuleLoader__.load({
                 h('select', { id: 'dsho-select-account', value: current?.id ?? '', onChange: e => setSelected(e.target.value) },
                   ...accounts.map(account => h('option', { key: account.id, value: account.id }, account.label)))),
               current?.config ? h(Config, { key: current.id, config: current.config, revision: current.revision, accountId: current.id, t })
-                : h(Empty, { title: t('notConfigured'), note: t('deployHint') }))),
-          panel('sessions', page === 'sessions' && h(ChannelList, { close })))
+                : h(Empty, { title: t('notConfigured'), note: t('deployHint') }))))
       }
       function ChannelShortcut({ wide }) {
         const t = useT()
         const native = useSyncExternalStore(subscribe, () => hasNativeTab)
         const dialog = useRef(null)
         const [active, setActive] = useState(false)
+        const [settings, setSettings] = useState(false)
+        useEffect(() => {
+          const open = () => { setSettings(false); setActive(true) }
+          shortcutListeners.add(open)
+          const openSettings = () => { setSettings(true); setActive(true) }
+          openOctoSettings = openSettings
+          return () => { shortcutListeners.delete(open); if (openOctoSettings === openSettings) openOctoSettings = () => {} }
+        }, [])
         useEffect(() => {
           if (active && dialog.current && !dialog.current.open) dialog.current.showModal()
         }, [active])
         if (native && !active) return null
         return h('div', null,
-          !native && h(Button, { size: 'sm', icon: mark(), onClick: () => setActive(true), title: t('shortcut'),
+          !native && h(Button, { size: 'sm', icon: mark(), onClick: () => { setSettings(false); setActive(true) }, title: t('shortcut'),
             'aria-label': t('shortcut'), 'data-octo-shortcut': true }, wide === false ? null : t('shortcut')),
           active && h('dialog', { className: 'dsho-modal', ref: dialog, onClose: () => setActive(false), 'aria-label': t('shortcut') },
             h('header', { className: 'dsho-head' }, h('h2', null, t('shortcut')),
               h(Button, { size: 'sm', onClick: () => dialog.current.close() }, t('close'))),
-            h(ChannelList, { close: () => dialog.current.close() })))
+            settings ? h(Settings, { close: () => dialog.current.close() })
+              : h(ChannelList, { close: () => dialog.current.close() })))
       }
 
       ctx.slots.inject('settings.section', () => ctx.slots.register({
@@ -548,25 +633,94 @@ window.__ModuleLoader__.load({
       ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
         name: 'sidebar.footer.action', id: 'dsh-channel-octo-shortcut', order: 45,
       }, ChannelShortcut))
+      ctx.slots.inject('sidebar.workspaces.session.row.action', () => ctx.slots.register({
+        name: 'sidebar.workspaces.session.row.action', id: 'dsh-channel-octo-status', order: 40,
+      }, NativeState))
+      if (MenuItemButton) ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
+        name: 'sidebar.workspaces.session.menu.item', id: 'dsh-channel-octo-copy-id', order: 490,
+      }, OctoMenuItem))
       ctx.effect(() => {
         const stylesheet = document.createElement('style')
         stylesheet.textContent = style
         document.head.appendChild(stylesheet)
         const controller = new AbortController()
-        let timer, flight, registry, remove
+        let timer, flight, registry, remove, removeFilter, bridge, matchIds = new Set(), rowKey = '', sourceRows = []
+        const sourceListeners = new Set()
+        const getIds = () => matchIds
+        let sessionRefresh
+        const refreshNativeIndex = () => {
+          if (sessionRefresh || controller.signal.aborted) return
+          sessionRefresh = Promise.resolve().then(() => ctx.sessions.refresh?.())
+            .catch(() => {}).finally(() => { sessionRefresh = undefined })
+        }
+        const rebuild = () => {
+          const localeLabel = tFor(locale())
+          const accountCount = snapshot.accounts?.length ?? 0
+          const rows = (snapshot.sessionRoutes ?? snapshot.conversations ?? []).map(row => {
+            const path = []
+            if (accountCount > 1) path.push({ key: 'bot:' + row.accountId, label: row.accountLabel || 'Bot' })
+            if (row.type === 1) path.push({ key: 'dm', label: localeLabel('dm') })
+            else {
+              path.push({ key: 'groups', label: localeLabel('group') })
+              if (row.group) {
+                path.push({ key: 'group:' + row.group, label: row.groupName || localeLabel('group') + ' ' + shortId(row.group) })
+                path.push(row.type === 5
+                  ? { key: 'topic:' + row.address, label: row.name || localeLabel('topic') + ' ' + shortId(row.address) }
+                  : { key: 'main', label: localeLabel('mainArea') })
+              } else path.push({ key: 'unknown', label: localeLabel('ungroupedTopics') })
+            }
+            return { id: row.id, path }
+          })
+          const key = JSON.stringify(rows)
+          if (key === rowKey) return
+          rowKey = key
+          sourceRows = rows
+          const next = new Set(rows.map(row => row.id))
+          const changed = matchIds.size !== next.size || [...next].some(id => !matchIds.has(id))
+          if (changed) {
+            const hasNew = [...next].some(id => !matchIds.has(id))
+            matchIds = next
+            applyFilter()
+            if (hasNew) refreshNativeIndex()
+          }
+          for (const fn of sourceListeners) fn()
+        }
+        const source = { id: 'octo', label: 'Octo', getSnapshot: () => sourceRows,
+          subscribe(fn) { sourceListeners.add(fn); return () => sourceListeners.delete(fn) },
+          openSettings: () => openOctoSettings() }
+        const applyFilter = () => {
+          removeFilter?.()
+          removeFilter = hasNativeTab && matchIds.size ? registry?.addSessionFilter?.(id => !matchIds.has(id)) : undefined
+        }
         const sync = () => {
           const readSlots = ctx.slots.entriesOfSlot ?? ctx.slots.entries
           const next = readSlots?.call(ctx.slots, 'sidebar.workspaces')
             ?.find(entry => entry?.component?.__dshNativeTabs?.version === 1)?.component?.__dshNativeTabs
-          if (next === registry) return
+          const nextBridge = next?.channelSources
+          if (next === registry && nextBridge === bridge) return
+          removeFilter?.()
           remove?.()
           registry = next
-          remove = registry?.insert?.({ id: 'octo', label: 'Octo', order: 25,
-            matchSession: id => snapshot.conversations?.some(row => row.id === id) ?? false,
-            render: props => h(ChannelList, { rail: true, renderSlot: props?.renderSlot }) })
+          bridge = nextBridge
+          const merged = bridge?.version === 1 && bridge.register?.(source)
+          remove = typeof merged === 'function' ? merged : registry?.insert?.({
+            id: 'octo', label: 'Octo', order: 25,
+            matchSession: id => matchIds.has(id),
+            render: props => h(NativeOcto, { props, official: registry?.officialTree, getIds }),
+          })
           hasNativeTab = typeof remove === 'function'
+          showChannel = typeof merged === 'function' ? () => bridge.open?.() === true : () => {
+            const tab = document.getElementById('ima-tab-octo') ?? document.getElementById('dcu-tab-octo')
+            if (!tab || tab.getAttribute('role') !== 'tab') return false
+            tab.click()
+            return true
+          }
+          applyFilter()
           notify()
         }
+        const unsubscribe = subscribe(rebuild)
+        const unsubscribeLocale = subscribeLocale(rebuild)
+        rebuild()
         const poll = () => {
           if (flight || controller.signal.aborted) return flight
           clearTimeout(timer)
@@ -575,7 +729,13 @@ window.__ModuleLoader__.load({
             if (document.visibilityState === 'hidden') return
             try {
               const next = await api('', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(6000)]) })
-              if (!controller.signal.aborted && epoch === revisionEpoch) publish(next)
+              if (!controller.signal.aborted && epoch === revisionEpoch) {
+                publish(next)
+                // A short-lived Octo Agent can be disposed after the host's previous list pull.
+                // Re-query its durable summary rather than displaying a second synthetic row.
+                const native = sessionSnapshot().byId
+                if ((next.sessionRoutes ?? []).some(row => !native[row.id])) refreshNativeIndex()
+              }
             } catch (error) {
               if (!controller.signal.aborted && epoch === revisionEpoch) {
                 const denied = error.message === 'authentication_required'
@@ -592,14 +752,16 @@ window.__ModuleLoader__.load({
         sync()
         let probes = 0
         const interval = setInterval(() => { sync(); if (++probes >= 20) clearInterval(interval) }, 250)
+        const unsubscribeSlots = ctx.slots.subscribe?.('sidebar.workspaces', sync)
         window.addEventListener('dsh-native-sidebar-change', sync)
         document.addEventListener('visibilitychange', poll)
         void poll()
         return () => {
-          controller.abort(); clearTimeout(timer); clearInterval(interval); remove?.(); stylesheet.remove()
+          controller.abort(); clearTimeout(timer); clearInterval(interval); unsubscribe(); unsubscribeLocale(); unsubscribeSlots?.()
+          removeFilter?.(); remove?.(); stylesheet.remove()
           window.removeEventListener('dsh-native-sidebar-change', sync)
           document.removeEventListener('visibilitychange', poll)
-          refresh = () => {}; hasNativeTab = false; publish({})
+          refresh = () => {}; showChannel = () => false; hasNativeTab = false; publish({})
         }
       }, 'Octo channel workspace')
     }

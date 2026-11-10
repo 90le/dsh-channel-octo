@@ -83,6 +83,7 @@ dialog.dsho-account-modal[open] {
 `
 
 const caption = {
+  recentIssues: ['最近 24 小时的处理问题', 'Processing issues in the last 24 hours'],
   count: ['个账号', 'accounts'], one: ['个账号', 'account'], add: ['添加账号', 'Add account'],
   receive: ['接收消息', 'Receive messages'], receiveHint: ['关闭后保留账号配置，但不接收新消息。', 'Turning this off keeps the account settings and stops new messages.'],
   edit: ['设置', 'Settings'], rename: ['修改账号名称', 'Rename account'], name: ['账号名称', 'Account name'],
@@ -393,8 +394,10 @@ export function createAccountView(React, primitives, { request, status, label })
       open && current?.directoryRecovery && (!current.directoryRecovery.ready || current.directoryRecovery.failed)
         && h('p', { className: 'dsho-account-list-note', role: 'status' },
           tr(current.directoryRecovery.failed ? 'directoryRecoveryFailed' : 'directoryRecoveryStarting')),
-      open && current?.counts?.length > 0 && h('div', { className: 'dsho-counts' }, ...current.counts.map(row =>
-        h('span', { key: row.state }, (label(row.state, lang) || label('review', lang)) + ' ' + row.total))),
+      open && current?.recentIssues?.length > 0 && h('details', { className: 'dsho-advanced dsho-account-list-note' },
+        h('summary', null, tr('recentIssues') + ' · ' + current.recentIssues.reduce((sum, row) => sum + row.total, 0)),
+        h('ul', null, ...current.recentIssues.map(row => h('li', { key: row.issue },
+          (label(row.issue, lang) || label('review', lang)) + ' · ' + row.total)))),
       modal && (!modal.id || selected) && h(Modal, { key: modal.id ?? 'new', account: selected, data, lang, tr, publish, refresh,
         close: () => setModal(null), added: () => setExpanded(true) }))
   }

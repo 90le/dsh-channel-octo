@@ -95,6 +95,23 @@ async function boundedJson(response) {
 export class OctoClient {
   #token
   #appRegistration
+  #channelNames = new Map()
+  #rememberChannelName(type, address, name) {
+    if (typeof name !== 'string') return
+    const safe = Array.from(name.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).slice(0, 100).join('')
+    if (!safe) return
+    this.#channelNames.set(type + ':' + address, safe)
+    if (this.#channelNames.size > 1024) this.#channelNames.delete(this.#channelNames.keys().next().value)
+  }
+
+  navigationNames(type, address) {
+    const scope = ruleScope(type, address)
+    if (!scope) return []
+    return [[2, scope.group, this.#channelNames.get('2:' + scope.group)],
+      ...(type === 5 ? [[5, address, this.#channelNames.get('5:' + address)]] : [])]
+      .filter(([, , name]) => name)
+  }
+
   constructor(config) {
     const { apiBase, token, waitSeconds, fetchImpl = fetch } = config
     this.base = apiBase
@@ -260,10 +277,12 @@ export class OctoClient {
       if ((pref?.group_allow_no_mention !== undefined && !flag(pref.group_allow_no_mention))
         || !flag(pref?.effective ?? pref?.no_mention)) return false
     }
+    let directoryGroup
     if (config.channelPolicy === 'joined') {
       const query = new URLSearchParams({ space_id: config.spaceId })
       const groups = memberList(await this.#request('/v1/bot/groups?' + query, undefined, signal, { timeout: 5000 }), 'groups')
-      if (!groups.some(g => g?.group_no === scope.group && g.space_id === config.spaceId)) return false
+      directoryGroup = groups.find(g => g?.group_no === scope.group && g.space_id === config.spaceId)
+      if (!directoryGroup) return false
     }
     if (ambient || directoryRecovery || config.senderPolicy === 'octo' || config.channelPolicy === 'joined') {
       const members = memberList(await this.#request(root + '/members', undefined, signal, { timeout: 5000 }), 'members')
@@ -272,6 +291,7 @@ export class OctoClient {
       if (!actor || ((ambient || directoryRecovery || config.senderPolicy === 'octo') && actor.robot !== 0 && actor.robot !== false)
         || !members.some(m => m?.uid === config.botUid)) return false
     }
+    if (directoryGroup) this.#rememberChannelName(2, scope.group, directoryGroup.name)
     return true
   }
 
@@ -300,6 +320,7 @@ export class OctoClient {
     const info = await this.#request('/v1/bot/groups/' + encodeURIComponent(group), undefined, signal, { timeout: 5000 })
     if (info === null) return false
     if (info?.group_no !== group || !Number.isInteger(info.status)) throw new OctoError('invalid_directory_response')
+    if (info.status === 1) this.#rememberChannelName(2, group, info.name)
     return info.status === 1
   }
 
@@ -307,6 +328,7 @@ export class OctoClient {
     const scope = ruleScope(5, row?.channel_id)
     if (!scope || row.group_no !== group || scope.group !== group || row.short_id !== scope.thread
       || row.channel_type !== 5 || row.status !== 1) throw new OctoError('invalid_directory_response')
+    this.#rememberChannelName(5, row.channel_id, row.name)
     return { channel_type: 5, channel_id: row.channel_id }
   }
 

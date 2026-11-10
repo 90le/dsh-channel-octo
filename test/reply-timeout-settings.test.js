@@ -118,7 +118,7 @@ function settingsUi(timeoutMs) {
   return {
     field, find, requests,
     change: (id, value) => field(id).props.onChange({ target: { value } }),
-    submit: () => find(node => node.type === 'form' && node.props['aria-label'] === 'Channel settings')
+    submit: () => find(node => node.type === 'form' && node.props['aria-label'] === 'Message rules')
       .props.onSubmit({ preventDefault() {} }),
   }
 }

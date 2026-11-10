@@ -10,6 +10,7 @@ import { channelView, loadSettings } from './web.js'
 import { normalizeImControls } from './im-controls.js'
 import { Worker } from './worker.js'
 import { sessionExists } from './session-state.js'
+import { ruleScope } from './rules.js'
 import { botCommandMenu, setBotCommands } from './bot-commands.js'
 import { administerWebhooks, validateWebhookInput, webhookWrites } from './webhook-admin.js'
 import { createWebhookChat, isWebhookChatAction, validateWebhookChatInput } from './webhook-chat.js'
@@ -297,12 +298,40 @@ export class Accounts {
     if (!inFlight) await operation
   }
 
+  async nativeSessionRemoved(sessionId) {
+    if (typeof sessionId !== 'string' || this.lifetime.signal.aborted) return
+    const runtimes = [...this.runtimes.values()].filter(runtime => runtime.store.hasSession?.(sessionId))
+    if (!runtimes.length) return
+    try {
+      if (await sessionExists(this.ctx, sessionId, this.lifetime.signal, { removed: true }) !== false) return
+      for (const runtime of runtimes) {
+        if (this.runtimes.get(runtime.record.id) !== runtime) continue
+        runtime.store.forgetSession(sessionId)
+        runtime.worker?.sessionRemoved(sessionId)
+      }
+    } catch {
+      if (!this.lifetime.signal.aborted) this.log.info('session_inventory_unavailable')
+    }
+  }
+
   async reconcileSessions(onlyRuntime) {
-    for (const runtime of onlyRuntime ? [onlyRuntime] : this.runtimes.values()) {
+    if (onlyRuntime) return this.reconcileSessionRuntimes([onlyRuntime])
+    if (!this.sessionReconciliation) {
+      this.sessionReconciliation = this.reconcileSessionRuntimes([...this.runtimes.values()])
+        .finally(() => { this.sessionReconciliation = undefined })
+    }
+    return this.sessionReconciliation
+  }
+
+  async reconcileSessionRuntimes(runtimes) {
+    for (const runtime of runtimes) {
       for (const sessionId of runtime.store.knownSessions()) {
         try {
           if (await sessionExists(this.ctx, sessionId, this.lifetime.signal) === false
-            && this.runtimes.get(runtime.record.id) === runtime) runtime.store.forgetSession(sessionId)
+            && this.runtimes.get(runtime.record.id) === runtime) {
+            runtime.store.forgetSession(sessionId)
+            runtime.worker?.sessionRemoved(sessionId)
+          }
         } catch {
           if (!this.lifetime.signal.aborted) this.log.info('session_inventory_unavailable')
           break
@@ -315,6 +344,8 @@ export class Accounts {
     const runtime = this.runtimes.get(record.id)
     const overview = runtime?.store.overview()
     const config = channelView(runtime?.settings.config)
+    const waiting = new Set([...(runtime?.worker?.activeByRoute?.values() ?? [])]
+      .filter(active => active.questions?.current).map(active => active.sessionId))
     const eventRecovery = record.enabled && runtime?.settings.config.transport === 'websocket'
       && runtime.settings.config.botKind !== 'app' ? runtime.store.eventRecovery?.() : undefined
     const directoryRecovery = record.enabled && runtime && directoryRecoveryEnabled(runtime.settings.config)
@@ -329,11 +360,13 @@ export class Accounts {
       senderPolicy: config?.senderPolicy ?? record.senderPolicy ?? 'octo', allowedUids: config?.allowedUids ?? record.allowedUids ?? [],
       status: runtime?.status ?? (record.enabled ? 'invalid_configuration' : 'disabled'),
       ...normalizeImControls({ ...this.deployment, ...record }),
-      config, revision: runtime?.settings.revision(), counts: overview?.counts ?? [], inbox: overview?.inbox,
+      config, revision: runtime?.settings.revision(), counts: overview?.counts ?? [], recentIssues: overview?.recentIssues ?? [], inbox: overview?.inbox,
       ...(eventRecovery && { eventRecovery: { ready: eventRecovery.ready, failed: eventRecovery.failed } }),
       ...(directoryRecovery && { directoryRecovery: { ready: directoryRecovery.ready, failed: directoryRecovery.failed,
         pendingGroups: directoryRecovery.pendingGroups } }),
-      conversations: (overview?.conversations ?? []).map(row => ({ ...row, accountId: record.id, accountLabel: record.label })),
+      conversations: (overview?.conversations ?? []).map(row => ({ ...row,
+        ...(waiting.has(row.id) && { state: 'waiting' }), accountId: record.id, accountLabel: record.label,
+      })),
     }
   }
 
@@ -345,6 +378,20 @@ export class Accounts {
       accounts, accountRevision: this.revision, canManage: this.ready === true, credentialAvailable: this.ready && this.canStore,
       status: selected?.status ?? this.status, config: selected?.config ?? null, revision: selected?.revision,
       counts: selected?.counts ?? [], conversations: rows.flatMap(account => account.conversations).slice(0, 1000),
+      sessionRoutes: rows.flatMap(account => {
+        const store = this.runtimes.get(account.id)?.store
+        const names = store?.navigationNames?.()
+        return (store?.sessionRoutes?.() ?? []).flatMap(row => {
+          let route
+          try { route = row.route.startsWith('[') ? JSON.parse(row.route) : [1, row.route] } catch { return [] }
+          if (!Array.isArray(route) || ![1, 2, 5].includes(route[0]) || typeof route[1] !== 'string') return []
+          const [type, address] = route
+          const group = ruleScope(type, address)?.group
+          return [{ id: row.id, type, address, group, name: names?.get(type + ':' + address),
+            groupName: group && names?.get('2:' + group), updatedAt: row.updatedAt,
+            accountId: account.id, accountLabel: account.label }]
+        })
+      }),
     }
   }
 

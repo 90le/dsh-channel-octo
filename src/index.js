@@ -6,6 +6,8 @@ export const inject = ['agents', 'agentDefaultModel', 'agentPresets', 'sessions'
 
 export function apply(ctx, settings = {}) {
   const accounts = new Accounts(ctx, settings)
+  // The host also emits this on ordinary disposal; Accounts verifies durable absence.
+  ctx.on('api-session/removed', sessionId => { void accounts.nativeSessionRemoved(sessionId) })
   ctx.inject(['webServer'], (web) => { web.effect(() => registerWeb(web, accounts)) })
   ctx.effect(() => {
     const boot = accounts.initialize()

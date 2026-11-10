@@ -391,7 +391,7 @@ test('channel settings keep App response controls usable and omit hidden group s
     nodes(tree).find(node => node?.props?.id === 'dsho-timeout').props.onChange({ target: { value: '6' } })
     nodes(tree).find(node => node?.props?.id === 'dsho-maxConcurrentTurns').props.onChange({ target: { value: '3' } })
     tree = ui.render(Settings, {})
-    await nodes(tree).find(node => node?.type === 'form' && node.props['aria-label'] === 'Channel settings').props.onSubmit({ preventDefault() {} })
+    await nodes(tree).find(node => node?.type === 'form' && node.props['aria-label'] === 'Message rules').props.onSubmit({ preventDefault() {} })
     assert.equal(requests.length, 1)
     assert.equal(requests[0].revision, 'original')
     if (app) assert.deepEqual(requests[0].settings, { progress: 'typing', timeoutMs: 6000, maxConcurrentTurns: 3 })

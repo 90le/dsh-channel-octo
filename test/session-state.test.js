@@ -74,3 +74,58 @@ for (const race of [false, true]) test('new input creates a fresh native session
   assert.equal(calls, race ? 2 : 1)
   assert.deepEqual(store.overview().conversations.map(row => row.id), [attached])
 })
+
+test('native disposal preserves durable records; permanent deletion invalidates live work and an old ready reply', async t => {
+  const store = storeFor(t)
+  const old = store.session('alice'); store.sessionCreated('alice', old.session_id)
+  const other = store.session('bob'); store.sessionCreated('bob', other.session_id)
+  store.add('7', { messageId: '7', sender: 'alice', text: 'first' })
+  store.add('8', { messageId: '8', sender: 'alice', text: 'second' })
+  store.running(1, old.session_id)
+  store.running(2, old.session_id); store.ready(2, 'pending text', {})
+  const worker = new Worker({ api: {}, store, config: {}, log() {} })
+  const controller = new AbortController(), bystander = new AbortController()
+  worker.activeByRoute.set('alice', { job: { seq: 1 }, sessionId: old.session_id, controller, merged: [] })
+  worker.activeByRoute.set('bob', { job: { seq: 3 }, sessionId: other.session_id, controller: bystander, merged: [] })
+  let durable = true
+  const ctx = { agents: { get: () => ({ stale: true }) }, sessions: { get: () => undefined },
+    get: () => ({ stat: async () => durable ? { id: old.session_id } : undefined }), logger: () => ({ info() {} }) }
+  const accounts = new Accounts(ctx, {})
+  accounts.runtimes.set('fixture', { record: { id: 'fixture' }, store, worker })
+  await accounts.nativeSessionRemoved(old.session_id)
+  assert.equal(store.hasSession(old.session_id), true)
+  assert.equal(controller.signal.aborted, false)
+  durable = false
+  await accounts.nativeSessionRemoved(old.session_id)
+  assert.equal(controller.signal.aborted, true)
+  assert.equal(bystander.signal.aborted, false)
+  assert.equal(store.hasSession(old.session_id), false)
+  assert.equal(store.hasSession(other.session_id), true)
+  assert.equal(store.add('7', { messageId: '7', sender: 'alice', text: 'retry' }).changes, 0)
+  assert.deepEqual(store.db.prepare('SELECT state,issue,reply FROM jobs ORDER BY seq').all().map(row => [...Object.values(row)]),
+    [['review', 'session_missing', null], ['review', 'session_missing', null]])
+  const replacement = store.session('alice')
+  assert.equal(store.sessionCreated('alice', old.session_id), false)
+  assert.equal(store.hasSession(replacement.session_id), false)
+})
+
+test('channel ownership includes archived-age history beyond the recent status limit', t => {
+  const store = storeFor(t)
+  const parent = 'd'.repeat(32), address = parent + '____123456789012345'
+  const topic = store.session(JSON.stringify([5, address]), 0, 1); store.sessionCreated(JSON.stringify([5, address]))
+  store.rememberNavigationNames([[2, parent, 'Fixture group'], [5, address, 'Fixture topic']])
+  for (let i = 0; i < 251; i++) {
+    store.session('dm' + i, 0, i + 2); store.sessionCreated('dm' + i)
+  }
+  const accounts = new Accounts({ logger: () => ({ info() {} }) }, {})
+  const record = { id: 'fixture', label: 'Fixture' }
+  accounts.records.set(record.id, record)
+  accounts.runtimes.set(record.id, { record, store, settings: { config: { allowed: new Set(), groups: new Set(), threads: new Set() }, revision: () => 'r' } })
+  const snapshot = accounts.overview()
+  assert.equal(snapshot.conversations.some(row => row.id === topic.session_id), false)
+  const row = snapshot.sessionRoutes.find(row => row.id === topic.session_id)
+  assert.equal(row.group, parent)
+  assert.equal(row.groupName, 'Fixture group')
+  assert.equal(row.name, 'Fixture topic')
+  assert.equal(row.accountId, 'fixture')
+})

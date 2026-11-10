@@ -55,6 +55,7 @@ export class Store {
       if (!columns.has('channel_type')) this.db.exec('ALTER TABLE jobs ADD COLUMN channel_type INTEGER NOT NULL DEFAULT 1')
       if (!columns.has('channel_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN channel_id TEXT')
       if (!columns.has('ambient')) this.db.exec('ALTER TABLE jobs ADD COLUMN ambient INTEGER NOT NULL DEFAULT 0')
+      if (!columns.has('received_ms')) this.db.exec('ALTER TABLE jobs ADD COLUMN received_ms INTEGER NOT NULL DEFAULT 0')
       if (!columns.has('metadata')) this.db.exec('ALTER TABLE jobs ADD COLUMN metadata TEXT')
       if (!columns.has('session_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN session_id TEXT')
       if (!columns.has('message_seq')) this.db.exec('ALTER TABLE jobs ADD COLUMN message_seq INTEGER')
@@ -92,6 +93,10 @@ export class Store {
           id INTEGER PRIMARY KEY CHECK(id=1), started_at INTEGER NOT NULL DEFAULT 0,
           ready INTEGER NOT NULL DEFAULT 0, completed_at INTEGER NOT NULL DEFAULT 0,
           failed INTEGER NOT NULL DEFAULT 0, listed_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS channel_navigation_names (
+          channel_type INTEGER NOT NULL, address TEXT NOT NULL, name TEXT NOT NULL,
+          PRIMARY KEY (channel_type, address)
         );
         CREATE TABLE IF NOT EXISTS directory_groups (
           group_no TEXT PRIMARY KEY NOT NULL, page INTEGER NOT NULL DEFAULT 1,
@@ -140,7 +145,7 @@ export class Store {
 
   add(eventId, m) {
     return this.db.prepare(`
-      INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient,metadata,message_seq,route_order) VALUES (?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO jobs (message_id,event_id,sender,input,channel_type,channel_id,ambient,metadata,message_seq,route_order,received_ms) VALUES (?,?,?,?,?,?,?,?,?,?,unixepoch()*1000)
       ON CONFLICT(message_id) DO NOTHING
     `).run(m.messageId, eventId, m.sender, m.text, m.channelType ?? 1, m.channelId ?? m.sender, m.ambient ? 1 : 0,
       m.attachment || m.attachments || m.parts || m.quoteId || m.command || m.cardAction || m.deferredForm || m.directoryRecovery ? JSON.stringify({
@@ -749,11 +754,19 @@ export class Store {
     return row ? { session_id: row.session_id, created: 1 } : null
   }
 
-  sessionCreated(sender) { this.db.prepare('UPDATE conversations SET created=1 WHERE sender=?').run(sender) }
+  sessionCreated(sender, sessionId = this.db.prepare('SELECT session_id FROM conversations WHERE sender=?').get(sender)?.session_id) {
+    return this.db.prepare('UPDATE conversations SET created=1 WHERE sender=? AND session_id=?')
+      .run(sender, sessionId ?? '').changes === 1
+  }
   knownSessions() {
     return this.db.prepare(`SELECT session_id FROM conversations WHERE created=1
       UNION SELECT session_id FROM conversation_history`).all().map(row => row.session_id)
   }
+  hasSession(sessionId) {
+    return !!this.db.prepare(`SELECT 1 FROM conversations WHERE session_id=? AND created=1
+      UNION ALL SELECT 1 FROM conversation_history WHERE session_id=? LIMIT 1`).get(sessionId, sessionId)
+  }
+
   forgetSession(sessionId) {
     // Forget only the routing/display mapping. Delivery receipts still prevent
     // replay, and existing native sessions/history are never deleted here.
@@ -761,8 +774,26 @@ export class Store {
     try {
       this.db.prepare('DELETE FROM conversations WHERE session_id=?').run(sessionId)
       this.db.prepare('DELETE FROM conversation_history WHERE session_id=?').run(sessionId)
+      this.db.prepare(`UPDATE jobs SET state='review', issue='session_missing', input='', reply=NULL, metadata=NULL
+        WHERE session_id=? AND state='ready'`).run(sessionId)
       this.db.exec('COMMIT')
     } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+  rememberNavigationNames(entries) {
+    const save = this.db.prepare(`INSERT INTO channel_navigation_names(channel_type,address,name) VALUES (?,?,?)
+      ON CONFLICT(channel_type,address) DO UPDATE SET name=excluded.name WHERE name<>excluded.name`)
+    for (const entry of entries) save.run(...entry)
+  }
+
+  navigationNames() {
+    return new Map(this.db.prepare('SELECT channel_type,address,name FROM channel_navigation_names').all()
+      .map(row => [row.channel_type + ':' + row.address, row.name]))
+  }
+
+  sessionRoutes() {
+    return this.db.prepare(`SELECT session_id AS id, sender AS route, last_ms AS updatedAt FROM conversations WHERE created=1
+      UNION ALL SELECT session_id AS id, sender AS route, last_ms AS updatedAt FROM conversation_history
+      ORDER BY updatedAt DESC`).all()
   }
   overview() {
     const conversations = this.db.prepare(`
@@ -791,9 +822,11 @@ export class Store {
       ORDER BY r.last_ms DESC,j.seq DESC
     `).all()
     const counts = this.db.prepare('SELECT state, count(*) AS total FROM jobs GROUP BY state').all()
+    const recentIssues = this.db.prepare(`SELECT COALESCE(issue,'review') AS issue, COUNT(*) AS total FROM jobs
+      WHERE state='review' AND received_ms>=? GROUP BY issue ORDER BY total DESC LIMIT 20`).all(Date.now() - 86400000)
     const inbox = this.db.prepare(`SELECT COUNT(*) AS routes,COALESCE(SUM(blocked),0) AS recoveringRoutes,
       COALESCE(SUM(failed),0) AS failedRoutes,(SELECT COUNT(*) FROM inbox_staged) AS pendingMessages FROM inbox_routes`).get()
-    return { conversations, counts, inbox }
+    return { conversations, counts, recentIssues, inbox }
   }
   retirePending() {
     this.db.exec('BEGIN IMMEDIATE')

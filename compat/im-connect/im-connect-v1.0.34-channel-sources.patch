@@ -1,0 +1,349 @@
+diff --git a/client.js b/client.js
+index 059e3eb..2ae23aa 100644
+--- a/client.js
++++ b/client.js
+@@ -5237,23 +5237,107 @@ window.__ModuleLoader__.load({
+      * 按频道分组：每个频道合成一个官方 WorkspaceView。
+      * 保留宿主的 phase/state/归档集合，官方浏览器才能正常渲染。
+      */
++    // Optional sources are scoped to this Channels view; no bot settings or transcripts cross this boundary.
++    const channelSourceRegistries = new WeakMap();
++    const EMPTY_CHANNEL_SOURCES = Object.freeze([]);
++    function channelSourcesFor(registry) {
++      if (!registry) return undefined;
++      let bridge = channelSourceRegistries.get(registry);
++      if (bridge) return bridge;
++      const sources = new Map(), listeners = new Set(), selection = new Set();
++      let rows = EMPTY_CHANNEL_SOURCES;
++      const update = () => {
++        const next = [];
++        for (const [id, { source }] of sources) {
++          for (const row of source.getSnapshot()) next.push({ ...row, sourceId: id, source });
++        }
++        rows = next;
++        for (const listener of listeners) listener();
++      };
++      bridge = {
++        version: 1,
++        getSnapshot: () => rows,
++        subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
++        subscribeSelection(fn) { selection.add(fn); return () => selection.delete(fn); },
++        open() {
++          if (selection.size) {
++            for (const listener of selection) listener();
++            return true;
++          }
++          // Other v1 shell providers expose a native tab button, but do not host the selection service.
++          const tab = typeof document !== "undefined" && (document.getElementById("ima-tab-channels")
++            || document.querySelector('[role="tab"][aria-controls$="-panel-channels"]'));
++          if (!tab || tab.getAttribute("role") !== "tab") return false;
++          tab.click();
++          return true;
++        },
++        register(source) {
++          if (!/^[a-z][a-z0-9-]{0,31}$/.test(source?.id || "") || CHANNEL_GROUP_IDS.includes(source.id)
++            || sources.has(source.id) || typeof source.getSnapshot !== "function" || typeof source.subscribe !== "function") return;
++          const entry = { source };
++          sources.set(source.id, entry);
++          entry.unsubscribe = source.subscribe(update);
++          update();
++          return () => {
++            if (sources.get(source.id) !== entry) return;
++            sources.delete(source.id);
++            entry.unsubscribe();
++            update();
++          };
++        },
++        release() {
++          if (registry.channelSources === bridge) delete registry.channelSources;
++          for (const entry of sources.values()) entry.unsubscribe();
++          sources.clear(); update();
++          channelSourceRegistries.delete(registry);
++        },
++      };
++      Object.defineProperty(registry, "channelSources", { value: bridge, configurable: true });
++      channelSourceRegistries.set(registry, bridge);
++      return bridge;
++    }
++
++    function projectExternalGroups(groups, rows, sessionSource) {
++      const claimed = new Set(groups.flatMap(group => group.sessions.map(row => row.sessionId)));
++      const external = new Map();
++      for (const row of rows) {
++        const id = row?.id;
++        const session = typeof id === "string" && Object.hasOwn(sessionSource.byId || {}, id) && sessionSource.byId[id];
++        if (!session || claimed.has(id) || !Array.isArray(row.path) || row.path.length > 6
++          || !row.path.every(part => typeof part?.key === "string" && typeof part.label === "string")) continue;
++        claimed.add(id);
++        const segments = [{ key: row.sourceId, label: row.source.label || row.sourceId }, ...row.path];
++        const prefix = [];
++        for (const segment of segments) {
++          prefix.push(encodeURIComponent(segment.key));
++          const groupId = prefix.join("/");
++          if (!external.has(groupId)) external.set(groupId, {
++            id: groupId, label: segment.label, path: "/__dsh_im_channels__/" + groupId,
++            external: true, openSettings: row.source.openSettings, sessions: [],
++          });
++        }
++        external.get(prefix.join("/")).sessions.push({ sessionId: id, updatedAt: session.updatedAt });
++      }
++      return [...groups, ...external.values()];
++    }
++
+     function syntheticChannelWorkspaceState(state, groups, t) {
+       const src = state || EMPTY_WORKSPACE_STATE;
+       const key = groups.map((group) => [
+         group.id,
+         channelLabel(group, t),
+-        channelGroupCreatedAt(group),
++        channelGroupCreatedAt(group), group.path || "",
+         (group.sessions || []).map((session) => session.sessionId).join(","),
+       ].join("\0")).join("\0\0");
+       const hit = channelSyntheticWorkspaceCache.get(src);
+       if (hit && hit.key === key) return hit.result;
+-      const items = groups.filter((group) => (group.sessions || []).length > 0).map((group) => {
++      const items = groups.filter((group) => group.external || (group.sessions || []).length > 0).map((group) => {
+         const workspaceId = channelWorkspaceId(group.id);
+         return {
+           workspaceId,
+           id: workspaceId,
+           title: channelLabel(group, t),
+-          path: "",
++          path: group.path || "",
+           sessionIds: (group.sessions || []).map((session) => session.sessionId),
+           createdAt: channelGroupCreatedAt(group),
+         };
+@@ -5601,7 +5685,14 @@ window.__ModuleLoader__.load({
+       // 旧宿主快照可能不带 phase，此时按已就绪处理，由 renderable 判定能力缺失。
+       const groupsReady = sessionSource.phase === undefined || sessionSource.phase === "ready";
+       const groupsError = sessionSource.state === "error";
+-      const groups = useMemo(() => channelGroupsFromSessionState(sessionSource, t), [membershipRevision, sessionSource, t]);
++      const external = props.channelSources;
++      const externalRows = useSyncExternalStore(external?.subscribe ?? (() => () => {}),
++        external?.getSnapshot ?? (() => EMPTY_CHANNEL_SOURCES), () => EMPTY_CHANNEL_SOURCES);
++      const groups = useMemo(() => projectExternalGroups(channelGroupsFromSessionState(sessionSource, t),
++        externalRows, sessionSource), [membershipRevision, sessionSource, t, externalRows]);
++      const treeMode = groupBy === "channel" && groups.some(group => group.external);
++      const useOfficialStore = useCallback(select => useChannelStore(state => select(
++        treeMode && state.groupBy === "channel" ? { ...state, groupBy: "workspace-tree" } : state)), [useChannelStore, treeMode]);
+       const groupsRef = useRef(groups);
+       groupsRef.current = groups;
+       const [channelIcons, setChannelIcons] = useState("");
+@@ -5653,7 +5744,7 @@ window.__ModuleLoader__.load({
+       }, [groupBy, memberIds, membershipRevision, workspaceIcons, workspaceSource]);
+       const groupKeys = useMemo(() => {
+         if (groupBy === "channel") {
+-          return groups.filter((group) => (group.sessions || []).length > 0).map((group) => channelWorkspaceId(group.id));
++          return groups.map((group) => channelWorkspaceId(group.id));
+         }
+         if (groupBy === "flat") return [];
+         return ((workspaceSource && workspaceSource.items) || [])
+@@ -5682,6 +5773,7 @@ window.__ModuleLoader__.load({
+         settingsLabel: t("rail.channelSettings"),
+         resolve: (channelId) => groupsRef.current.find((group) => group.id === channelId),
+         onSettings: (group) => {
++          if (group.external && typeof group.openSettings === "function") { group.openSettings(); return; }
+           if (typeof openChannelSettings === "function") {
+             openChannelSettings({ channelId: group.id, name: channelLabel(group, t) });
+             return;
+@@ -5727,7 +5819,7 @@ window.__ModuleLoader__.load({
+ 
+       const officialProps = Object.assign({}, hostProps, {
+         t: text,
+-        useStore: useChannelStore,
++        useStore: useOfficialStore,
+         actions: store.actions,
+         useSessions: useChannelSessions,
+         useWorkspaces: useChannelWorkspaces,
+@@ -5884,6 +5976,10 @@ window.__ModuleLoader__.load({
+       const Official = props.officialTree;
+       const rawUseSessions = props.useSessions;
+       const nativeTabs = props.nativeTabs;
++      const sources = nativeTabs?.channelSources;
++      const sourceRows = useSyncExternalStore(sources?.subscribe ?? (() => () => {}),
++        sources?.getSnapshot ?? (() => EMPTY_CHANNEL_SOURCES), () => EMPTY_CHANNEL_SOURCES);
++      const channelSourceIds = useMemo(() => new Set(sourceRows.map(row => row.id)), [sourceRows]);
+       const extraTabs = useSyncExternalStore(
+         (listener) => (nativeTabs && nativeTabs.subscribe ? nativeTabs.subscribe(listener) : () => {}),
+         () => (nativeTabs && nativeTabs.getTabs ? nativeTabs.getTabs() : EMPTY_EXTRA_TABS),
+@@ -5907,6 +6003,7 @@ window.__ModuleLoader__.load({
+       const currentId = typeof rawUseSessions === "function"
+         ? rawUseSessions((state) => currentSessionId(state))
+         : (props.selectedId || null);
++      useEffect(() => sources?.subscribeSelection(() => setTab("channels")), [sources]);
+       const sessionById = (sessionSnap && sessionSnap.byId) || {};
+       const useTaskSessions = useCallback((selector, eq) => {
+         if (typeof rawUseSessions !== "function") return selector({ ids: [], byId: {}, current: null });
+@@ -5936,8 +6033,8 @@ window.__ModuleLoader__.load({
+         );
+         tabFollowReady.current = followed.ready;
+         previousCurrentId.current = followed.previousId;
+-        if (followed.tab) setTab(followed.tab);
+-      }, [currentId, extraTabs, membershipRevision]);
++        if (followed.tab) setTab(channelSourceIds.has(currentId) ? "channels" : followed.tab);
++      }, [currentId, extraTabs, membershipRevision, channelSourceIds]);
+       const hostOpen = typeof props.openSession === "function"
+         ? props.openSession
+         : (typeof props.open === "function" ? props.open : undefined);
+@@ -5953,6 +6050,12 @@ window.__ModuleLoader__.load({
+         useWorkspaceShortcuts: useIsolatedWorkspaceShortcuts,
+       });
+       const officialProps = Object.assign({}, props, { useSessions: useTaskSessions, t: officialT, openSession, open: openSession });
++      if (nativeTabs && typeof props.searchSessions === "function") {
++        officialProps.searchSessions = async (...args) => {
++          const result = await props.searchSessions(...args);
++          return { ...result, items: result.items.filter(item => nativeTabs.sessionFilters.every(fn => fn(String(item.id)))) };
++        };
++      }
+       const guardedOfficialProps = Object.assign({}, officialProps, {
+         expandSidebar: safeExpandSidebar,
+         useWorkspaceShortcuts: useIsolatedWorkspaceShortcuts,
+@@ -5961,6 +6064,7 @@ window.__ModuleLoader__.load({
+         officialTree: Official,
+         hostProps: guardedHostProps,
+         hostT: officialT,
++        channelSources: sources,
+         t,
+         openSession,
+         openChannelSettings: props.openChannelSettings,
+@@ -6988,6 +7092,7 @@ window.__ModuleLoader__.load({
+           removeInsertedOpener();
+           removeInsertedOpener = () => {};
+           clearFilter();
++          insertedTabRegistry?.channelSources?.release();
+           insertedTabRegistry = null;
+         };
+         const unwrap = () => {
+@@ -7002,6 +7107,7 @@ window.__ModuleLoader__.load({
+           wrappedEntry = null;
+           originalComp = null;
+           ownedWrapper = null;
++          ownedRegistry?.channelSources?.release();
+           ownedRegistry = null;
+         };
+         const insertChannelTab = (entry) => {
+@@ -7014,12 +7120,13 @@ window.__ModuleLoader__.load({
+           }
+           ensureFilter(registry);
+           if (registry.getTabs().some((item) => item.id === "channels")) return true;
++          const sources = channelSourcesFor(registry);
+           const refreshInsertedTab = () => {
+             removeInsertedTab = registry.insert({
+               id: "channels",
+               label: t("rail.channels"),
+               order: 20,
+-              matchSession: isChannelSession,
++              matchSession: id => isChannelSession(id) || sources.getSnapshot().some(row => row.id === id),
+               render: (props) => {
+                 const hostOpen = typeof props.openSession === "function"
+                   ? props.openSession
+@@ -7032,6 +7139,7 @@ window.__ModuleLoader__.load({
+                   hostProps: props,
+                 }, h(ChannelOfficialView, Object.assign({}, props, {
+                   officialTree: registry.officialTree,
++                  channelSources: sources,
+                   hostProps: props,
+                   hostT: props.officialT || props.t,
+                   t,
+@@ -7074,6 +7182,7 @@ window.__ModuleLoader__.load({
+             if (!official) return;
+             originalComp = official.component;
+             const registry = createNativeTabRegistry(originalComp);
++            channelSourcesFor(registry);
+             ownedRegistry = registry;
+             removeInsertedOpener = installSessionOpener(registry);
+             ensureFilter(registry);
+diff --git a/tests/sidebar-channel-source.test.mjs b/tests/sidebar-channel-source.test.mjs
+new file mode 100644
+index 0000000..585baa9
+--- /dev/null
++++ b/tests/sidebar-channel-source.test.mjs
+@@ -0,0 +1,42 @@
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import test from 'node:test'
++import { extractBlock } from './sidebar-lifecycle-harness.mjs'
++
++const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
++const code = extractBlock(src, '    const channelSourceRegistries', '    function syntheticChannelWorkspaceState', 'channel source bridge')
++const { channelSourcesFor, projectExternalGroups } = new Function('CHANNEL_GROUP_IDS', code
++  + '; return { channelSourcesFor, projectExternalGroups }')(['weixin'])
++
++test('external Octo source groups real sessions and disappears on uninstall without touching IM Connect data', () => {
++  const registry = {}, bridge = channelSourcesFor(registry), listeners = new Set()
++  let rows = []
++  const register = bridge.register({ id: 'octo', label: 'Octo', getSnapshot: () => rows,
++    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) } })
++  let notifications = 0
++  bridge.subscribe(() => notifications++)
++  rows = [
++    { id: 'main', path: [{ key: 'groups', label: 'Groups' }, { key: 'group:1', label: '同名群' }, { key: 'main', label: 'Main' }] },
++    { id: 'topic', path: [{ key: 'groups', label: 'Groups' }, { key: 'group:1', label: '同名群' }, { key: 'topic:3', label: 'Topic' }] },
++    { id: 'other', path: [{ key: 'groups', label: 'Groups' }, { key: 'group:2', label: '同名群' }, { key: 'main', label: 'Main' }] },
++    { id: 'wechat', path: [] }, { id: 'deleted', path: [] },
++  ]
++  for (const listener of listeners) listener()
++  const existing = [{ id: 'weixin', sessions: [{ sessionId: 'wechat' }] }]
++  const state = { byId: { main: {}, topic: {}, other: {}, wechat: {} } }
++  const groups = projectExternalGroups(existing, bridge.getSnapshot(), state)
++  assert.equal(groups[0], existing[0])
++  const channels = groups.filter(group => group.external)
++  assert.deepEqual(channels.filter(group => group.sessions.length).map(group => group.sessions[0].sessionId),
++    ['main', 'topic', 'other'])
++  const labels = channels.filter(group => group.label === '同名群')
++  assert.equal(labels.length, 2)
++  assert.notEqual(labels[0].path, labels[1].path)
++  assert.ok(channels.find(group => group.label === 'Topic').path.startsWith(labels[0].path + '/'))
++  register()
++  assert.equal(listeners.size, 0)
++  assert.deepEqual(bridge.getSnapshot(), [])
++  assert.equal(notifications, 2)
++  bridge.release()
++  assert.equal(registry.channelSources, undefined)
++})
+diff --git a/tests/sidebar-host.test.mjs b/tests/sidebar-host.test.mjs
+index b45cf36..c5dbc2c 100644
+--- a/tests/sidebar-host.test.mjs
++++ b/tests/sidebar-host.test.mjs
+@@ -350,7 +350,7 @@ test('插入频道页签 render 注入的 openSession 在运行时将行点击
+ 
+   const code = extractBlock(client, '        const insertChannelTab = (entry) => {', '        const sync = () => {\n          if (syncing) return;', '插入频道页签')
+   const fn = new Function(
+-    'findNativeTabRegistry', 'installSessionOpener', 'ensureFilter', 't', 'isChannelSession',
++    'findNativeTabRegistry', 'channelSourcesFor', 'installSessionOpener', 'ensureFilter', 't', 'isChannelSession',
+     'openRegisteredSession', 'openListedSession', 'resolveHostSessionId', 'createImSessionOpener', 'ctx', 'h',
+     'ImSidebarFallbackBoundary', 'ChannelUnavailable', 'ChannelOfficialView',
+     'openChannelSettings', 'openImSettings', 'archiveHostSession', 'unarchiveHostSession',
+@@ -359,6 +359,7 @@ test('插入频道页签 render 注入的 openSession 在运行时将行点击
+     `${code}; return insertChannelTab;`
+   )(
+     () => fakeRegistry,
++    () => undefined,
+     () => () => {},
+     () => {},
+     (key) => key,
+diff --git a/tests/sidebar-lifecycle-harness.mjs b/tests/sidebar-lifecycle-harness.mjs
+index b738af1..c1b6e23 100644
+--- a/tests/sidebar-lifecycle-harness.mjs
++++ b/tests/sidebar-lifecycle-harness.mjs
+@@ -47,6 +47,7 @@ export function createHarness(body, kind) {
+     isForeignSidebarHost: component => !!component?.__dshNativeTabHost || component?.__dshNativeTabWrapped === true || component?.__imConnectWrapped === true,
+     resolveOfficialTreeComponent: component => component,
+     createNativeTabRegistry: registry,
++    channelSourcesFor: () => undefined,
+     attachNativeTabRegistry: nativeTabs.attachNativeTabRegistry,
+     findNativeTabRegistry: find,
+     subscribeLocale: () => () => {}, subscribeChannelMembership: () => () => {},
+diff --git a/tests/sidebar-shell-harness.mjs b/tests/sidebar-shell-harness.mjs
+index cd3600e..d784a8d 100644
+--- a/tests/sidebar-shell-harness.mjs
++++ b/tests/sidebar-shell-harness.mjs
+@@ -34,7 +34,7 @@ export function createImShellHarness(storage, source = readFileSync(new URL('../
+       if (old && deps && deps.length === old.deps?.length && deps.every((value, i) => Object.is(value, old.deps[i]))) return
+       effects.push(() => { old?.cleanup?.(); state[index] = { deps, cleanup: callback() } })
+     },
+-    fallbackT: key => key, EMPTY_EXTRA_TABS: [],
++    fallbackT: key => key, EMPTY_EXTRA_TABS: [], EMPTY_CHANNEL_SOURCES: [],
+     currentSessionId: snapshot => snapshot.current ?? null,
+     applySessionFilters: value => value, resolveHostSessionId: id => id,
+     openRegisteredSession() {}, openListedSession() {}, ensureStyle() {},
