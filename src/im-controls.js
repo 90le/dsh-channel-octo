@@ -18,7 +18,8 @@ export function normalizeImControls(input) {
   }
 }
 
-const safeCommands = new Set(['help', 'status', 'new', 'card', 'choose'])
+const safeCommands = new Set(['help', 'status', 'new', 'stop'])
+export const OCTO_STOP = new Error('octo_user_stop')
 const mentionPrefix = /^(?:@\[[^\]\r\n]+\]|[@＠]\S+)\s+/u
 const structuredMention = /^@\[([\w.-]+):[^\]\r\n]+\]$/u
 const invisible = /[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029\p{Cf}]/gu
@@ -31,7 +32,7 @@ function targetsOnlyBot(botUid, mention) {
 
 /**
  * Classify native inbound text: { kind: 'text' }, { kind: 'blocked' }, or
- * { kind: 'command', command: 'help' | 'status' | 'new' }. Only 'text' may
+ * { kind: 'command', command: 'help' | 'status' | 'new' | 'stop' }. Only 'text' may
  * enter the agent prompt path. The parser never executes a command.
  *
  * The caller supplies routeAllowed and actorApproved from the current

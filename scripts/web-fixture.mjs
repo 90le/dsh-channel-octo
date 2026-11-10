@@ -108,6 +108,8 @@ function removeFirstFixtureSession() {
   console.log('FIXTURE_SESSION_REMOVED')
 }
 const peer = process.env.DSH_OCTO_FIXTURE_WIRE === '1' ? await wirePeer() : null
+const stopFixture = process.env.DSH_OCTO_FIXTURE_STOP === '1'
+  ? (await import('./native-stop-fixture.mjs')).nativeStopFixture({ peer, home: process.env.DSH_HOME, modelStream }) : null
 function nextMessage() {
   const [type, address] = routes[received]
   received++
@@ -126,13 +128,15 @@ function nextMessage() {
     },
   }
 }
-if (peer) setInterval(() => {
+if (peer && !stopFixture) setInterval(() => {
   if (peer.send && received < routes.length && received === sent
     && (!browserReady || received !== 1 || existsSync(browserReady + '.owned'))) peer.send(nextMessage())
 }, 50).unref()
 const realFetch = globalThis.fetch
 globalThis.fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : String(input))
+  const stopResponse = stopFixture?.(url, init)
+  if (stopResponse) return stopResponse
   const json = value => Response.json(value)
   if (ownerSmoke && url.hostname === 'storage-fixture.invalid') {
     uploaded = init.method === 'PUT' && Buffer.from(init.body).toString() === 'written by native DSH'
@@ -161,7 +165,7 @@ globalThis.fetch = async (input, init) => {
     if (url.pathname.endsWith('/verify-bot')) {
       const { bot_token: token } = JSON.parse(init.body)
       if (token === 'bf_fixture_second' || token === 'bf_fixture_second_rotated') return json({ bot_uid: 'fixture-bot-second', space_id: 'fixture-space' })
-      return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space', ...(ownerSmoke && { owner_uid: 'fixture-user' }) })
+      return json({ bot_uid: 'fixture-bot', space_id: 'fixture-space', ...((ownerSmoke || stopFixture) && { owner_uid: 'fixture-user' }) })
     }
     if (url.pathname.endsWith('/register') && peer) {
       return json({ robot_id: 'fixture-bot', im_token: 'fixture-im-secret', ws_url: peer.wsUrl })
@@ -861,10 +865,9 @@ globalThis.fetch = async (input, init) => {
       return new Response(frames.map(frame => 'event: ' + frame.type + '\ndata: ' + JSON.stringify(frame) + '\n\n').join(''),
         { headers: { 'Content-Type': 'text/event-stream' } })
     }
-    const snapshot = body.messages.filter(m => m.role === 'user').flatMap(m =>
-      typeof m.content === 'string' ? [m.content] : m.content.map(c => c.text ?? ''),
-    ).filter(text => text.includes('Octo 当前会话规则快照')).at(-1) ?? ''
-    const rulesOk = round <= 2 || round === 6 ? !snapshot
+    const systemText = typeof body.system === 'string' ? body.system : (body.system ?? []).map(c => c.text ?? '').join('\n')
+    const snapshot = systemText.includes('Octo 当前会话规则快照') ? systemText : ''
+    const rulesOk = history.includes('Octo 当前会话规则快照') ? false : round <= 2 || round === 6 ? !snapshot
       : round === 3 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && !snapshot.includes('THREAD-FIXTURE')
         : round === 4 ? snapshot.includes('PARENT-FIXTURE {{leave_literal}}') && snapshot.includes('THREAD-FIXTURE')
           : snapshot.includes('"status":"empty"') && !snapshot.includes('PARENT-FIXTURE') && !snapshot.includes('THREAD-FIXTURE')
@@ -873,7 +876,7 @@ globalThis.fetch = async (input, init) => {
         : history.includes('GROUP-HISTORY-FIXTURE') && !history.includes('TOPIC-HISTORY-FIXTURE')
     if (round && ((body.tools ?? []).length !== 0 && !ownerSmoke
       || !rulesOk || !historyOk || /FUTURE-HISTORY-FIXTURE|WRONG-ROUTE-FIXTURE/.test(history)
-      || JSON.stringify(body.system ?? '').includes('PARENT-FIXTURE')
+      || /GROUP-HISTORY-FIXTURE|TOPIC-HISTORY-FIXTURE|TOPIC-QUOTE-FIXTURE/u.test(systemText)
       || (round === 2 && (deleteSmoke ? history.includes('fixture response 1') : !history.includes('fixture response 1')))
       || (round >= 3 && round !== 6 && /fixture (prompt|response) [1-2]/.test(history))
       || (round === 6 && (!history.includes('fixture response 2') || history.includes('fixture response 1')))
@@ -906,6 +909,21 @@ globalThis.fetch = async (input, init) => {
   if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return realFetch(input, init)
   return new Response(null, {status: 503})
 }
+}
+
+function modelStream(model, id, content, tool) {
+  const frames = [
+    { type: 'message_start', message: { id, model, usage: { input_tokens: 3, output_tokens: 0 } } },
+    { type: 'content_block_start', index: 0, content_block: tool
+      ? { type: 'tool_use', id: tool.id, name: tool.name, input: {} } : { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: tool
+      ? { type: 'input_json_delta', partial_json: JSON.stringify(content) } : { type: 'text_delta', text: content } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 5 } },
+    { type: 'message_stop' },
+  ]
+  return new Response(frames.map(frame => 'event: ' + frame.type + '\ndata: ' + JSON.stringify(frame) + '\n\n').join(''),
+    { headers: { 'Content-Type': 'text/event-stream' } })
 }
 
 async function appBotFixture() {
@@ -975,20 +993,8 @@ async function appBotFixture() {
     }
   }, 50).unref()
 
-  const stream = (body, content, tool) => {
-    const frames = [
-      { type: 'message_start', message: { id: 'appbot-fixture', model: body.model, usage: { input_tokens: 3, output_tokens: 0 } } },
-      { type: 'content_block_start', index: 0, content_block: tool
-        ? { type: 'tool_use', id: 'toolu_appbot_' + (step - 1), name: tool, input: {} } : { type: 'text', text: '' } },
-      { type: 'content_block_delta', index: 0, delta: tool
-        ? { type: 'input_json_delta', partial_json: JSON.stringify(content) } : { type: 'text_delta', text: content } },
-      { type: 'content_block_stop', index: 0 },
-      { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 5 } },
-      { type: 'message_stop' },
-    ]
-    return new Response(frames.map(frame => 'event: ' + frame.type + '\ndata: ' + JSON.stringify(frame) + '\n\n').join(''),
-      { headers: { 'Content-Type': 'text/event-stream' } })
-  }
+  const stream = (body, content, tool) => modelStream(body.model, 'appbot-fixture', content,
+    tool && { name: tool, id: 'toolu_appbot_' + (step - 1) })
   globalThis.fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     const json = value => Response.json(value)
@@ -1138,7 +1144,7 @@ async function appBotFixture() {
       if (tail.includes('Generate the session title from this JSON array of human messages:')) return stream(body, 'AppBot fixture title')
       const round = Number([...history.matchAll(/appbot fixture prompt ([12])/g)].at(-1)?.[1])
       if (!round || /APPBOT-REJECT-|fixture (?:prompt|response) [1-6]|NEVER_RETURN_WIRE_/u.test(history.replaceAll('appbot fixture prompt', 'appbot turn'))
-        || history.includes('Octo 当前会话规则快照')) return fail('MODEL_CONTEXT')
+        || (history + JSON.stringify(body.system ?? '')).includes('Octo 当前会话规则快照')) return fail('MODEL_CONTEXT')
       const names = (body.tools ?? []).map(tool => tool.name)
       if (names.some(name => /^octo_(?:groups?|members|space_|targets_|rules_|threads?|webhooks?|voice)/.test(name)
         || /^octo_messages_(?:search|resolve_|send_target)/.test(name))) return fail('UNAVAILABLE_TOOLS')

@@ -25,6 +25,7 @@ test('DM commands need an independently approved actor and route on a safe accou
   assert.deepEqual(parseSafeCommand(' \t/HELP \t', enabled, dm), command('help'))
   assert.deepEqual(parseSafeCommand('/status', enabled, dm), command('status'))
   assert.deepEqual(parseSafeCommand('/new', enabled, dm), command('new'))
+  assert.deepEqual(parseSafeCommand('/STOP', enabled, dm), command('stop'))
   for (const route of [undefined, { ...dm, routeAllowed: false }, { ...dm, actorApproved: false },
     { ...dm, actorApproved: 'true' }, { ...dm, channelType: 9 }, { ...dm, hasAttachments: true }]) {
     assert.deepEqual(parseSafeCommand('/status', enabled, route), blocked)
@@ -52,7 +53,7 @@ test('group and topic commands require the bot owner and a direct, unambiguous b
 })
 
 test('slash-like input is either an exact safe command or consumed without prompting', () => {
-  for (const input of ['/shell whoami', '/reset', '/new session', '/new;whoami', '/new/foo', '/help.md',
+  for (const input of ['/shell whoami', '/reset', '/card', '/choose', '/stop another', '/new session', '/new;whoami', '/new/foo', '/help.md',
     '/new\nrun this', '/new\r\n', '/help\u200b', '\u200b/help', '/status@octo_bot', '//new', '/']) {
     assert.deepEqual(parseSafeCommand(input, enabled, dm), blocked, input)
   }

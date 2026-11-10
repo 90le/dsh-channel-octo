@@ -82,11 +82,11 @@ const action = (tool, detail, status = 'active') => ({
   statusTone: status === 'done' ? 'Good' : status === 'failed' ? 'Attention' : 'Accent',
 })
 
-function frame(mode, reasoningId, phase, seconds, stats, detail) {
+function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   const terminal = outcomes.includes(phase)
   const actual = !terminal && stats.approval ? 'approval' : !terminal && stats.waiting ? 'question'
     : !terminal && phase !== 'delivering' && stats.active > 0 ? 'tool' : phase
-  const label = labels[actual]
+  const label = interrupted ? '任务已停止' : labels[actual]
   const state = wireStates[actual] ?? actual
   const elapsed = '已用时 ' + seconds + ' 秒'
   const counts = stats.steps + ' 步 · ' + stats.calls + ' 次工具' + (stats.files ? ' · 已发 ' + stats.files + ' 个文件' : '')
@@ -152,7 +152,7 @@ export class Progress {
     }
   }
 
-  start(job, mode, signal, authorize) {
+  start(job, mode, signal, authorize, terminalSignal = signal) {
     if (!mode || mode === 'off') return { stage() {}, trace() {}, async finish() { return false } }
     const route = { channel_id: job.channel_id ?? job.sender, channel_type: job.channel_type }
     const reasoningId = 'dsh-octo-' + (decimalId(job.message_id) ?? randomUUID())
@@ -163,24 +163,24 @@ export class Progress {
     let tryCard = mode === 'auto', probeAt = started, dueAt = started + initialDelay
     let editAt, refreshAt, scheduledAt
     const active = () => !closed && !blocked && !signal.aborted
-    const render = (state, detail) => frame(format, reasoningId, state, Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail)
+    const render = (state, detail, interrupted) => frame(format, reasoningId, state, Math.max(0, Math.floor((Date.now() - started) / 1000)), stats, detail, interrupted)
     const clearTimer = () => {
       clearTimeout(timer)
       timer = scheduledAt = undefined
     }
-    const request = (fn, terminal = false) => this.#request(async () => {
+    const request = (fn, terminal = false, requestSignal = signal) => this.#request(async () => {
       if (authorize) {
         try {
-          if (await authorize(signal) !== true) throw new Error('progress_access_denied')
+          if (await authorize(requestSignal) !== true) throw new Error('progress_access_denied')
         } catch (error) {
-          blocked = true
+          if (!requestSignal.aborted) blocked = true
           clearTimer()
           throw error
         }
       }
-      if (blocked || signal.aborted || (!terminal && closed)) throw new Error('progress_closed')
+      if (blocked || requestSignal.aborted || (!terminal && closed)) throw new Error('progress_closed')
       return fn()
-    }, signal)
+    }, requestSignal)
     const schedule = () => {
       if (!active() || flight) return
       const when = Math.max(dueAt, this.#retryAt)
@@ -236,25 +236,26 @@ export class Progress {
         schedule()
       })
     }
-    const finish = async (outcome, { detail } = {}) => {
+    const finish = async (outcome, { detail, interrupted } = {}) => {
       closed = true
       clearTimer()
       signal.removeEventListener('abort', clearTimer)
       await flight
-      if (!id || blocked || signal.aborted || !outcomes.includes(outcome)) return false
+      const finishSignal = interrupted && outcome === 'stopped' ? terminalSignal : signal
+      if (!id || blocked || finishSignal.aborted || !outcomes.includes(outcome)) return false
       const deadline = Date.now() + terminalWaitBudget
-      const payload = render(outcome, detail)
+      const payload = render(outcome, detail, interrupted)
       const terminalSeq = ++seq
       for (let attempt = 0; attempt < 2; attempt++) {
         let when = Math.max(this.#retryAt, attempt ? Date.now() + editInterval : 0)
-        while (when > Date.now() && !signal.aborted) {
+        while (when > Date.now() && !finishSignal.aborted) {
           if (when > deadline) return false
-          await waitFor(when - Date.now(), signal)
+          await waitFor(when - Date.now(), finishSignal)
           when = Math.max(when, this.#retryAt)
         }
-        if (signal.aborted) return false
+        if (finishSignal.aborted) return false
         // Identical payload and sequence make a retry safe if the previous edit landed.
-        const result = await request(() => this.api.editProgress(route, id, payload, terminalSeq, false, signal), true)
+        const result = await request(() => this.api.editProgress(route, id, payload, terminalSeq, false, finishSignal), true, finishSignal)
         if (result.ok) return true
         if (blocked) return false
         if (!mayRetry(result.status)) return false

@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { admit, OctoClient } from '../src/octo.js'
 import { Worker } from '../src/worker.js'
 import { Store } from '../src/store.js'
+import { sendCard } from '../src/octo-cards.js'
 
 function fixture(t, options = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'octo-integrated-'))
@@ -83,7 +84,7 @@ test('admitted attachment goes to DSH; the same turn sends its declared file to 
   assert.deepEqual(store.overview().counts.map(row => [row.state, row.total]), [['sent', 2]])
 })
 
-test('WebSocket sidecar consumes only its own click, persists before ACK and does not replay', async t => {
+test('WebSocket sidecar consumes an existing legacy card only once, persisting before ACK', async t => {
   const { store, config } = fixture(t, { dmCommands: 'safe' })
   let rawCard
   const acks = [], responses = []
@@ -102,8 +103,12 @@ test('WebSocket sidecar consumes only its own click, persists before ACK and doe
   }
   const api = new OctoClient(config)
   const worker = new Worker({ api, store, config, host: { run() { assert.fail('command/click ran the model') } }, log() {} })
-  store.add('1', admit(msg('1', { type: 1, content: '/choose' }), config))
-  await worker.process(store.next(Date.now()), signal)
+  // Existing cards can still receive a callback after retiring the demo command.
+  const { binding } = await sendCard(config, { channel_id: 'alice', channel_type: 1, operatorUid: 'alice' }, {
+    title: 'Legacy test card', text: 'Choose one', actions: [{ id: 'confirm', label: 'Confirm' }],
+    choice: { id: 'selection', label: 'Options', options: [{ title: 'A', value: 'A' }, { title: 'B', value: 'B' }] },
+  }, signal)
+  store.bindCard(binding)
   assert.equal(rawCard.profile, 'octo/v2')
   assert.equal(store.hasOpenCard(), true)
   const click = { event_id: '8', event_type: 'card_action', event_data: {

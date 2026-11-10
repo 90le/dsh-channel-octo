@@ -3,6 +3,7 @@ import { validUid, validBotIdentity } from './config.js'
 import { randomUUID } from 'node:crypto'
 import { ruleScope } from './rules.js'
 import { normalizeOctoContent } from './octo-content.js'
+import { quoteDisplayName } from './octo-quote.js'
 import { parseSafeCommand } from './im-controls.js'
 import { ChannelApi, ChannelApiError } from './channel-api.js'
 import { OctoError, readApiError } from './api-errors.js'
@@ -372,7 +373,7 @@ export class OctoClient {
     return { routes, nextPage: result.nextPage }
   }
 
-  async recentMessages(config, route, before, signal) {
+  async recentMessages(config, route, before, signal, quoteId) {
     const type = route.channel_type, id = route.channel_id
     if (![1, 2, 5].includes(type) || (type === 1 ? !validUid(id) || id.includes('@') : !ruleScope(type, id))) {
       throw new OctoError('invalid_history_scope')
@@ -402,7 +403,8 @@ export class OctoClient {
       if (config.botKind === 'app') {
         const verified = await this.channel.appMessage(route, id, messageId, signal)
         if (verified.text.trim()) rows.push({ seq: verified.message_seq, messageId, sender: verified.from_uid,
-          text: Array.from(verified.text).slice(0, 280).join('') })
+          text: Array.from(verified.text).slice(0, 280).join(''),
+          ...(messageId === quoteId && { quote: { type: verified.type, truncated: Array.from(verified.text).length > 280 } }) })
         seenSeq.add(seq); seenId.add(messageId)
         continue
       }
@@ -418,8 +420,14 @@ export class OctoClient {
       if (!content?.text?.trim()) continue
       seenSeq.add(seq)
       seenId.add(messageId)
+      // Enrich the requested row only after the existing history checks; no
+      // additional rows, requests, or attachment bytes enter the result.
+      const quote = messageId === quoteId && normalizeOctoContent(payload, { historyQuote: true })
+      const quoteText = quote && Array.from(quote.text)
       rows.push({ seq, messageId, sender: validUid(item.from_uid) ? item.from_uid : 'unknown',
-        text: Array.from(content.text).slice(0, 280).join('') })
+        text: Array.from(content.text).slice(0, 280).join(''),
+        ...(quote && { quote: { name: quoteDisplayName(item.from_name), type: payload.type, text: quoteText.slice(0, 280).join(''),
+          media: quote.media, truncated: quote.truncated || quoteText.length > 280 } }) })
     }
     return { rows: rows.sort((a, b) => a.seq - b.seq).slice(-20), more: flag(data.more) || (data.messages?.length ?? 0) >= 20 }
   }
@@ -675,6 +683,8 @@ export function admit(event, config) {
   }) : { kind: 'text' }
   if (command.kind === 'blocked' || (command.kind === 'command' && payload.type !== 1)) return
   return { messageId, sender, text, channelId, channelType, ambient,
+    ...(command.command === 'stop' && Number.isSafeInteger(message.timestamp) && message.timestamp > 0
+      && { stopSentAt: message.timestamp }),
     ...(messageSeq && { messageSeq }), ...(quoteId && { quoteId }),
     ...(attachment && { attachment }), ...(attachments && { attachments }), ...(parts && { parts }), ...(command.kind === 'command' && { command: command.command }) }
 }

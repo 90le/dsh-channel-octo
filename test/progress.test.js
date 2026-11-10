@@ -61,6 +61,24 @@ test('native approval has a distinct waiting label and cannot hide the final sta
   assert.equal(f.calls.filter(c => c.type === 'edit').at(-1).frame.data.statusLabel, '回复已发送')
 })
 
+test('an explicit stop ends a created progress card using the still-authorized service lifetime', async t => {
+  const tick = clock(t), f = fixture()
+  const task = new AbortController(), service = new AbortController(), checked = []
+  const handle = f.progress.start(job, 'auto', task.signal, async signal => {
+    checked.push(signal)
+    return !signal.aborted
+  }, service.signal)
+  await tick(450)
+  task.abort()
+  assert.equal(await handle.finish('stopped', { interrupted: true, detail: '收到 /stop' }), true)
+  const edit = f.calls.at(-1)
+  assert.equal(edit.frame.state, 'stopped')
+  assert.equal(edit.frame.data.statusLabel, '任务已停止')
+  assert.equal(edit.frame.data.progressText, '收到 /stop')
+  assert.equal(checked.at(-1), service.signal)
+  assert.ok(checked.length > 1 && checked.slice(0, -1).every(signal => signal === task.signal))
+})
+
 test('type-17 template shows queued, running, responding and confirmed completion', async t => {
   const tick = clock(t)
   const requests = []

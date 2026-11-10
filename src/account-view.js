@@ -151,7 +151,7 @@ export function createBotCommandMenu(React, { Button }) {
     }
     return h('section', { className: 'dsho-account-footer', 'aria-label': tr('commandMenu') },
       h('strong', null, tr('commandMenu')),
-      h('p', { className: 'dsho-account-note' }, '/help · /status · /new · /card · /choose'),
+      h('p', { className: 'dsho-account-note' }, '/help · /status · /new · /stop'),
       h('p', { className: 'dsho-account-note' }, tr(disabled ? 'menuUnavailable' : 'menuHint')),
       h('div', { className: 'dsho-account-buttons' }, ...['publish', 'clear'].map(kind =>
         h(Button, { key: kind, type: 'button', variant: 'outline', size: 'sm', disabled: !!blocked,

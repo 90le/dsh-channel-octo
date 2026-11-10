@@ -2,6 +2,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { statSync } from 'node:fs'
 import { ruleScope } from './rules.js'
+import { DEFAULT_REPLY_TIMEOUT_MS, UNLIMITED_REPLY_TIMEOUT } from './reply-timeout.js'
 
 export const validUid = (s) => typeof s === 'string' && /^[A-Za-z0-9_.:@-]{1,128}$/.test(s)
 export const validBotIdentity = (config) => validUid(config?.botUid) && (config.botKind === 'app'
@@ -67,11 +68,13 @@ export function resolveConfig(config, env = process.env) {
     throw new Error('invalid_working_or_state_directory')
   }
   const waitSeconds = config.waitSeconds ?? 15
-  const timeoutMs = config.timeoutMs ?? 120_000
+  const timeoutMs = config.timeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS
   const progress = config.progress ?? 'auto'
   if (!['auto', 'typing', 'off'].includes(progress)) throw new Error('invalid_progress_mode')
   if (!Number.isInteger(waitSeconds) || waitSeconds < 5 || waitSeconds > 30
-    || !Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000) throw new Error('invalid_timeouts')
+    || (timeoutMs !== UNLIMITED_REPLY_TIMEOUT && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000))) {
+    throw new Error('invalid_timeouts')
+  }
   return {
     apiBase, token, stateDir, waitSeconds, timeoutMs, cwd: config.cwd,
     ...identity, allowed: new Set(allowedUids), groups, threads, threadRuleMode,

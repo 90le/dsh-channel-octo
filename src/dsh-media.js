@@ -1,6 +1,7 @@
 import { constants } from 'node:fs'
 import { lstat, open, readlink, realpath } from 'node:fs/promises'
 import path from 'node:path'
+import { quoteAttachmentExcerpt, quoteNativeFilename, quoteTextBytes } from './octo-quote.js'
 
 const MiB = 1024 * 1024
 const maxFiles = 16
@@ -50,14 +51,15 @@ function rasterType(bytes) {
   if (header.startsWith('RIFF') && header.slice(8) === 'WEBP') return 'image/webp'
 }
 
-function inlineText(mime, name, bytes, remaining) {
+function inlineText(mime, name, bytes, remaining, quotedBytes) {
   if (bytes.length > Math.min(maxInlineFileBytes, remaining)) return
   const type = mime === octet ? mimeByExtension.get(path.extname(name).toLowerCase()) : mime
   if (!type || (!type.startsWith('text/') && !inlineTypes.has(type))) return
   try {
     const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
     if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u.test(decoded)) return
-    return { type: 'text', text: 'Octo attachment ' + JSON.stringify(name) + ' (untrusted file content):\n' + decoded }
+    return { type: 'text', text: quotedBytes !== undefined ? quoteAttachmentExcerpt(name, decoded, quotedBytes)
+      : 'Octo attachment ' + JSON.stringify(name) + ' (untrusted file content):\n' + decoded }
   } catch {
     // Invalid UTF-8 stays a verbatim file instead of being decoded with replacements.
   }
@@ -86,22 +88,26 @@ export async function prepareInput(ctx, _agent, text, attachments = [], signal, 
   if (typeof text !== 'string' || !Array.isArray(attachments)) throw failure('invalid_dsh_input')
   if (attachments.length > maxFiles) throw failure('dsh_attachment_limit')
 
-  let totalBytes = 0, inlineBytes = 0
+  let totalBytes = 0, inlineBytes = 0, quotedBytes = quoteTextBytes
   const images = []
   const parts = []
-  for (const item of attachments) {
+  const quoted = new Set(order?.filter(part => part?.quoted === true).map(part => part.media))
+  for (const [index, item] of attachments.entries()) {
     if (!Buffer.isBuffer(item?.bytes)) throw failure('invalid_dsh_attachment')
     const { bytes } = item
     totalBytes += bytes.length
     if (bytes.length > maxFileBytes || totalBytes > maxTotalBytes) throw failure('dsh_attachment_limit')
-    const name = displayName(item.name)
+    const isQuoted = quoted.has(index)
+    const name = displayName(isQuoted ? quoteNativeFilename(item.name) : item.name)
     const mime = (typeof item.mime === 'string' ? item.mime.split(';', 1)[0].trim().toLowerCase() : '') || octet
     // Octo's MIME can be a filename/type hint. A known raster signature selects
     // the candidate format; DSH still validates the full image before storing it.
     const mediaType = imageTypes.has(mime) ? rasterType(bytes) ?? mime : mime === octet ? rasterType(bytes) : undefined
-    const inline = mediaType ? undefined : inlineText(mime, name, bytes, maxInlineTotalBytes - inlineBytes)
+    const inline = mediaType ? undefined : inlineText(mime, name, bytes, maxInlineTotalBytes - inlineBytes,
+      isQuoted ? quotedBytes : undefined)
     if (inline) {
       inlineBytes += bytes.length
+      if (isQuoted) quotedBytes -= Buffer.byteLength(inline.text)
       parts.push(inline)
     } else if (mediaType) {
       parts.push({ type: 'image', index: images.length })

@@ -4,8 +4,7 @@ export const BOT_COMMANDS = Object.freeze([
   { command: 'help', description: '查看频道命令帮助' },
   { command: 'status', description: '查看当前会话状态' },
   { command: 'new', description: '开始新会话' },
-  { command: 'card', description: '查看展示卡片' },
-  { command: 'choose', description: '试用交互卡片' },
+  { command: 'stop', description: '停止当前频道正在处理的任务' },
 ].map(Object.freeze))
 
 export function botCommandMenu(action) {

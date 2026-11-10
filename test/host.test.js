@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { DshHost } from '../src/dsh.js'
+import { OCTO_STOP } from '../src/im-controls.js'
 
 function fakeHost({ toolGuard = true, reason = 'completed' } = {}) {
   const events = new EventEmitter()
@@ -205,6 +206,47 @@ test('steering joins only the claimed Octo-owned turn and replaces the earlier a
   events.emit('session/event', agent.session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
   assert.equal(await response, 'new answer')
   assert.equal(offer, undefined)
+})
+
+test('native stop cancels an exclusive turn without clearing unrelated Web input', async t => {
+  for (const mode of ['owned', 'exclusive borrowed', 'mixed borrowed', 'unclaimed borrowed']) await t.test(mode, async () => {
+    const { ctx, events, agentId, calls } = fakeHost()
+    const controller = new AbortController(), ready = Promise.withResolvers()
+    const pending = new Set(['web-prompt']), cancellations = []
+    const agent = {
+      id: agentId, status: 'idle', session: { id: agentId, header: { cwd: '/fixture' } },
+      ctx: { get: name => name === 'tools' ? { restrict() { return () => {} }, guard() { return () => {} } } : null },
+      inbox: { remove(id) { pending.delete(id) } },
+      async whenIdle() {},
+      followup(message) {
+        this.status = 'running'
+        if (mode === 'unclaimed borrowed') pending.add(message.id)
+        else {
+          events.emit('agent/inbox/claimed', { agent, message, turn: 1 })
+          if (mode === 'mixed borrowed') events.emit('agent/inbox/claimed', { agent, message: { id: 'web-claimed' }, turn: 1 })
+        }
+        ready.resolve()
+      },
+      cancel(...args) { cancellations.push(args) },
+    }
+    if (mode === 'owned') ctx.agents.create = async ({ setup }) => {
+      await setup(agent.ctx, agent)
+      return { agent, async dispose() { calls.push('dispose') } }
+    }
+    else {
+      ctx.agents.get = () => agent
+      ctx.agentPresets.composedPreset = () => 'octo-text'
+    }
+    const run = new DshHost(ctx, '/fixture', 1000).run({ session_id: agentId, created: mode !== 'owned' },
+      'stop target', () => {}, controller.signal)
+    await ready.promise
+    controller.abort(OCTO_STOP)
+    await assert.rejects(run, error => error === OCTO_STOP)
+    assert.deepEqual(cancellations, ['owned', 'exclusive borrowed'].includes(mode)
+      ? [[{ kind: 'user' }, { keepInbox: true }]] : [])
+    assert.deepEqual([...pending], ['web-prompt'])
+    assert.equal(calls.includes('dispose'), mode === 'owned')
+  })
 })
 
 test('a completed marker never forwards the last tool preamble without a final assistant answer', async () => {

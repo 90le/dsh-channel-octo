@@ -17,6 +17,8 @@ import { formToolSpec } from './form-tool.js'
 import { deferredFormSpecs, publishDeferredForm, manageDeferredForm, deferredMessage, flushDeferredFeedback } from './deferred-forms.js'
 import { InboxRecovery } from './inbox.js'
 import { DirectoryDiscovery } from './directory-discovery.js'
+import { OCTO_STOP } from './im-controls.js'
+import { octoQuoteFromHistory } from './octo-quote.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
@@ -66,12 +68,8 @@ async function materializeInput(config, meta, signal) {
   const unavailable = { text: '【附件未能读取】' }
   if (!meta.parts && !attachments.length) throw new OctoError('attachment_unavailable')
   return { attachments, order: meta.parts?.map(part =>
-    Number.isInteger(part.media) ? (indices.has(part.media) ? { media: indices.get(part.media) } : unavailable) : part) }
+    Number.isInteger(part.media) ? (indices.has(part.media) ? { ...part, media: indices.get(part.media) } : unavailable) : part) }
 }
-const cardForm = command => command === 'card'
-  ? { title: 'DSH · Octo', text: '这是 Octo 展示卡片。输入 /choose 可以试用带按钮的交互卡片。' }
-  : { title: '请选择一个选项', text: '这个选择只在当前会话内确认。', actions: [{ id: 'confirm', label: '确认选择' }],
-    choice: { id: 'selection', label: '选项', options: [{ title: '选项 A', value: 'A' }, { title: '选项 B', value: 'B' }] } }
 function authoredCard(reply) {
   const match = /^```octo-card\s*\n([\s\S]{1,2300})\n```$/u.exec(reply.trim())
   if (!match) return
@@ -83,7 +81,7 @@ function authoredCard(reply) {
 }
 
 const textCommands = {
-  help: '可用命令：/help 帮助、/status 当前会话状态、/new 新会话、/card 展示卡片、/choose 交互卡片。',
+  help: '可用命令：/help 帮助、/status 当前会话状态、/new 新会话、/stop 停止你在当前频道正在处理的任务。',
   status: 'DSH 已收到这条消息，当前会话可以正常处理消息。',
   new: '已开启新会话，旧会话记录仍可在 DSH 查看。',
 }
@@ -126,6 +124,7 @@ export class Worker {
     this.questions = new QuestionBridge({ api, store, log })
     this.cursor = '0'
     this.steering = new Set()
+    this.stopControls = new Set()
     this.inbox = new InboxRecovery({ api, store, log, config: () => this.config,
       questionKey: message => this.questions.match(message)?.key,
       accept: (id, message, options) => this.acceptInbound(id, message, options) })
@@ -189,6 +188,11 @@ export class Worker {
   }
 
   acceptInbound(eventId, message, { historical = false, delayed = false, questionKey, appVerified = false } = {}) {
+    if (message.command === 'stop') {
+      if (this.stopIntake) return false
+      if (this.store.rememberAnswer(eventId, message, null) && !historical && !delayed) this.handleStop(message)
+      return true
+    }
     if (this.config.botKind === 'app' && !appVerified) {
       // Persist before the synchronous WS ACK. Serialize live authorization so
       // a question answer or steering input cannot skip the server Space guard.
@@ -236,14 +240,66 @@ export class Worker {
     return true
   }
 
+  handleStop(message) {
+    const active = this.activeWork, config = this.config
+    const request = { sender: message.sender, channel_type: message.channelType, channel_id: message.channelId,
+      message_id: message.messageId, ambient: message.ambient }
+    const authorized = () => this.config === config && !this.stopIntake && safeCommand(config, request)
+      && permitsRoute(config, request.sender, request.channel_type, request.channel_id)
+    if (!authorized() || this.stopControls.size >= 16) return
+    const budget = AbortSignal.timeout(8000)
+    const signal = this.intakeSignal ? AbortSignal.any([budget, this.intakeSignal]) : budget
+    const work = (async () => {
+      signal.throwIfAborted()
+      // App Bots must verify the exact triggering message against the App's
+      // Space grant before acting. User Bot controls use the verified sender
+      // and can only stop work that already belongs to that same sender.
+      if (config.botKind === 'app' && !await this.api.allowsMessage(config, request, signal)) return
+      signal.throwIfAborted()
+      if (!authorized()) return
+      const target = active?.job
+      const matching = target && request.sender === target.sender && request.channel_type === target.channel_type
+        && request.channel_id === (target.channel_id ?? target.sender)
+        && (!message.stopSentAt || message.stopSentAt * 1000 + 999 >= active.startedAt)
+        && (!message.messageSeq || !target.message_seq || message.messageSeq > target.message_seq)
+      let stopped = false
+      if (matching && this.activeWork === active && !active.controller.signal.aborted
+        && this.store.stopWork(target.seq, active.merged)) {
+        active.question = this.questions.current?.binding
+        active.controller.abort(OCTO_STOP)
+        this.log('stopped_by_user')
+        stopped = true
+      }
+      await this.api.send(request.channel_id, stopped
+        ? '已请求停止当前任务，后续回复和文件交付将停止。已完成的操作不会撤销。'
+        : '当前频道没有可由你停止的正在处理的任务。', signal, request.channel_type)
+    })().catch(() => { if (!signal.aborted) this.log('stop_control_unconfirmed') })
+    this.stopControls.add(work)
+    void work.finally(() => this.stopControls.delete(work))
+  }
+
   async drain(signal) {
     while (!signal.aborted) {
       const job = !this.paused && this.store.next(Date.now())
       if (!job) { await delay(150, undefined, { signal }); continue }
       this.currentJob = job
-      const work = this.process(job, signal)
+      const active = { job, controller: new AbortController(), startedAt: Date.now(), terminalSignal: signal, merged: [] }
+      this.activeWork = active
+      const work = this.process(job, AbortSignal.any([signal, active.controller.signal]), active)
       this.inFlight = work
-      try { await work } finally {
+      try { await work }
+      catch (error) {
+        if (active.controller.signal.reason !== OCTO_STOP || error !== OCTO_STOP) throw error
+      } finally {
+        if (active.controller.signal.reason === OCTO_STOP && !signal.aborted) {
+          try {
+            if (active.question && await active.authorizeTerminal?.()) {
+              await this.questions.closeCard(active.question, '任务已停止，旧卡片不能继续提交。', signal)
+            }
+            await active.progress?.finish('stopped', { interrupted: true, detail: '收到 /stop，已停止本次任务。' })
+          } catch { this.log('stop_feedback_unconfirmed') }
+        }
+        this.activeWork = undefined
         this.currentJob = undefined
         this.steering.clear()
         if (this.inFlight === work) this.inFlight = undefined
@@ -483,18 +539,18 @@ export class Worker {
     // from a DM or substitute the parent channel for a topic.
     let result
     if ((before || meta.quoteId) && typeof this.api.recentMessages === 'function') {
-      try { result = await this.api.recentMessages(config, { ...route, ...(meta.directoryRecovery ?? {}) }, before, signal) }
+      try { result = await this.api.recentMessages(config, { ...route, ...(meta.directoryRecovery ?? {}) }, before, signal, meta.quoteId) }
       catch { signal.throwIfAborted(); this.log('channel_history_unavailable') }
     }
     const quote = meta.quoteId && result?.rows.find(row => row.messageId === meta.quoteId)
+    const quotedMessageId = meta.parts?.[0]?.octoQuote?.messageId ?? meta.quoteId
     let rows = group && before ? (result?.rows ?? []).filter(row =>
-      row.seq < before && row.messageId !== job.message_id && row.messageId !== meta.quoteId && row.sender !== config.botUid) : []
+      row.seq < before && row.messageId !== job.message_id && row.messageId !== quotedMessageId && row.sender !== config.botUid) : []
     rows = rows.slice(-12)
     return {
       source, status: !group ? 'quote-only' : !before ? 'position-unavailable' : !result ? 'unavailable'
         : rows.length ? 'recent-only' : 'empty',
-      ...(quote && { quote: { sender: quote.sender, text: quote.text,
-        ...(members.find(m => m.uid === quote.sender)?.name && { name: members.find(m => m.uid === quote.sender).name }) } }),
+      ...(quote && { quote: octoQuoteFromHistory(quote, members.find(m => m.uid === quote.sender)?.name) }),
       ...(group && { history: rows.map(({ seq, sender, text }) => ({ seq, sender, text,
         ...(members.find(m => m.uid === sender)?.name && { name: members.find(m => m.uid === sender).name }) })),
         members: members.slice(0, 80).map(({ uid, name, robot, role }) => ({ uid, name, robot, role })),
@@ -502,7 +558,7 @@ export class Worker {
     }
   }
 
-  async process(job, signal) {
+  async process(job, signal, activeWork) {
     const sourceConfig = this.config
     const sourceChannel = this.api.channel
     const config = { ...sourceConfig }
@@ -510,6 +566,10 @@ export class Worker {
     const channelType = job.channel_type
     const recipient = job.channel_id ?? job.sender
     let meta = job.metadata ? JSON.parse(job.metadata) : {}
+    if (['stop', 'card', 'choose'].includes(meta.command)) {
+      this.store.discard(job.seq, 'inactive_command')
+      return
+    }
     if (meta.directoryRecovery) job = { ...job, directoryRecovery: meta.directoryRecovery }
     if (!permitsRoute(config, job.sender, channelType, recipient)) {
       this.store.review(job.seq, 'route_not_allowed')
@@ -517,11 +577,14 @@ export class Worker {
     }
     if (job.directoryRecovery || config.botKind === 'app' || job.ambient || config.senderPolicy === 'octo' || (channelType !== 1 && config.channelPolicy === 'joined')) {
       try {
-        if (!await this.api.allowsMessage(config, job, signal)) {
+        const allowed = await this.api.allowsMessage(config, job, signal)
+        signal.throwIfAborted()
+        if (!allowed) {
           this.store.discard(job.seq, 'octo_access_denied')
           return
         }
       } catch (error) {
+        if (signal.reason === OCTO_STOP) throw OCTO_STOP
         if (signal.aborted) return
         const issue = 'access_' + (error instanceof OctoError ? error.code : 'internal_error')
         this.store.discard(job.seq, issue, 'review')
@@ -551,6 +614,10 @@ export class Worker {
     }
     let progress
     let merged = meta.merged ?? []
+    if (activeWork) {
+      activeWork.merged = merged
+      activeWork.authorizeTerminal = () => authorizeDelivery({}, activeWork.terminalSignal)
+    }
     if (job.state === 'queued') {
       if (this.api.readReceipt && decimalId(job.message_id)) {
         try { await this.api.readReceipt(route, job.message_id, signal) }
@@ -561,6 +628,7 @@ export class Worker {
         try {
           rules = await this.api.rules(channelType, recipient, config.threadRuleMode, signal)
         } catch (error) {
+          if (signal.reason === OCTO_STOP) throw OCTO_STOP
           if (signal.aborted) return // still queued; a clean restart can fetch rules
           const code = error instanceof OctoError ? error.code : 'internal_error'
           this.store.review(job.seq, 'rules_' + code)
@@ -581,16 +649,15 @@ export class Worker {
       let deliverables, card, targetFileAttempted = false
       try {
         let reply
-        if (meta.command === 'card' || meta.command === 'choose') {
-          reply = '当前 Octo 客户端或部署未开启所需的卡片类型。'
-        } else if (meta.command) {
+        if (meta.command) {
           if (meta.command === 'new') this.store.session(conversation, config.idleMinutes, Date.now(), true)
           reply = textCommands[meta.command]
         } else if (meta.cardAction) {
           reply = meta.cardAction.selection === 'A' || meta.cardAction.selection === 'B'
             ? '已确认：选项 ' + meta.cardAction.selection + '。' : '已确认。'
         } else {
-          progress = this.progress.start(job, config.progress, signal, active => authorizeDelivery({}, active))
+          progress = this.progress.start(job, config.progress, signal, active => authorizeDelivery({}, active), activeWork?.terminalSignal)
+          if (activeWork) activeWork.progress = progress
           const [material, channelContext] = await Promise.all([
             materializeInput(config, meta, signal),
             this.channelContext(config, route, job, meta, signal),
@@ -642,6 +709,11 @@ export class Worker {
             && /卡片|\bcard\b/iu.test(input)
           const run = async () => {
             if (job.directoryRecovery) await authorizeDelivery()
+            // A topic mode change can occur while rules or attachments are
+            // being fetched. Never send a now-disabled parent rule to DSH.
+            if (rules && channelType === 5 && this.config.threadRuleMode !== config.threadRuleMode) {
+              throw new Error('delivery_access_changed')
+            }
             return host.run(session, input, async () => {
             if (!meta.deferredForm) this.store.sessionCreated(conversation)
             await this.attach?.(session.session_id, config.cwd)
@@ -822,6 +894,7 @@ export class Worker {
         this.store.ready(job.seq, bounded, meta)
         job = { ...job, reply: bounded }
       } catch (error) {
+        if (signal.reason === OCTO_STOP) throw OCTO_STOP
         const code = error instanceof OctoError ? (error.status ? apiErrorCode(error) : error.code) : hostIssues.has(error?.message) ? error.message
           : error?.name === 'SessionAlreadyOwnedError' ? 'session_busy' : 'agent_run_not_confirmed'
         this.store.review(job.seq, code)
@@ -878,9 +951,9 @@ export class Worker {
         }
       }
       let resultId
-      if (meta.command === 'card' || meta.command === 'choose' || (meta.displayCard && safeCommand(config, job))) {
+      if (meta.displayCard && safeCommand(config, job)) {
         try {
-          const result = await sendCard(config, { ...route, operatorUid: job.sender }, meta.displayCard ?? cardForm(meta.command), signal,
+          const result = await sendCard(config, { ...route, operatorUid: job.sender }, meta.displayCard, signal,
             () => !this.stopIntake && safeCommand(this.config, job), () => authorizeDelivery({ command: true, files: !!meta.deliverables?.length }))
           resultId = result.messageId
           confirmed = true
@@ -920,12 +993,14 @@ export class Worker {
           const delivered = await this.api.send(recipient, outbound.text, signal, channelType, replyTo, outbound.mention)
           confirmed = true
           resultId ??= delivered
-          if (chunks.length > 1 || meta.deliverables?.length) this.store.recordDelivery(job.seq, delivered)
+          if (signal.aborted || chunks.length > 1 || meta.deliverables?.length) this.store.recordDelivery(job.seq, delivered)
         }
       }
+      signal.throwIfAborted()
       this.store.sent(job.seq, resultId, merged)
       await progress?.finish('completed')
     } catch (error) {
+      if (signal.reason === OCTO_STOP) throw OCTO_STOP
       // Do not replay a text/card or any already sent file if delivery failed mid-batch.
       if (!confirmed && !meta.deliverables?.length && !merged.length && error instanceof OctoError && error.status === 429 && job.attempts < 3) {
         this.store.retry(job.seq, Date.now() + Math.max(error.retryAfterMs, 3000 * (2 ** job.attempts)))
@@ -953,13 +1028,14 @@ export class Worker {
     if (this.config.transport === 'websocket') return this.runRealtime(signal)
     const stop = new AbortController()
     const lifetime = AbortSignal.any([signal, stop.signal])
+    this.intakeSignal = lifetime
     this.inbox.connection(false)
     this.inbox.connection(true)
     const draining = this.drain(lifetime)
     const receiving = this.poll(lifetime)
     const recovery = this.inbox.run(lifetime)
     try { await Promise.all([receiving, draining, recovery]) }
-    finally { stop.abort(); await Promise.allSettled([receiving, draining, recovery]) }
+    finally { stop.abort(); await Promise.allSettled([receiving, draining, recovery, ...this.stopControls]) }
   }
 
   async poll(signal) {
@@ -1021,7 +1097,7 @@ export class Worker {
       signal.throwIfAborted()
       const candidate = admit({ message: {
         message_id: m.messageId, message_seq: m.messageSeq, from_uid: m.fromUid, channel_type: m.channelType,
-        channel_id: m.channelId, payload: m.payload,
+        channel_id: m.channelId, timestamp: m.timestamp, payload: m.payload,
       } }, this.config)
       if (candidate && !this.stopIntake) this.inbox.receive('ws:' + candidate.messageId, candidate)
       // WukongConnection sends RECVACK only after this function returns.
@@ -1035,7 +1111,7 @@ export class Worker {
       await Promise.all([receiving, draining, cardEvents, recovery, discovery])
     } finally {
       stop.abort()
-      await Promise.allSettled([receiving, draining, cardEvents, recovery, discovery])
+      await Promise.allSettled([receiving, draining, cardEvents, recovery, discovery, ...this.stopControls])
       await this.appIntake
     }
   }

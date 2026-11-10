@@ -16,8 +16,7 @@ const expected = [
   { command: 'help', description: '查看频道命令帮助' },
   { command: 'status', description: '查看当前会话状态' },
   { command: 'new', description: '开始新会话' },
-  { command: 'card', description: '查看展示卡片' },
-  { command: 'choose', description: '试用交互卡片' },
+  { command: 'stop', description: '停止当前频道正在处理的任务' },
 ]
 
 test('menu is a fixed copy of supported command metadata; only explicit clear yields []', () => {
@@ -53,7 +52,7 @@ test('official wire contract uses POST setCommands, bearer auth, command names w
       assert.deepEqual(init.headers, { 'Content-Type': 'application/json', Authorization: 'Bearer ' + credential })
       assert.deepEqual(JSON.parse(init.body), { commands: action === 'publish' ? expected : [] })
       assert.ok(init.signal instanceof AbortSignal)
-      assert.deepEqual(result, { action, count: action === 'publish' ? 5 : 0 })
+      assert.deepEqual(result, { action, count: action === 'publish' ? expected.length : 0 })
     }
   }
 })
@@ -170,7 +169,7 @@ test('configured paused account explicitly publishes/clears; runtime policy and 
     const prior = accounts.revision
     const result = await accounts.updateBotCommands(id, { revision: prior, action })
     assert.notEqual(result.accountRevision, prior)
-    assert.deepEqual(result.botCommands, { action, count: action === 'publish' ? 5 : 0 })
+    assert.deepEqual(result.botCommands, { action, count: action === 'publish' ? expected.length : 0 })
     assert.equal(result.accounts[0].enabled, false)
     assert.equal(result.accounts[0].dmCommands, 'off')
     assert.equal(result.accounts[0].groupCommands, 'off')
@@ -323,7 +322,7 @@ test('HTTP owner-session gate, CSRF headers, method, revision and account guards
   const result = await invoke({ id, body, headers: { 'sec-fetch-site': 'same-origin' } })
   assert.equal(result.status, 200)
   assert.equal(result.headers['Cache-Control'], 'no-store')
-  assert.deepEqual(result.data.botCommands, { action: 'publish', count: 5 })
+  assert.deepEqual(result.data.botCommands, { action: 'publish', count: 4 })
   assert.equal(calls.length, 2)
   assert.equal((await web(accounts, () => 403)({ id, body })).status, 403)
   assert.equal(calls.length, 2)
@@ -358,14 +357,14 @@ const nodes = node => node && typeof node === 'object' ? [node, ...node.children
 const button = (tree, text) => nodes(tree).find(node => node?.type === 'button' && node.children.includes(text))
 const textOf = tree => nodes(tree).filter(node => typeof node === 'string').join('\n')
 
-test('Chinese UI previews the five commands, requires explicit confirmation and sends no request on render/cancel', async () => {
+test('Chinese UI previews the four commands, requires explicit confirmation and sends no request on render/cancel', async () => {
   const render = renderer(React => createBotCommandMenu(React, { Button: 'button' }))
   const calls = []
   const props = { lang: 'zh', perform: async action => { calls.push(action) } }
   let tree = render(props)
   assert.match(textOf(tree), /发布会替换此 Bot 的全部现有菜单/)
   assert.match(textOf(tree), /命令权限仍按当前设置/)
-  assert.match(textOf(tree), /\/help · \/status · \/new · \/card · \/choose/)
+  assert.match(textOf(tree), /\/help · \/status · \/new · \/stop/)
   assert.equal(calls.length, 0)
   button(tree, '发布菜单').props.onClick()
   tree = render(props)

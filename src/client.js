@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
       configuration_or_state_error: ['无法读取渠道设置', 'Channel settings are unavailable'],
       worker_stopped: ['连接已停止', 'Connection stopped'],
       queued: ['待处理', 'Queued'], running: ['生成中', 'Working'], ready: ['待发送', 'Ready to send'],
-      sending: ['发送中', 'Sending'], sent: ['已回复', 'Replied'], review: ['待检查', 'Needs review'],
+      sending: ['发送中', 'Sending'], sent: ['已回复', 'Replied'], stopped: ['已停止', 'Stopped'], review: ['待检查', 'Needs review'],
       established: ['已建立', 'Available'], ignored: ['未触发', 'Not triggered'],
       notConfigured: ['尚未绑定 Octo Bot', 'No Octo bot is connected'],
       deployHint: ['请在 DSH 服务器中完成初始绑定。启用后，这里会显示连接状态和渠道设置。',
@@ -49,11 +49,16 @@ window.__ModuleLoader__.load({
       appScope: ['Octo 管理的私聊范围', 'Octo-managed DM scope'],
       threadRule: ['子区规则', 'Topic rules'], threadOnly: ['只用子区规则', 'Use only topic rules'],
       threadInherit: ['继承群规则，子区优先', 'Inherit group rules; topic rules take priority'],
-      response: ['回复体验', 'Replies'], responseHint: ['设置用户看到的进度和最长等待时间。', 'Choose the progress users see and how long to wait.'],
+      response: ['回复体验', 'Replies'], responseHint: ['设置回复进度和执行时限。', 'Choose how reply progress is shown and how long a reply can run.'],
       progress: ['进度显示', 'Reply progress'], card: ['优先使用 Octo 进度卡', 'Prefer Octo progress cards'],
       typing: ['仅显示正在输入', 'Typing indicator only'], off: ['关闭进度', 'Turn off progress'],
       cardHint: ['卡片不可用时自动显示「正在输入」。', 'Falls back to a typing indicator when cards are unavailable.'],
-      timeout: ['回复超时（秒）', 'Reply timeout (seconds)'],
+      timeout: ['回复时限', 'Reply timeout'],
+      timeoutDuration: ['时长', 'Duration'], timeoutUnit: ['单位', 'Unit'],
+      seconds: ['秒', 'Seconds'], minutes: ['分钟', 'Minutes'], hours: ['小时', 'Hours'], days: ['天', 'Days'],
+      unlimited: ['不限时', 'Unlimited'],
+      timeoutHint: ['等待用户回答或批准的时间不计入时限。', 'Time spent waiting for an answer or approval does not count.'],
+      invalidTimeout: ['请输入有效时长，至少 1 秒；或选择不限时。', 'Enter a valid duration of at least one second, or choose Unlimited.'],
       save: ['保存设置', 'Save settings'], saving: ['正在保存…', 'Saving…'],
       reset: ['恢复当前设置', 'Reset to current settings'], resetDone: ['已恢复当前设置。', 'Current settings restored.'],
       saved: ['已保存，从下一条消息起生效。', 'Saved. Applies to the next message.'],
@@ -143,6 +148,10 @@ window.__ModuleLoader__.load({
 .dsho-field > input,.dsho-field textarea,.dsho-field select { width:100%; min-width:0; box-sizing:border-box; border:1px solid var(--dsho-edge); border-radius:8px; background:var(--dsho-soft); color:inherit; font:inherit; padding:7px 9px; }
 .dsho-field textarea { resize:vertical; }
 .dsho-field select { min-height:34px; max-width:100%; text-overflow:ellipsis; }
+.dsho-timeout { min-inline-size:0; border:0; margin:0; padding:0; }
+.dsho-timeout legend { font-size:13px; font-weight:570; padding:0; margin-bottom:5px; }
+.dsho-timeout-controls { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:5px; }
+.dsho-timeout-controls > .dsho-field { flex:1 1 88px; }
 .dsho-tools { align-items:stretch; flex-wrap:wrap; }
 .dsho-search { min-width:0; flex:1 1 150px; }
 .dsho-search input { width:100%; min-width:0; }
@@ -382,9 +391,16 @@ window.__ModuleLoader__.load({
         progress: ['progress', [['auto', 'card'], ['typing', 'typing'], ['off', 'off']]],
       }
       const listKeys = ['allowedGroupIds', 'allowedThreadIds']
-      function initialDraft(config) {
+      const timeoutUnits = { seconds: 1000, minutes: 60_000, hours: 3_600_000, days: 86_400_000 }
+      function initialDraft(config, preferredUnit) {
+        const ms = config.timeoutMs
+        const timeoutUnit = ms === 'unlimited' ? 'unlimited'
+          : Object.hasOwn(timeoutUnits, preferredUnit) ? preferredUnit
+          // Keep the seconds display for values supported by 0.20.
+          : (ms > 600_000 && ['days', 'hours', 'minutes'].find(unit => ms % timeoutUnits[unit] === 0)) || 'seconds'
         return { ...Object.fromEntries(Object.keys(choices).map(key => [key, config[key]])),
-          ...Object.fromEntries(listKeys.map(key => [key, config[key].join('\n')])), timeout: config.timeoutMs / 1000 }
+          ...Object.fromEntries(listKeys.map(key => [key, config[key].join('\n')])),
+          timeoutUnit, timeout: timeoutUnit === 'unlimited' ? '' : ms / timeoutUnits[timeoutUnit] }
       }
       function Config({ config, revision, accountId, t }) {
         const app = config.botKind === 'app'
@@ -410,8 +426,30 @@ window.__ModuleLoader__.load({
           value: draft[key], placeholder: t('onePerLine'), onChange: e => set(key, e.target.value) }), note)
         const card = (title, note, ...fields) => h('section', { className: 'dsho-card' },
           h('h3', null, t(title)), hint(t(note)), h('div', { className: 'dsho-grid' }, ...fields))
+        const unlimited = draft.timeoutUnit === 'unlimited'
+        const multiplier = timeoutUnits[draft.timeoutUnit]
+        const timeoutControl = h('fieldset', { className: 'dsho-timeout', 'aria-describedby': 'dsho-timeout-note' },
+          h('legend', null, t('timeout')),
+          h('div', { className: 'dsho-timeout-controls' },
+            !unlimited && field('timeout', 'timeoutDuration', h('input', { id: 'dsho-timeout', type: 'number',
+              min: 1000 / multiplier, step: 'any', required: true, value: draft.timeout,
+              onChange: e => set('timeout', e.target.value) })),
+            field('timeout-unit', 'timeoutUnit', h('select', { id: 'dsho-timeout-unit', value: draft.timeoutUnit,
+              onChange: e => set('timeoutUnit', e.target.value) },
+              ...[...Object.keys(timeoutUnits), 'unlimited'].map(unit => h('option', { key: unit, value: unit }, t(unit)))))),
+          h('p', { className: 'dsho-muted', id: 'dsho-timeout-note' }, t('timeoutHint')))
         const save = async e => {
           e.preventDefault()
+          let timeoutMs = 'unlimited'
+          if (!unlimited) {
+            const duration = Number(draft.timeout)
+            // Keep the original integer if its displayed value was left as is.
+            timeoutMs = duration === config.timeoutMs / multiplier ? config.timeoutMs : Math.round(duration * multiplier)
+            if (duration < 1000 / multiplier || !Number.isSafeInteger(timeoutMs)) {
+              setFeedback(['alert', 'invalidTimeout'])
+              return
+            }
+          }
           setSaving(true); setFeedback(null); revisionEpoch++
           try {
             const settings = Object.fromEntries((app ? ['progress'] : Object.keys(choices)).map(k => [k, draft[k]]))
@@ -419,12 +457,12 @@ window.__ModuleLoader__.load({
               const inactive = draft.channelPolicy === 'joined'
               settings[key] = inactive ? [] : [...new Set(draft[key].split('\n').map(x => x.trim()).filter(Boolean))]
             }
-            settings.timeoutMs = Math.round(Number(draft.timeout) * 1000)
+            settings.timeoutMs = timeoutMs
             const next = await api(accountId ? '/accounts/' + accountId + '/settings' : '/settings', { method: 'PUT', headers: {
               'Content-Type': 'application/json', 'x-dsh-octo-client': '1',
             }, body: JSON.stringify({ settings, revision: base.current }) })
             revisionEpoch++
-            base.current = next.revision; setDraft(initialDraft(next.config)); setDirty(false)
+            base.current = next.revision; setDraft(initialDraft(next.config, draft.timeoutUnit)); setDirty(false)
             publish(next.overview ?? { ...snapshot, ...next }); setFeedback(['status', 'saved'])
           } catch (error) {
             setFeedback(['alert', t(error.message) ? error.message : 'saveError'])
@@ -439,9 +477,7 @@ window.__ModuleLoader__.load({
             draft.channelPolicy === 'allowlist' && multi('allowedThreadIds', 'threads', 'threadFormat')),
           !app && card('triggers', 'triggersHint', select('mentionPolicy', config.transport !== 'websocket' && 'requiresWebSocket'),
             select('threadRuleMode')),
-          card('response', 'responseHint', select('progress', draft.progress === 'auto' && 'cardHint'),
-            field('timeout', 'timeout', h('input', { id: 'dsho-timeout', type: 'number', min: 1, max: 600, step: 0.001,
-              required: true, value: draft.timeout, onChange: e => set('timeout', e.target.value) }))),
+          card('response', 'responseHint', select('progress', draft.progress === 'auto' && 'cardHint'), timeoutControl),
           (feedback || stale) && h('p', { className: 'dsho-alert', role: stale ? 'alert' : feedback[0] },
             t(stale ? 'settings_changed' : feedback[1])),
           h('div', { className: 'dsho-actions dsho-savebar' },

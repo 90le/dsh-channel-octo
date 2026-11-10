@@ -169,7 +169,7 @@ export const CHANNEL_API_OPERATIONS = freeze([
   spec('thread.read', 'Read a thread in this group. In a thread session only the current thread is allowed.', schema(threadArgs)),
   spec('thread.members', 'List current thread participants; thread role 1 means creator, not group admin.', schema({ ...threadArgs, limit })),
   spec('thread.rules.read', 'Read the selected/current thread rules.', schema(threadArgs)),
-  spec('thread.rules.edit', 'Update nonempty thread rules; requester must be group owner/admin and server must grant bot_admin.',
+  spec('thread.rules.edit', 'Replace topic rules with nonblank Markdown; requester must be group owner/admin and server must grant bot_admin. A bot token cannot clear topic rules. For clearing, direct the requester to the Octo topic rule editor.',
     schema({ ...threadArgs, content: { type: 'string', minLength: 1, maxLength: 10240 } }, ['content']), true),
   spec('thread.rename', 'Rename a thread; no bot-token rename endpoint in the reviewed server.',
     schema({ ...threadArgs, name: { type: 'string', minLength: 1, maxLength: 100 } }, ['name']), true, 'unsupported_bot_endpoint'),
@@ -193,7 +193,7 @@ export const CHANNEL_API_OPERATIONS = freeze([
     schema({ ...searchPage, sort: { type: 'string', enum: ['time_desc', 'time_asc'] } })),
   spec('messages.search_all', 'Search messages and files together in the current channel as a User Bot with server search enabled. Supply a keyword or sender/time filter. One page of at most 10 individually verified hits; no cross-channel search.',
     schema({ keyword: searchKeyword, ...searchPage })),
-  spec('messages.search_around', 'Read context around a visible current-channel message as a User Bot with server search enabled. limit is per side (default 5, max 10): at most 21 verified messages including the anchor. Sender/time filters affect neighbors, not the anchor. No cursor or automatic paging.',
+  spec('messages.search_around', 'Read context around a visible current-channel message as a User Bot with server search enabled. Use its exact decimal message_id string, not message_seq. limit is per side (default 5, max 10): at most 21 verified messages including the anchor. Neighbors excluded by visibility checks are omitted without backfill, so the window may be partial. Sender/time filters affect neighbors, not the anchor. No cursor or automatic paging.',
     schema({ anchor_message_id: messageID, filters: searchFilters, limit: searchLimit }, ['anchor_message_id'])),
   spec('messages.notify', 'Send text with visible native @name mentions for current member UIDs. Explicit all=true requires a current requester group owner/admin and notifies humans, never all bots.',
     schema({ text, uids: { type: 'array', items: { type: 'string', pattern: '^[A-Za-z0-9_.:@-]{1,128}$' }, maxItems: 10, uniqueItems: true },
@@ -261,6 +261,7 @@ const errorHints = Object.freeze({
   mutation_permission_changed: 'Live membership or role changed during this operation. No mutation was sent.',
   mutation_unconfirmed: 'The server did not return the required success acknowledgement. Inspect the resource before retrying.',
   unsupported_bot_endpoint: 'The reviewed official server has no bot-token endpoint for this operation.',
+  thread_rules_clear_unsupported: 'Octo rejects blank topic rules from a bot. Use the delete action in the Octo topic rule editor if you have permission.',
   unsafe_mention_label: 'A selected member name resembles a broadcast or embeds another @. Use a safe member display name before sending a native mention.',
   invalid_mention_target: 'Broadcast sentinel UIDs cannot be used as individual mention targets. Use the explicit all option with group administrator authority.',
 })
@@ -801,7 +802,7 @@ export class ChannelApi {
     return { ok: true, version: raw.version }
   }
 
-  #message(raw, scope, sender, details = false, editType) {
+  #message(raw, scope, sender, details = false, editType, expectedNeighbor) {
     if (!object(raw) || !id(raw.message_id) || !seq(raw.message_seq) || !validUid(raw.from_uid)
       || raw.channel_type !== scope.route.channel_type) fail('invalid_message_response')
     const channel = scope.route.channel_id
@@ -810,6 +811,12 @@ export class ChannelApi {
     const dmIDs = [channel, channel + '@' + this.#config.botUid, this.#config.botUid + '@' + channel]
     if (scope.group ? raw.channel_id !== channel : !dmIDs.includes(raw.channel_id)
       || ![channel, this.#config.botUid].includes(raw.from_uid)) fail('message_outside_channel')
+    // An unavailable neighbor can be omitted only after its identity matches
+    // the current-route index hit. Do not mask a protocol or routing mismatch.
+    if (expectedNeighbor) {
+      if (id(raw.message_id) !== expectedNeighbor.message_id) fail('message_outside_channel')
+      if (raw.message_seq !== expectedNeighbor.message_seq || raw.from_uid !== expectedNeighbor.sender_id) fail('invalid_search_response')
+    }
     if ([raw, raw.extra, raw.message_extra].some(extra => extra && [extra.revoke, extra.revoked, extra.is_deleted].some(flag))) fail('message_unavailable')
     let payload = raw.payload
     if (typeof payload === 'string' && payload.length <= 120000) {
@@ -818,9 +825,12 @@ export class ChannelApi {
     }
     const matchesSpace = value => value.space_id == null || (this.#config.botKind === 'app'
       ? validUid(value.space_id) : value.space_id === this.#config.spaceId)
-    if (!object(payload) || payload.event != null || !matchesSpace(payload)) fail('message_unavailable')
-    if (payload.visibles != null && (!Array.isArray(payload.visibles)
-      || payload.visibles.length > 0 && !payload.visibles.includes(sender))) fail('message_unavailable')
+    if (!object(payload)) fail(expectedNeighbor ? 'invalid_message_response' : 'message_unavailable')
+    if (payload.event != null || !matchesSpace(payload)) fail('message_unavailable')
+    if (payload.visibles != null) {
+      if (!Array.isArray(payload.visibles)) fail(expectedNeighbor ? 'invalid_message_response' : 'message_unavailable')
+      if (payload.visibles.length > 0 && !payload.visibles.includes(sender)) fail('message_unavailable')
+    }
     const checkEditSource = value => {
       if (value.type !== editType) fail(editType === 17 ? 'display_card_message_required'
         : editType === 14 ? 'richtext_message_required' : 'plain_text_message_required')
@@ -867,12 +877,12 @@ export class ChannelApi {
       })), attachments_truncated: attachments.length > 2 }) }
   }
 
-  async #readMessage(scope, sender, messageId, signal, details = false, editType) {
+  async #readMessage(scope, sender, messageId, signal, details = false, editType, expectedNeighbor) {
     if (!id(messageId)) fail('invalid_arguments')
     const base = scope.group ? scope.root + (scope.thread ? '/threads/' + scope.thread : '')
       : '/v1/bot/messages/person/' + encodeURIComponent(scope.route.channel_id)
     const path = scope.group ? base + '/messages/' + messageId : base + '/' + messageId
-    const result = this.#message(await this.#call(path, undefined, signal), scope, sender, details, editType)
+    const result = this.#message(await this.#call(path, undefined, signal), scope, sender, details, editType, expectedNeighbor)
     if (result.message_id !== messageId) fail('message_outside_channel')
     return result
   }
@@ -890,6 +900,7 @@ export class ChannelApi {
     let raw
     try { raw = await this.#call(searchEndpoints[operation], body, signal) }
     catch (error) {
+      if (around && error?.code === 'api_search_not_found') throw error
       if (error instanceof ChannelApiError && error.code.startsWith('api_')) {
         throw new ChannelApiError(error.code, 'Search requires a User Bot, an enabled server search backend, and current channel access. No retry or identity fallback was attempted.')
       }
@@ -936,7 +947,17 @@ export class ChannelApi {
     }
     for (const entry of entries) {
       const { row, kind } = entry
-      const message = await this.#readMessage(scope, sender, row.message_id, signal, true)
+      const neighbor = around && entry !== anchor
+      let message
+      try {
+        message = await this.#readMessage(scope, sender, row.message_id, signal, true, undefined, neighbor ? row : undefined)
+      } catch (error) {
+        // Octo windows are visibility-filtered for the bot. Apply the
+        // requester's additional visibility filter per neighbor. Never skip
+        // the anchor or treat an upstream error as a visibility decision.
+        if (neighbor && error instanceof ChannelApiError && error.code === 'message_unavailable') continue
+        throw error
+      }
       if (!Number.isInteger(message.type) || message.type < 1 || message.type >= 99
         || message.message_seq !== row.message_seq || message.from_uid !== row.sender_id
         || kind === 'file' && message.type !== 8 || kind === 'message' && message.type === 8
@@ -946,7 +967,8 @@ export class ChannelApi {
     // Search and verification may take time; membership loss during either must
     // prevent returning even an otherwise valid page. No cursor traversal/retries.
     await this.#access(scope, sender, false, signal)
-    return around ? { before: before.map(entry => entry.value), anchor: anchor.value, after: after.map(entry => entry.value),
+    const visible = side => side.filter(entry => entry.value).map(entry => entry.value)
+    return around ? { before: visible(before), anchor: anchor.value, after: visible(after),
       has_more_before: raw.has_more_before, has_more_after: raw.has_more_after }
       : { messages: entries.map(entry => entry.value), more: raw.pagination.has_more, next_cursor: raw.pagination.next_cursor }
   }
@@ -1217,6 +1239,12 @@ export class ChannelApi {
       const targets = operation === 'messages.user_info' ? [args.uid] : args.uids
       if (targets.some(target => ['.', '..'].includes(bareUID(target)))
         || new Set(targets.map(target => bareUID(target).toLowerCase())).size !== targets.length) fail('invalid_arguments')
+    }
+    if (operation === 'thread.rules.edit' && object(args)) {
+      // The bot PUT rejects Go strings.TrimSpace(content) == ""; the DELETE
+      // route is mounted only for authenticated users.
+      const content = Object.getOwnPropertyDescriptor(args, 'content')?.value
+      if (typeof content === 'string' && !/\P{White_Space}/u.test(content)) fail('thread_rules_clear_unsupported')
     }
     let prepared
     if (structuredEdit || targetCard) {

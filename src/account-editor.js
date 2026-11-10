@@ -93,7 +93,7 @@ const copy = {
   groupCommands: ['群聊快捷命令', 'Group shortcuts'],
   commandsOff: ['仅正常对话', 'Conversation only'],
   commandsSafe: ['允许频道快捷命令', 'Allow channel shortcuts'],
-  commandsHint: ['仅控制 /help、/status、/new、/card、/choose 等频道快捷命令，仍遵循原有命令授权规则；不控制 DSH 工具、插件或技能访问，也不转发其他插件命令。工具访问请设置“工具使用范围”和“权限策略”。', 'Only controls channel shortcuts such as /help, /status, /new, /card and /choose, under existing command authorization rules. It does not control DSH tools, plugins or skills, or forward other plugin commands. Configure tool scope and permission for tool access.'],
+  commandsHint: ['开启后可用 /help、/status、/new、/stop；群聊和子区仅 Bot 所有者可用。/stop 只停止当前频道正在处理的任务。此设置不转发其他插件命令；工具访问由“工具使用范围”和“权限策略”控制。', 'Enables /help, /status, /new and /stop. In groups and topics, only the bot owner can use them. /stop stops only the current task in that conversation. This setting does not forward other plugins’ commands. Tool access is controlled by tool scope and permission.'],
   allowFiles: ['允许处理文件附件', 'Allow file attachments'],
   filesNote: ['允许处理符合聊天准入规则的附件。工作区文件交付还须符合“工具使用范围”和账号权限策略；选择包含群聊、子区的工具范围时，可在相应已准入会话交付文件。', 'Process attachments from admitted chats. Workspace file delivery also requires tool access under the selected scope and account permission. Scopes that include groups and topics allow delivery in those admitted conversations.'],
   appFilesNote: ['允许处理获准私聊中的附件。工作区文件交付仍须符合“工具使用范围”和账号权限策略。', 'Process attachments from admitted DMs. Workspace file delivery still requires tool access under the selected scope and account permission.'],

@@ -826,6 +826,17 @@ export class Store {
   recordDelivery(seq, id) { this.db.prepare("UPDATE jobs SET result_id=? WHERE seq=?").run(id, seq) }
   retry(seq, at) { this.db.prepare("UPDATE jobs SET state='ready', next_ms=? WHERE seq=?").run(at, seq) }
   review(seq, issue) { this.db.prepare("UPDATE jobs SET state='review', issue=? WHERE seq=?").run(issue, seq) }
+  stopWork(seq, merged = []) {
+    const stop = this.db.prepare(`UPDATE jobs SET state='stopped', issue='stopped_by_user', input='', reply=NULL, metadata=NULL
+      WHERE seq=? AND state IN ('queued','running','ready','sending')`)
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const stopped = stop.run(seq).changes > 0
+      if (stopped) for (const item of merged) stop.run(item)
+      this.db.exec('COMMIT')
+      return stopped
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
   discard(seq, issue, state = 'ignored') {
     this.db.prepare("UPDATE jobs SET state=?, issue=?, input='', reply=NULL, metadata=NULL WHERE seq=?").run(state, issue, seq)
   }

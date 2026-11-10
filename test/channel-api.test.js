@@ -409,7 +409,11 @@ test('PUT group/thread rules uses server bot_admin authorization independently o
   assert.equal(f.writes.at(-1).method, 'PUT')
   assert.equal(f.writes.at(-1).path, root + '/threads/' + T + '/md')
   assert.deepEqual(f.writes.at(-1).body, { content: '# Thread rules' })
-  await denies(f.run('thread.rules.edit', { content: '' }, 'owner', topic), 'invalid_arguments')
+  const requestsBeforeClear = f.calls.length
+  for (const content of ['', ' \n\t', '\u0085']) {
+    await denies(f.run('thread.rules.edit', { content }, 'owner', topic), 'thread_rules_clear_unsupported')
+  }
+  assert.equal(f.calls.length, requestsBeforeClear)
   await denies(f.run('thread.rules.edit', { content: 'No', short_id: SIBLING }, 'owner', topic), 'current_thread_only')
   await denies(f.run('rules.edit', { content: '中'.repeat(3500) }, 'owner'), 'invalid_arguments')
   assert.equal(f.writes.length, 3)
@@ -862,6 +866,33 @@ test('around refuses hidden anchors before search and changed anchors before rea
   g.state.intercept = call => { if (call.path === contract.path) g.live.payload.visibles = ['bot'] }
   await denies(g.run(contract.op, contract.args), 'message_unavailable')
   assert.ok(!g.calls.some(call => call.path.endsWith('/messages/99')))
+})
+
+test('around returns only verified visible neighbors and fails closed on a mismatched hit or transport error', async () => {
+  const contract = searchContracts[4]
+  const f = searchFixture(contract, topic)
+  const neighbors = [
+    message({ ...topic, message_id: '98', message_seq: 8 }),
+    message({ ...topic, message_id: '99', message_seq: 9, payload: { type: 1, content: secret, visibles: ['bot'] } }),
+    message({ ...topic, message_id: '101', message_seq: 11, payload: { type: 1, content: secret, event: {} } }),
+    message({ ...topic, message_id: '102', message_seq: 12 }),
+  ]
+  for (const neighbor of neighbors) f.state.messages[neighbor.message_id] = neighbor
+  f.state.searchAround.before = neighbors.slice(0, 2).map(row => searchHit(row, topic))
+  f.state.searchAround.after = neighbors.slice(2).map(row => searchHit(row, topic))
+  const result = await f.run(contract.op, contract.args, 'human', topic)
+  assert.deepEqual([result.before.map(row => row.message_id), result.anchor.message_id, result.after.map(row => row.message_id)],
+    [['98'], '100', ['102']])
+  assert.ok(!JSON.stringify(result).includes(secret))
+
+  neighbors[1].from_uid = 'human'
+  await denies(f.run(contract.op, contract.args, 'human', topic), 'invalid_search_response')
+  neighbors[1].from_uid = 'bot'
+  f.state.intercept = call => {
+    if (call.path.endsWith('/messages/102')) throw Object.assign(new Error(secret), { status: 503 })
+  }
+  await denies(f.run(contract.op, contract.args, 'human', topic), 'api_server_error')
+  assert.equal(f.writes.length, 0)
 })
 
 test('around validates anchor identity, both arrays/flags, cross-wing duplicates and per-side bounds', async () => {

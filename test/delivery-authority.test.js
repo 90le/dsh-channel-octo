@@ -59,7 +59,10 @@ function fixture(t, options = {}) {
     if (url.origin === new URL(endpoint).origin && [
       '/api/v1/bot/groups/' + group + '/md',
       '/api/v1/bot/groups/' + group + '/threads/123456789012345678/md',
-    ].includes(url.pathname)) return Response.json({ content: '', version: 1 })
+    ].includes(url.pathname)) {
+      await f.hooks.rules?.(call)
+      return Response.json({ content: 'Fixture channel policy.', version: 1 })
+    }
     if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/messages/sync')) {
       f.syncs.push(call)
       await f.hooks.sync?.(call)
@@ -338,13 +341,13 @@ test('current octo_display_card tool cannot POST after profile-time permission c
   stopped(f)
 })
 
-test('/card cannot POST when the command is disabled during its profile request', async t => {
+test('a model-authored fallback card cannot POST when card authorization changes during its profile request', async t => {
   const f = fixture(t)
   f.hooks.profile = () => f.reconfigure({ dmCommands: 'off' })
-  const message = f.enqueue('/card')
-  assert.equal(message.command, 'card')
+  f.reply = '\`\`\`octo-card\n{"title":"Report","text":"Synthetic summary."}\n\`\`\`'
+  f.enqueue('请发一张展示卡片')
   await f.process()
-  assert.equal(f.hostCalls.length, 0)
+  assert.equal(f.hostCalls.length, 1)
   assert.equal(f.profiles.length, 1)
   assert.equal(f.posts.length, 0, 'no card or plain-text fallback may bypass the disabled command')
   stopped(f)
@@ -658,6 +661,20 @@ test('ready DM text remains deliverable after thread-rule and media-only setting
   assert.deepEqual(f.posts.map(call => call.body.payload), [{ type: 1, content: answer }])
   assert.equal(f.job().state, 'sent')
   assert.equal(f.hostCalls.length, 1)
+})
+
+test('turn does not pass fetched parent rules to the host after inheritance is disabled', async t => {
+  const f = fixture(t, { threadRuleMode: 'inherit-group' })
+  f.route = { channelType: 5, channelId: topic }
+  f.hooks.rules = ({ path }) => {
+    if (!path.includes('/threads/')) f.reconfigure({ threadRuleMode: 'thread-only' })
+  }
+  f.enqueue()
+  await f.process()
+  healthy(f)
+  assert.equal(f.hostCalls.length, 0)
+  assert.equal(f.posts.length, 0)
+  stopped(f)
 })
 
 for (const invalid of [undefined, 'invalid-digest']) {
