@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
+const approvedIcons = new Set(Object.values(JSON.parse(readFileSync(new URL('./fixtures/octo-approved-progress-icons.json', import.meta.url), 'utf8'))))
 import { setImmediate } from 'node:timers/promises'
 import { OctoClient, OctoError } from '../src/octo.js'
 import { cardMode, Progress } from '../src/progress.js'
@@ -55,6 +57,7 @@ function localCard(card) {
   assert.equal(byId.size, rows.filter(row => row.id).length, 'IDs are unique within the frame')
   for (const row of rows) {
     assert.ok(row.type === 'Column' || compact.elements.includes(row.type))
+    if (row.type === 'Image') assert.ok(approvedIcons.has(row.url), 'Image URL must match Octo server approved bytes')
     if (row.isVisible !== undefined) assert.equal(typeof row.isVisible, 'boolean')
     if (!row.selectAction) continue
     assert.equal(row.selectAction.type, 'Action.ToggleVisibility')
@@ -365,7 +368,7 @@ test('compact progress keeps three visible lines, resets each frame, and edits t
   assert.match(body[2].text, /^已用时 /)
   assert.equal(body[0].selectAction, undefined, 'bulk control has no enclosing click handler')
   assert.equal(body[0].columns.at(-1).items[0].id, 'dsh_progress_all_open')
-  assert.equal(body[0].columns.at(-1).items[0].width, '14px')
+  assert.equal(body[0].columns.at(-1).items[0].items[0].width, '14px')
   const local = localCard(initial.card)
   local.expanded('dsh_progress', false)
   local.expanded('dsh_progress_session', false)
@@ -539,4 +542,24 @@ test('idle cards refresh less often, while questions and completion update promp
   assert.equal(f.calls.length, count)
   await handle.finish('completed')
   assert.equal(f.calls.at(-1).frame.data.statusLabel, '回复已发送')
+})
+
+// A confirmed validation rejection is safe to retry as a plain card. Network
+// uncertainty still follows the existing no-duplicate typing fallback test.
+test('a rejected compact card falls back to a basic card and continues editing it', async t => {
+  const tick = clock(t); let attempts = 0
+  const f = fixture({ profile: () => compact, create: () => {
+    if (++attempts === 1) throw new OctoError('http_400', 400)
+    return '456'
+  } })
+  const handle = f.progress.start(job, 'auto', new AbortController().signal)
+  await tick(450); await tick(1)
+  const creates = f.calls.filter(c => c.type === 'create')
+  assert.equal(creates.length, 2)
+  assert.ok(elements(creates[0].frame.card).some(e => e.type === 'Image'))
+  assert.ok(creates[1].frame.card.body.every(e => e.type === 'TextBlock'))
+  assert.equal(f.calls.filter(c => c.type === 'typing').length, 0)
+  assert.equal(await handle.finish('completed'), true)
+  assert.equal(f.calls.at(-1).id, '456')
+  assert.ok(f.calls.at(-1).frame.card.body.every(e => e.type === 'TextBlock'))
 })

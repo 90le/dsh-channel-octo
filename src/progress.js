@@ -105,11 +105,14 @@ const disclosureTargets = (id, expanded) => [
 function chevrons(id, label, targets, double = false) {
   return [false, true].map(expanded => {
     const title = (expanded ? '收起' : '展开') + label
-    const path = double ? expanded ? 'm6 11 6-6 6 6m-12 8 6-6 6 6' : 'm6 5 6 6 6-6m-12 8 6 6 6-6'
-      : expanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="none" stroke="#a1a6ab" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${path}"/></svg>`
-    return { type: 'Image', id: id + (expanded ? '_close' : '_open'), isVisible: !expanded,
-      url: 'data:image/svg+xml,' + encodeURIComponent(svg), altText: title, size: 'Small', width: '14px', height: '14px', spacing: 'None',
+    // Octo's server only accepts these exact official icon bytes; visually
+    // equivalent SVGs (including a custom double-chevron) reject the whole card.
+    const path = expanded ? 'm18 15l-6-6l-6 6' : 'm6 9l6 6l6-6'
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path fill="none" stroke="#a1a6ab" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${path}"/></svg>`
+    const icon = { type: 'Image', url: 'data:image/svg+xml,' + encodeURIComponent(svg),
+      altText: title, size: 'Small', width: '14px', height: double ? '8px' : '14px', spacing: 'None' }
+    return { ...(double ? { type: 'Container', spacing: 'None', items: [{ ...icon }, { ...icon }] } : icon),
+      id: id + (expanded ? '_close' : '_open'), isVisible: !expanded,
       selectAction: { type: 'Action.ToggleVisibility', title, targetElements: targets(!expanded) } }
   })
 }
@@ -296,6 +299,13 @@ export class Progress {
           editAt = Date.now() + editInterval
           refreshAt = Date.now() + refreshInterval
           dueAt = editDue()
+          return
+        }
+        // A definitive validation rejection did not create a message. Retain a
+        // useful card on older servers without retrying an uncertain delivery.
+        if (result.status === 400 && format === 'compact') {
+          format = 'display'
+          dueAt = Date.now()
           return
         }
         // A rejected 429 can be retried. An uncertain create may already have posted a card.
