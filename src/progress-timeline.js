@@ -35,13 +35,15 @@ export class ProgressTimeline {
     const notice = hidden ? `已收拢 ${hidden} 条较早记录` + (failedHidden ? ` · 含 ${failedHidden} 条未成功操作` : '') + (activeHidden ? ` · ${activeHidden} 项${terminal ? '结果未确认' : '仍在执行'}` : '') : ''
     return { notice, groups: selected.map(row => {
       const status = row.state === 'active' ? terminal ? interrupted ? '已停止' : '未确认结束' : '执行中' : row.state === 'failed' ? '未成功' : '已完成'
+      const result = clean(row.result,160).replace(/^状态：(已完成|成功|正常|失败|错误|进行中|等待中|已取消|未确认|已跳过)(；|$)/, '').trim()
       const elapsed = Math.max(0, Math.floor(((row.ended ?? Date.now())-row.started)/1000))
       return { id: 'dsh_progress_item_' + row.id,
+        kind: row.type,
         thought: row.type === 'note' ? '分析摘要' : row.title,
         status: row.type === 'note' ? '' : status,
         tone: row.state === 'failed' ? 'Attention' : row.state === 'active' ? 'Accent' : 'Default',
         actions: [{ tool: row.type === 'note' ? '分析摘要' : row.title,
-          detail: row.type === 'note' ? clean(row.text,120) : [row.result && clean(row.result,160), elapsed > 0 && `耗时 ${elapsed} 秒`].filter(Boolean).join(' · ') || status,
+          detail: row.type === 'note' ? clean(row.text,120) : [result, `耗时 ${elapsed} 秒`].filter(Boolean).join(' · '),
           statusGlyph: row.state === 'failed' ? '!' : row.state === 'active' ? '●' : '✓',
           statusTone: row.state === 'failed' ? 'Attention' : 'Default' }],
       }

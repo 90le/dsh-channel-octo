@@ -140,16 +140,17 @@ function compactBody(status, summary, tone, phases, stats, note) {
     text(summary, { isSubtle: true, size: 'Small' }),
     { type: 'Container', id: outer + '_details', isVisible: false, separator: true, spacing: 'Small', items: [
 
-      ...groups.map(group => ({ type: 'Container', spacing: 'Small', items: [
+      ...groups.map(group => ({ type: 'Container', spacing: 'Medium', items: [
         { type: 'ColumnSet', spacing: 'None', columns: [
-          column('stretch', [text(group.thought, { spacing: 'None' })]),
+          column('stretch', [text(group.thought, { spacing: 'None', weight: group.kind === 'note' ? 'Default' : 'Bolder', size: group.kind === 'note' ? 'Small' : 'Default', isSubtle: group.kind === 'note' })]),
           ...(group.status ? [column('auto', [text(group.status, { color: group.tone ?? 'Default', isSubtle: true, spacing: 'None', size: 'Small' })])] : []),
           column('auto', chevrons(group.id, group.thought, expanded => disclosureTargets(group.id, expanded))),
         ] },
         ...(group.summary ? [text(group.summary, { isSubtle: true })] : []),
         { type: 'Container', id: group.id + '_details', isVisible: false, spacing: 'Small', items: [
-          ...group.actions.map((item, index) => ({ type: 'Container', spacing: index === 0 ? 'None' : 'Small', items: [
-            text(item.detail, { isSubtle: true, spacing: 'None' }),
+          ...group.actions.map((item, index) => ({ type: 'ColumnSet', spacing: index === 0 ? 'None' : 'Small', columns: [
+            column('16px', []),
+            column('stretch', [text(item.detail, { isSubtle: true, size: 'Small', spacing: 'None' })]),
           ] })),
         ] },
       ] })),
@@ -165,7 +166,7 @@ function frame(mode, reasoningId, phase, seconds, stats, detail, interrupted) {
   const label = interrupted ? '任务已停止' : labels[actual]
   const state = wireStates[actual] ?? actual
   const elapsed = '已用时 ' + duration(seconds)
-  const summary = [elapsed, stats.files && '已发 ' + stats.files + ' 个文件'].filter(Boolean).join(' · ')
+  const summary = [elapsed, stats.calls && stats.calls + ' 次工具', stats.files && '已发 ' + stats.files + ' 个文件'].filter(Boolean).join(' · ')
   const view = stats.timeline.view(terminal, interrupted, safeProgressText)
   const note = [view.notice, phase !== 'completed' && safeProgressText(detail, 160)].filter(Boolean).join(' · ')
   const phases = view.groups
