@@ -81,6 +81,7 @@ Object.assign(env, {
   DSH_OCTO_FIXTURE_STOP: stopSmoke ? '1' : '0',
   DSH_OCTO_FIXTURE_STATE: state,
   DSH_OCTO_FIXTURE_WIRE: wire ? '1' : '0',
+  DSH_OCTO_FIXTURE_AUTOMATION_SIDEBAR: automation && browserModule ? '1' : '0',
   // Synthetic fixtures exercise published code; no dependency build scripts.
   npm_config_ignore_scripts: 'true',
   ...((stopSmoke || eventRecoverySmoke || directoryRecoverySmoke) && { npm_config_offline: 'true', npm_config_audit: 'false', npm_config_update_notifier: 'false' }),

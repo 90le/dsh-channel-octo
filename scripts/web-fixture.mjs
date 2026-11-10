@@ -879,7 +879,12 @@ globalThis.fetch = async (input, init) => {
     const historyOk = round <= 2 || round === 6 ? !/GROUP-HISTORY-FIXTURE|TOPIC-HISTORY-FIXTURE/.test(history)
       : round === 4 ? history.includes('TOPIC-HISTORY-FIXTURE') && history.includes('TOPIC-QUOTE-FIXTURE') && !history.includes('GROUP-HISTORY-FIXTURE')
         : history.includes('GROUP-HISTORY-FIXTURE') && !history.includes('TOPIC-HISTORY-FIXTURE')
-    if (round && ((body.tools ?? []).length !== 0 && !ownerSmoke
+    // Automation registers local schema descriptions for root Agents; this browser run
+    // exercises its sidebar host. The synthetic model never issues an automation call.
+    const toolSchemas = body.tools ?? []
+    const sidebarOnly = process.env.DSH_OCTO_FIXTURE_AUTOMATION_SIDEBAR === '1'
+      && toolSchemas.every(tool => /^automation_[a-z_]+$/.test(tool.name || ''))
+    if (round && (toolSchemas.length !== 0 && !ownerSmoke && !sidebarOnly
       || !rulesOk || !historyOk || /FUTURE-HISTORY-FIXTURE|WRONG-ROUTE-FIXTURE/.test(history)
       || /GROUP-HISTORY-FIXTURE|TOPIC-HISTORY-FIXTURE|TOPIC-QUOTE-FIXTURE/u.test(systemText)
       || (round === 2 && (deleteSmoke ? history.includes('fixture response 1') : !history.includes('fixture response 1')))
