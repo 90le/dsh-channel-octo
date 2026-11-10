@@ -21,7 +21,17 @@ const builtinEffort = {
 }
 const copy = {
   unnamed: ['Octo 账号', 'Octo account'],
-  assistant: ['绑定助理', 'Bound assistant'],
+  accountTab: ['账号连接', 'Connection'], assistantTab: ['专属助理', 'Assistant'],
+  messagesTab: ['消息行为', 'Messages'], advancedTab: ['高级管理', 'Advanced'],
+  assistantIntro: ['每个 Bot 自动拥有一位专属助理，以下设置仅用于此 Bot。', 'Each bot has its own assistant. These settings apply only to this bot.'],
+  documents: ['助理指令', 'Assistant instructions'], documentsHint: ['可选。保存后应用于后续消息，不覆盖工作区内的同名文件。', 'Optional. Applies to subsequent messages without overwriting workspace files.'],
+  agentsMd: ['AGENTS.md', 'AGENTS.md'], soulMd: ['SOUL.md', 'SOUL.md'],
+  agentsPlaceholder: ['工作方式、执行规范和任务要求…', 'Working practices, execution rules and task requirements…'],
+  soulPlaceholder: ['助理的角色、语气和沟通风格…', 'Assistant role, tone and communication style…'],
+  documentsTooLarge: ['每份助理指令最多 8 KB，请缩短后保存。', 'Each instruction document can contain up to 8 KB.'],
+  setupHint: ['验证 Bot 令牌，并在「专属助理」选择工作区，即可创建账号。', 'Verify the bot token and choose a workspace under Assistant to create the account.'],
+  savedHint: ['设置自动保存，后续消息生效。', 'Changes save automatically and apply to subsequent messages.'],
+  assistant: ['专属助理', 'Assistant'],
   assistantHint: ['工作区、模型、预设和权限请在「助理」页编辑。', 'Use the Assistants tab to edit the workspace, model, preset and permissions.'],
   connection: ['连接与诊断', 'Connection and diagnostics'], messageBehavior: ['私聊准入与附件', 'DM admission and attachments'],
   advancedBehavior: ['高级消息行为', 'Advanced message behavior'],
@@ -116,7 +126,7 @@ const copy = {
   diagnosed: ['Octo 已确认 Bot 身份，现有连接未被重启。', 'Octo verified the bot identity. The existing connection was not restarted.'],
   reconnected: ['重连请求已完成。', 'Reconnect completed.'],
   actionFailed: ['未能完成账号操作。请稍后重试。', 'Could not complete the account action. Try again.'],
-  cancel: ['取消', 'Cancel'],
+  cancel: ['取消', 'Cancel'], close: ['关闭', 'Close'],
 }
 
 const modelChoice = (provider, model) => provider || model ? JSON.stringify([provider, model]) : ''
@@ -126,6 +136,7 @@ const userIds = text => [...new Set(text.split(/\r?\n/).map(uid => uid.trim()).f
 export function accountFields(account) {
   return {
     label: account?.label ?? '',
+    agentsMd: account?.agentsMd ?? '', soulMd: account?.soulMd ?? '',
     cwd: account?.cwd ?? '',
     provider: account?.provider ?? '',
     model: account?.model ?? '',
@@ -148,7 +159,7 @@ export function createAccountEditor(React, { Button, Input }) {
   const { createElement: h, useEffect, useId, useRef, useState } = React
 
   function AccountForm({ account, options, allowCredentials, onVerify, onSave, onCancel,
-    onDiagnose, onReconnect, onRemove, t, lang = 'zh', connectionStatus, errorMessage }) {
+    onDiagnose, onReconnect, onRemove, t, lang = 'zh', connectionStatus, errorMessage, management }) {
     const tr = key => {
       const id = 'octo.accountEditor.' + key
       const translated = t?.(id)
@@ -156,6 +167,9 @@ export function createAccountEditor(React, { Button, Input }) {
     }
     const editing = account != null
     const id = useId()
+    const [page, setPage] = useState('account')
+    const scroll = useRef(null)
+    useEffect(() => { if (scroll.current) scroll.current.scrollTop = 0 }, [page])
     const [initial] = useState(() => accountFields(account))
     const [draft, setDraft] = useState(initial)
     const [uidText, setUidText] = useState(() => initial.allowedUids.join('\n'))
@@ -287,9 +301,11 @@ export function createAccountEditor(React, { Button, Input }) {
         label: settings.label.trim(),
         allowedUids: settings.senderPolicy === 'allowlist' ? userIds(uids) : [],
       }
-      const problem = validate(fields)
+      const problem = [fields.agentsMd, fields.soulMd].some(text => new TextEncoder().encode(text).length > 8192)
+        ? 'documentsTooLarge' : validate(fields)
       if (problem) {
         queued.current = null
+        if (['pickWorkspace', 'noWorkspaces', 'pickModel', 'pickPolicy', 'noPolicies', 'documentsTooLarge'].includes(problem)) setPage('assistant')
         setFeedback({ text: tr(problem), error: true })
         return
       }
@@ -391,15 +407,12 @@ export function createAccountEditor(React, { Button, Input }) {
         }
       },
     }), editing && hint('labelHint')), true)
-    const settings = h('div', { className: 'dsho-account-settings' },
-      !editing && labelField,
-      account?.assistantId && h('div', { className: 'dsho-account-wide' },
-        h('strong', null, tr('assistant') + ' · ' + account.assistantName), hint('assistantHint')),
-      !account?.assistantId && h(React.Fragment, null,
-      select('cwd', editing ? 'currentWorkspace' : 'workspace', workspaceItems, draft.cwd, cwd => update({ cwd }),
-        workspaceItems.length ? 'pickWorkspace' : 'noWorkspaces'),
-      select('preset', 'agentPreset', presetItems, draft.agentPreset, agentPreset => update({ agentPreset })),
-      h('div', { className: 'dsho-account-settings dsho-account-wide' },
+    const assistantSettings = h(React.Fragment, null,
+      hint('assistantIntro'),
+      h('div', { className: 'dsho-account-settings' },
+        select('cwd', editing ? 'currentWorkspace' : 'workspace', workspaceItems, draft.cwd, cwd => update({ cwd }),
+          workspaceItems.length ? 'pickWorkspace' : 'noWorkspaces'),
+        select('preset', 'agentPreset', presetItems, draft.agentPreset, agentPreset => update({ agentPreset })),
         select('model', 'model', modelItems, modelValue, value => {
           const [provider, model] = value ? JSON.parse(value) : ['', '']
           update({ provider, model, reasoningEffort: '' })
@@ -407,34 +420,41 @@ export function createAccountEditor(React, { Button, Input }) {
         effortItems.length > 0 ? select('effort', 'reasoning', effortItems, draft.reasoningEffort,
           reasoningEffort => update({ reasoningEffort }), 'defaultEffort', true)
           : field('effort', 'reasoning', h('select', { id: id + '-effort', disabled: true },
-            h('option', null, tr('effortUnavailable'))))),
-      select('policy', 'permission', policyItems, draft.permission, permission => update({ permission }),
-        policyItems.length ? 'pickPolicy' : 'noPolicies'),
-      select('tool-scope', 'toolScope', toolItems, draft.toolScope, toolScope => update({ toolScope })),
-      policies.some(item => item.disabled) && hint('policyDisabled', { className: 'dsho-account-note dsho-account-wide' }),
-      hint(app ? 'appToolScopeHint' : 'toolScopeHint', { className: 'dsho-account-note dsho-account-wide' }),
-      hint(toolHint, { className: 'dsho-account-note dsho-account-wide' })),
-      h('section', { className: 'dsho-account-settings dsho-account-wide', 'aria-label': tr('messageBehavior') },
-      h('h4', { className: 'dsho-account-wide' }, tr('messageBehavior')),
-      select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),
-      draft.senderPolicy === 'allowlist' && field('uids', 'allowedUids', h(React.Fragment, null,
-        h('textarea', { id: id + '-uids', rows: 3, value: uidText, disabled: locked, 'aria-required': true,
-          'aria-describedby': id + '-uids-hint', onChange: event => setUidText(event.target.value),
-          onBlur: () => { if (editing) void save(draft, uidText) } }),
-        hint('allowedUidsHint', { id: id + '-uids-hint' })), true),
-      checkbox('allowFiles', 'allowFiles', draft.allowFiles ? id + '-files-note' : undefined),
-      draft.allowFiles && hint(app ? 'appFilesNote' : 'filesNote', { id: id + '-files-note', className: 'dsho-account-note dsho-account-wide' })),
-      h('details', { className: 'dsho-account-wide dsho-advanced' }, h('summary', null, tr('advancedBehavior')),
+            h('option', null, tr('effortUnavailable')))),
+        select('policy', 'permission', policyItems, draft.permission, permission => update({ permission }),
+          policyItems.length ? 'pickPolicy' : 'noPolicies'),
+        select('tool-scope', 'toolScope', toolItems, draft.toolScope, toolScope => update({ toolScope }))),
+      hint(toolHint),
+      h('details', { className: 'dsho-account-help' }, h('summary', null, tr('toolScope')),
+        hint(app ? 'appToolScopeHint' : 'toolScopeHint'),
+        policies.some(item => item.disabled) && hint('policyDisabled')),
+      h('section', { className: 'dsho-account-section' },
+        h('h3', null, tr('documents')), hint('documentsHint'),
+        ...['agentsMd', 'soulMd'].map(key => field(key, key, h('textarea', {
+          id: id + '-' + key, rows: 4, maxLength: 8192, value: draft[key], disabled: locked,
+          placeholder: tr(key === 'agentsMd' ? 'agentsPlaceholder' : 'soulPlaceholder'),
+          onChange: event => update({ [key]: event.target.value }, false),
+          onBlur: () => { if (editing) void save(draft, uidText) },
+        })))))
+    const messageSettings = h(React.Fragment, null,
       h('div', { className: 'dsho-account-settings' },
-      select('send-mode', 'sendMode', enums([['queue', 'sendQueue'], ['steer', 'sendSteer']]),
-        draft.sendMode, sendMode => update({ sendMode })),
-      select('idle', 'idleMinutes', idleItems, String(draft.idleMinutes),
-        idleMinutes => update({ idleMinutes: Number(idleMinutes) })),
-      draft.sendMode === 'steer' && hint('sendSteerNote', { className: 'dsho-account-note dsho-account-wide' }),
-      select('dm-commands', 'dmCommands', commandItems, draft.dmCommands, dmCommands => update({ dmCommands })),
-      !app && select('group-commands', 'groupCommands', commandItems, draft.groupCommands, groupCommands => update({ groupCommands })),
-      hint('commandsHint', { className: 'dsho-account-note dsho-account-wide' }))),
-      !editing && checkbox('enabled', 'enabled'))
+        select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),
+        select('send-mode', 'sendMode', enums([['queue', 'sendQueue'], ['steer', 'sendSteer']]),
+          draft.sendMode, sendMode => update({ sendMode })),
+        draft.senderPolicy === 'allowlist' && field('uids', 'allowedUids', h(React.Fragment, null,
+          h('textarea', { id: id + '-uids', rows: 3, value: uidText, disabled: locked,
+            onChange: event => setUidText(event.target.value),
+            onBlur: () => { if (editing) void save(draft, uidText) } }), hint('allowedUidsHint')), true),
+        select('idle', 'idleMinutes', idleItems, String(draft.idleMinutes),
+          idleMinutes => update({ idleMinutes: Number(idleMinutes) })),
+        checkbox('allowFiles', 'allowFiles')),
+      draft.sendMode === 'steer' && hint('sendSteerNote'),
+      draft.allowFiles && hint(app ? 'appFilesNote' : 'filesNote'),
+      h('section', { className: 'dsho-account-section' },
+        h('div', { className: 'dsho-account-settings' },
+          select('dm-commands', 'dmCommands', commandItems, draft.dmCommands, dmCommands => update({ dmCommands })),
+          !app && select('group-commands', 'groupCommands', commandItems, draft.groupCommands, groupCommands => update({ groupCommands }))),
+        hint('commandsHint')))
 
     const cancelReplacement = () => { clearToken(); setReplacing(false); setFeedback(null) }
     const cancelToken = () => editing ? cancelReplacement() : clearToken()
@@ -467,33 +487,48 @@ export function createAccountEditor(React, { Button, Input }) {
         role: feedback.error ? 'alert' : 'status' }, feedback.text),
       feedback?.retry && h(Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !!busy,
         onClick: () => save(draft, uidText) }, tr('retry')))
+    const pages = [['account', 'accountTab'], ['assistant', 'assistantTab'], ['messages', 'messagesTab'],
+      ...(editing ? [['advanced', 'advancedTab']] : [])]
+    const panel = (key, ...children) => h('div', { className: 'dsho-account-tabpanel', role: 'tabpanel',
+      id: id + '-panel-' + key, 'aria-labelledby': id + '-tab-' + key, hidden: page !== key }, ...children)
     return h('form', { className: 'dsho-account-editor', autoComplete: 'off',
       onSubmit: event => { event.preventDefault(); void save(draft, uidText, !editing) } },
-      h('div', { className: 'dsho-account-body' },
-        editing && h('header', { className: 'dsho-account-inspector' },
-          h('span', { className: 'dsho-account-logo', 'aria-hidden': true }, 'O'),
-          h('div', { className: 'dsho-account-inspector-copy' },
-            h('div', { className: 'dsho-account-inspector-title' },
-              h('h3', null, account.label || tr('unnamed')), connectionStatus))),
-        editing && labelField,
-        h('div', { className: editing ? undefined : 'dsho-account-setup' }, settings),
-        !editing && credentials,
-        editing && h('div', { className: 'dsho-account-buttons' },
-          h(Button, { type: 'submit', variant: 'outline', disabled: !!busy }, tr('saveEdits')), feedbackLine),
-        editing && h('details', { className: 'dsho-advanced' },
-          h('summary', null, tr('connection')),
-          identityDetails(account), account.legacy && hint('legacy'), credentials,
-          actions.length > 0 && h('div', { className: 'dsho-account-buttons dsho-account-edit-actions' },
-          ...actions.map(([kind, action]) =>
-            h(Button, { key: kind, type: 'button', variant: 'outline', disabled: !!busy,
-              className: kind === 'remove' ? 'dsho-danger-action' : undefined,
-              onClick: () => runAction(kind, action) }, tr(kind)))))),
-      !editing && h('footer', { className: 'dsho-account-footer' },
-        feedbackLine,
+      h('div', { className: 'dsho-account-tabs', role: 'tablist', 'aria-label': tr('unnamed') },
+        ...pages.map(([key, title], index) => h('button', { key, type: 'button', role: 'tab',
+          id: id + '-tab-' + key, 'aria-controls': id + '-panel-' + key, 'aria-selected': page === key,
+          tabIndex: page === key ? 0 : -1, onClick: () => setPage(key),
+          onKeyDown: event => {
+            let next
+            if (event.key === 'ArrowRight') next = (index + 1) % pages.length
+            if (event.key === 'ArrowLeft') next = (index + pages.length - 1) % pages.length
+            if (event.key === 'Home') next = 0
+            if (event.key === 'End') next = pages.length - 1
+            if (next !== undefined) { event.preventDefault(); setPage(pages[next][0]); document.getElementById(id + '-tab-' + pages[next][0])?.focus() }
+          } }, tr(title)))),
+      h('div', { className: 'dsho-account-body', ref: scroll },
+        panel('account',
+          editing && h('header', { className: 'dsho-account-inspector' },
+            h('span', { className: 'dsho-account-logo', 'aria-hidden': true }, 'O'),
+            h('div', { className: 'dsho-account-inspector-copy' },
+              h('div', { className: 'dsho-account-inspector-title' },
+                h('h3', null, account.label || tr('unnamed')), connectionStatus), identityDetails(account))),
+          !editing && hint('setupHint'), labelField, credentials, !editing && checkbox('enabled', 'enabled')),
+        panel('assistant', assistantSettings),
+        panel('messages', messageSettings),
+        editing && panel('advanced', management,
+          h('section', { className: 'dsho-account-section' }, h('h3', null, tr('connection')),
+            account.legacy && hint('legacy'),
+            h('div', { className: 'dsho-account-buttons' }, ...actions.map(([kind, action]) =>
+              h(Button, { key: kind, type: 'button', variant: 'outline', disabled: !!busy,
+                className: kind === 'remove' ? 'dsho-danger-action' : undefined,
+                onClick: () => runAction(kind, action) }, tr(kind))))))),
+      h('footer', { className: 'dsho-account-footer' },
+        h('div', null, feedbackLine, !feedback && !busy && hint(editing ? 'savedHint' : 'assistantIntro')),
         h('div', { className: 'dsho-account-buttons' },
-          h(Button, { type: 'button', variant: 'outline', disabled: !!busy, onClick: () => { clearToken(); onCancel() } }, tr('cancel')),
+          h(Button, { type: 'button', variant: 'outline', disabled: !!busy, onClick: () => { clearToken(); onCancel() } }, tr(editing ? 'close' : 'cancel')),
           h(Button, { type: 'submit', variant: 'primary',
-            disabled: !!busy || !allowCredentials || !identity || !draft.cwd }, tr('save')))))
+            disabled: !!busy || (!editing && (!allowCredentials || !identity)) }, tr(editing ? 'saveEdits' : 'save')))))
+
   }
 
   return function AccountEditor(props) {

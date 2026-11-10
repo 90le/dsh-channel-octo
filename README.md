@@ -8,9 +8,9 @@
 
 ## 多 Bot 助理
 
-在「设置 → Octo 渠道 → 助理」配置工作区、模型、Agent 预设、权限与工具范围。可先建立未绑定的助理，再绑定给 Bot；每个 Bot 同时只绑定一位助理。账号首次升级时自动沿用旧配置，助理在第一次保存时持久化；Bot、群主区、各子区及各私聊的会话绑定不迁移。切换助理或执行权限可能开启新会话，旧会话仍可查看。
+在「设置 → Octo 渠道 → Bot 账号 → 设置」使用「账号连接 / 专属助理 / 消息行为 / 高级管理」页签。创建 Bot 时自动创建一位专属助理，工作区、模型、Agent 预设、权限和工具范围在「专属助理」直接编辑。现有账号与历史会话保留。更改执行权限等运行配置可能开启新会话，旧会话仍可查看。
 
-助理页的 AGENTS.md 和 SOUL.md 是插件管理的提示词文件，只注入对应助理的 Octo 回合，不覆盖项目目录的同名文件，也不赋予工具权限。
+「专属助理」页签的 AGENTS.md 和 SOUL.md 是插件管理的提示词文件，只注入对应助理的 Octo 回合，不覆盖项目目录的同名文件，也不赋予工具权限。
 
 ## 本地检查
 
@@ -27,7 +27,7 @@ npm pack --dry-run
 以 DSH `0.2.2-rc.1` 或 `0.2.1-rc.5` 为兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.0.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.1.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。

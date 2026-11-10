@@ -431,6 +431,7 @@ export function apply(ctx) {
       if (process.env.DSH_OCTO_SMOKE_SIDEBAR_ONLY === '1') {
         console.log('PASS: native add workspace, route grouping, Tasks exclusion and independent Octo tab.')
         if (assistantSmoke) {
+          await page.locator('.dsho-filter-menu > summary').click()
           const kind = page.getByLabel('会话类型', { exact: true })
           await kind.selectOption('2')
           await nativeRow.waitFor({ state: 'detached' })
@@ -438,12 +439,20 @@ export function apply(ctx) {
           await nativeRow.waitFor()
           await page.keyboard.press('Control+Alt+,')
           await page.getByRole('button', { name: 'Octo 渠道', exact: true }).click()
-          await page.getByRole('tab', { name: '助理', exact: true }).click()
-          await page.getByRole('button', { name: /编辑 · Octo Bot/ }).click()
+          await page.getByRole('button', { name: /设置 · Octo Bot/ }).click()
+          const accountDialog = page.locator('dialog.dsho-account-modal')
+          await accountDialog.getByRole('tab', { name: '专属助理', exact: true }).click()
           await page.getByLabel('AGENTS.md', { exact: true }).fill('ASSISTANT-AGENTS-FIXTURE')
           await page.getByLabel('SOUL.md', { exact: true }).fill('ASSISTANT-SOUL-FIXTURE')
-          await page.getByRole('button', { name: '保存助理', exact: true }).click()
-          await page.getByText('助理设置已保存，从后续消息起生效。').waitFor()
+          await accountDialog.getByRole('button', { name: '保存设置', exact: true }).click()
+          await accountDialog.getByText('已保存', { exact: true }).waitFor()
+          if (process.env.DSH_OCTO_UI_CAPTURE) {
+            await page.screenshot({ path: join(process.env.DSH_OCTO_UI_CAPTURE, '027-assistant.png') })
+            await accountDialog.getByRole('tab', { name: '消息行为', exact: true }).click()
+            await page.screenshot({ path: join(process.env.DSH_OCTO_UI_CAPTURE, '027-messages.png') })
+            await accountDialog.getByRole('tab', { name: '高级管理', exact: true }).click()
+            await accountDialog.getByRole('button', { name: '诊断连接', exact: true }).waitFor()
+          }
           const settings = await (await page.request.get(new URL('/api/dsh-channel-octo/assistants/legacy', launch).href)).json()
           if (settings.agentsMd !== 'ASSISTANT-AGENTS-FIXTURE' || settings.soulMd !== 'ASSISTANT-SOUL-FIXTURE') {
             throw Error('Assistant files were not persisted by the UI')

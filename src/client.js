@@ -122,7 +122,22 @@ window.__ModuleLoader__.load({
 .dsho-advanced > summary { cursor:pointer; font-weight:560; margin-block:8px; }
 [data-dsho-hidden-task-workspace] { display:none!important; }
 .dsho-native-tabs { margin:8px 12px; }
-.dsho-bot-filter { display:flex; align-items:center; gap:8px; margin:6px 12px; }
+.dsho-bot-filter { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:2px 16px 0; min-height:30px; font-size:12px; }
+.dsho-filter-context { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; opacity:.65; }
+.dsho-filter-menu { position:relative; flex:none; }
+.dsho-filter-menu > summary { display:flex; align-items:center; gap:5px; list-style:none; border-radius:7px; padding:5px 8px; cursor:pointer; user-select:none; }
+.dsho-filter-menu > summary::-webkit-details-marker { display:none; }
+.dsho-filter-menu > summary:hover,.dsho-filter-menu[open] > summary { background:color-mix(in srgb,currentColor 7%,transparent); }
+.dsho-filter-menu > summary:focus-visible { outline:2px solid var(--dsw-alias-brand-primary,#4b7cff); }
+.dsho-filter-dot { width:5px; height:5px; border-radius:50%; background:var(--dsw-alias-brand-primary,#4b7cff); }
+.dsho-filter-popover { position:absolute; inset-inline-end:0; top:calc(100% + 6px); z-index:40; width:220px; max-width:calc(100vw - 40px);
+  box-sizing:border-box; display:grid; gap:12px; padding:14px; border:1px solid color-mix(in srgb,currentColor 13%,transparent);
+  background:var(--dsw-alias-bg-layer-1,Canvas); color:inherit; box-shadow:0 8px 24px #0002; border-radius:12px; }
+.dsho-filter-popover label { display:grid; gap:6px; font-weight:550; }
+.dsho-filter-popover select { width:100%; box-sizing:border-box; min-height:34px; padding:6px 8px; border:1px solid color-mix(in srgb,currentColor 15%,transparent);
+  border-radius:7px; background:transparent; color:inherit; font:inherit; font-weight:400; }
+.dsho-filter-popover button { border:0; background:transparent; color:inherit; font:inherit; cursor:pointer; padding:4px; text-align:start; }
+
 .dsho-native-state { max-width:100px; color:var(--dsw-alias-label-secondary,currentColor); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsho-root h2,.dsho-root h3,.dsho-rail h3,.dsho-modal h2 { margin:0; font-weight:650; line-height:1.32; }
 .dsho-root h2,.dsho-modal h2 { font-size:21px; }
@@ -675,13 +690,28 @@ window.__ModuleLoader__.load({
           const result = await props.searchSessions(...args)
           return { ...result, items: result.items.filter(row => visibleIds.has(row.id)) }
         }
-        return h(React.Fragment, null, h('div', { className: 'dsho-bot-filter' },
-          data.accounts?.length > 1 && h('label', null, 'Bot ',
-            h('select', { 'aria-label': 'Bot', value: account, onChange: event => setAccount(event.target.value) },
-              h('option', { value: '' }, t('all')), ...data.accounts.map(bot => h('option', { key: bot.id, value: bot.id }, bot.label)))),
-          h('label', null, t('conversationType') + ' ', h('select', { 'aria-label': t('conversationType'), value: kind, onChange: event => setKind(event.target.value) },
-            h('option', { value: '' }, t('all')), ...[1,2,5].map(type => h('option', { key: type, value: type }, t(channelNames[type])))))),
+        return h(React.Fragment, null,
+          h('div', { className: 'dsho-bot-filter' },
+            h('span', { className: 'dsho-filter-context' }, account
+              ? data.accounts?.find(bot => bot.id === account)?.label || 'Octo'
+              : (locale()?.startsWith('zh') ? '全部 Bot' : 'All bots')),
+            h('details', { className: 'dsho-filter-menu',
+              onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false },
+              onKeyDown: event => { if (event.key === 'Escape') { event.currentTarget.open = false; event.currentTarget.querySelector('summary')?.focus() } } },
+              h('summary', { 'aria-label': locale()?.startsWith('zh') ? '筛选会话' : 'Filter conversations' },
+                h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
+                  h('path', { d: 'M2 4h12M4 8h8M6 12h4', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' })),
+                locale()?.startsWith('zh') ? '筛选' : 'Filter', (account || kind) && h('span', { className: 'dsho-filter-dot', 'aria-hidden': true })),
+              h('div', { className: 'dsho-filter-popover' },
+                data.accounts?.length > 1 && h('label', null, 'Bot',
+                  h('select', { 'aria-label': 'Bot', value: account, onChange: event => setAccount(event.target.value) },
+                    h('option', { value: '' }, t('all')), ...data.accounts.map(bot => h('option', { key: bot.id, value: bot.id }, bot.label)))),
+                h('label', null, t('conversationType'), h('select', { 'aria-label': t('conversationType'), value: kind, onChange: event => setKind(event.target.value) },
+                  h('option', { value: '' }, t('all')), ...[1,2,5].map(type => h('option', { key: type, value: type }, t(channelNames[type]))))),
+                (account || kind) && h('button', { type: 'button', onClick: () => { setAccount(''); setKind('') } },
+                  locale()?.startsWith('zh') ? '重置筛选' : 'Reset filters')))),
           h(official, native))
+
       }
 
       function StandaloneSidebar({ official, props, registry }) {
@@ -778,7 +808,7 @@ window.__ModuleLoader__.load({
         const [selected, setSelected] = useState('')
         const accounts = data.accounts ?? []
         const current = accounts.find(account => account.id === selected) ?? accounts[0]
-        const sections = ['account', 'assistants', 'rules']
+        const sections = ['account', 'rules']
         const panel = (key, content) => h('div', { id: 'dsho-panel-' + key, role: 'tabpanel',
           'aria-labelledby': 'dsho-tab-' + key, hidden: page !== key, key }, content)
         return h('div', { className: 'dsho-root', 'data-octo-settings': true },
@@ -791,7 +821,6 @@ window.__ModuleLoader__.load({
             items: sections.map(key => ({ value: key, label: t(key), id: 'dsho-tab-' + key, panelId: 'dsho-panel-' + key })) }),
           data.error && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
           panel('account', h(Account, { data, t, current, choose: setSelected })),
-          panel('assistants', page === 'assistants' && h(Assistants, { data, t })),
           panel('rules',
             h('div', { className: 'dsho-panel' },
               accounts.length > 1 && h('div', { className: 'dsho-field' },

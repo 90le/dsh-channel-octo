@@ -133,7 +133,9 @@ export function registerWeb(ctx, accounts) {
       try {
         const creatingAssistant = req.method === 'POST' && target === path + '/assistants'
         const editingAssistant = req.method === 'PUT' && assistant
-        const input = await body(req, creatingAssistant || editingAssistant ? 110_000 : undefined)
+        const savingAccount = req.method === 'POST' && target === path + '/accounts'
+          || req.method === 'PUT' && /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})$/.test(target)
+        const input = await body(req, creatingAssistant || editingAssistant || savingAccount ? 110_000 : undefined)
         if (creatingAssistant || editingAssistant) return send(200, await accounts.saveAssistant(assistant?.[1], input))
         if (req.method === 'POST' && target === path + '/accounts/verify') {
           return send(200, await accounts.verify(input?.token))

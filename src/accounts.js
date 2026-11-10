@@ -691,7 +691,11 @@ export class Accounts {
     return this.locked(async () => {
       this.checkRevision(input)
       const old = accountId ? this.record(accountId) : null
-      const data = input.account
+      const payload = input.account
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) fail('invalid_account')
+      const docs = Object.fromEntries(assistantDocKeys.filter(key => Object.hasOwn(payload, key)).map(key => [key, payload[key]]))
+      if (Object.values(docs).some(value => !validAssistantDoc(value))) fail('invalid_assistant')
+      const data = Object.fromEntries(Object.entries(payload).filter(([key]) => !assistantDocKeys.includes(key)))
       const fields = await this.editFields(data, old)
       const changedToken = Object.hasOwn(data, 'token')
       if (!old && !changedToken) fail('invalid_bot_token')
@@ -714,7 +718,7 @@ export class Accounts {
       record.assistantId = selectedAssistant
       const profile = this.assistants.get(selectedAssistant) ?? legacyAssistant(record)
       if (!this.assistants.has(selectedAssistant) && this.assistants.size >= 64) fail('invalid_assistant')
-      const profiles = new Map(this.assistants).set(selectedAssistant, { ...profile, ...assistantRuntime(record) })
+      const profiles = new Map(this.assistants).set(selectedAssistant, { ...profile, name: record.label, ...assistantRuntime(record), ...docs })
       const active = this.runtimes.get(record.id)
       if (active?.changing) fail('account_transition')
       const rotate = !!active && (changedToken || active.record.enabled !== record.enabled)

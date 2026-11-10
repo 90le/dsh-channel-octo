@@ -39,14 +39,14 @@ button.dsho-account-platform { cursor:pointer; }
 }
 dialog.dsho-account-modal[open] {
   display:flex; flex-direction:column; width:min(720px,calc(100vw - 32px))!important; min-height:0;
-  max-height:calc(100dvh - 40px); padding:0!important; color:inherit; overflow:hidden;
+  height:min(700px,calc(100dvh - 40px)); max-height:calc(100dvh - 40px); padding:0!important; color:inherit; overflow:hidden;
   background:var(--dsw-alias-bg-layer-1,var(--dsho-soft,Canvas));
 }
 .dsho-account-dialog-head { display:flex; justify-content:space-between; align-items:center; flex:none; gap:12px; padding:14px 24px; border-bottom:1px solid var(--dsho-edge); }
 .dsho-account-dialog-head h2 { font-size:17px; line-height:24px; }
 .dsho-account-editor { display:flex; flex-direction:column; min-width:0; min-height:0; margin:0; }
 .dsho-account-body {
-  display:grid; align-content:start; gap:16px; min-width:0; min-height:0; overflow:auto;
+  display:grid; flex:1; align-content:start; gap:16px; min-width:0; min-height:0; overflow:auto;
   padding:18px 24px 20px; scrollbar-gutter:stable; overscroll-behavior:contain;
 }
 .dsho-account-footer { display:grid; gap:8px; flex:none; padding:12px 24px; border-top:1px solid var(--dsho-edge); }
@@ -74,8 +74,37 @@ dialog.dsho-account-modal[open] {
 .dsho-account-feedback:empty { display:none; }
 .dsho-account-confirm { color:inherit; }
 .dsho-account-confirm .dsho-account-buttons { justify-content:flex-end; }
+.dsho-account-modal .dsho-account-editor { flex:1; overflow:hidden; }
+.dsho-account-tabs { display:flex; flex:none; gap:4px; padding:12px 24px 0; border-bottom:1px solid var(--dsho-edge); }
+.dsho-account-tabs button { appearance:none; border:0; border-bottom:2px solid transparent; border-radius:6px 6px 0 0;
+  background:transparent; color:var(--dsho-muted); font:inherit; font-size:13px; padding:10px 12px; cursor:pointer; }
+.dsho-account-tabs button:hover { background:var(--dsho-row); color:inherit; }
+.dsho-account-tabs button[aria-selected=true] { color:inherit; border-bottom-color:currentColor; font-weight:650; }
+.dsho-account-tabs button:focus-visible { outline:2px solid var(--dsw-alias-brand-primary,#4b7cff); outline-offset:-2px; }
+.dsho-account-tabpanel { display:grid; align-content:start; gap:18px; min-height:300px; min-width:0; }
+.dsho-account-tabpanel[hidden] { display:none!important; }
+.dsho-account-section { display:grid; gap:12px; padding-top:18px; border-top:1px solid var(--dsho-edge); }
+.dsho-account-editor h3 { font-size:14px; line-height:1.5; margin:0; }
+.dsho-account-editor .dsho-field { display:grid; align-content:start; gap:7px; min-width:0; }
+.dsho-account-editor .dsho-field :is(input,select,textarea) {
+  box-sizing:border-box; width:100%; min-width:0; padding:9px 11px; border:1px solid var(--dsho-edge);
+  border-radius:8px; background:var(--dsw-alias-bg-layer-1,Canvas); color:inherit; font:inherit; font-size:13px; }
+.dsho-account-editor .dsho-field textarea { resize:vertical; line-height:1.6; min-height:100px; }
+.dsho-account-editor .dsho-field :is(input,select,textarea):focus-visible { outline:2px solid var(--dsw-alias-brand-primary,#4b7cff); outline-offset:1px; }
+.dsho-account-editor .dsho-field select:disabled { opacity:.55; }
+.dsho-account-editor > .dsho-account-footer { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; }
+.dsho-account-editor > .dsho-account-footer > div:first-child { flex:1; min-width:140px; }
+.dsho-account-tabpanel > .dsho-account-footer { border:0; padding:0 0 18px; border-bottom:1px solid var(--dsho-edge); }
+.dsho-account-tabpanel .dsho-account-footer h3 { font-size:14px; margin:0; }
+.dsho-account-note { font-size:12px; line-height:1.6; }
+.dsho-account-help { font-size:12px; color:var(--dsho-muted); }
+.dsho-account-help > summary { cursor:pointer; width:fit-content; }
+.dsho-account-help > p { margin-top:8px; }
+
 @media (max-width:520px) {
-  .dsho-account-dialog-head,.dsho-account-body,.dsho-account-footer { padding-inline:14px; }
+  .dsho-account-dialog-head,.dsho-account-body,.dsho-account-footer,.dsho-account-tabs { padding-inline:14px; }
+  .dsho-account-tabs { gap:0; }
+  .dsho-account-tabs button { padding-inline:9px; font-size:12px; }
   .dsho-account-settings { grid-template-columns:minmax(0,1fr); gap:12px; }
   .dsho-account-setup { padding:12px; }
   .dsho-account-credentials .dsho-account-buttons { margin-top:0; }
@@ -102,6 +131,7 @@ const caption = {
   account_transition: ['账号正在切换连接，请稍后再试。', 'The account is changing its connection. Try again shortly.'],
   account_changed: ['账号设置已在别处更新，请重新打开设置后再试。', 'The account changed elsewhere. Reopen its settings and try again.'],
   duplicate_bot: ['这个 Bot 已经添加，请编辑原账号。', 'This bot already has an account. Edit the existing account.'],
+  invalid_assistant: ['助理指令格式无效，每份最多 8 KB。', 'Invalid assistant instructions. Each document allows up to 8 KB.'],
   invalid_bot_token: ['Bot 令牌无效或尚未配置。', 'The bot token is invalid or missing.'],
   bot_identity_mismatch: ['新令牌的 Bot、类型或空间与原账号不一致。', 'The replacement token has a different bot, type or space.'],
   bot_verification_failed: ['Octo 未确认令牌，请检查令牌和服务地址。', 'Octo could not verify this token. Check the token and server.'],
@@ -207,6 +237,7 @@ export function createAccountView(React, primitives, { request, status, label })
     const revision = useRef(data.accountRevision)
     const pending = useRef(false)
     const [options, setOptions] = useState(null)
+    const [assistant, setAssistant] = useState(null)
     const [failed, setFailed] = useState(false)
     const [busy, setBusy] = useState(false)
     const [confirming, setConfirming] = useState(false)
@@ -214,8 +245,9 @@ export function createAccountView(React, primitives, { request, status, label })
     useEffect(() => {
       if (!dialog.current.open) dialog.current.showModal()
       const controller = new AbortController()
-      request('/account-options', { signal: controller.signal }).then(result => {
-        if (!controller.signal.aborted) setOptions(result)
+      Promise.all([request('/account-options', { signal: controller.signal }),
+        account?.assistantId ? request('/assistants/' + account.assistantId, { signal: controller.signal }) : null]).then(([result, profile]) => {
+        if (!controller.signal.aborted) { setAssistant(profile); setOptions(result) }
       }).catch(() => { if (!controller.signal.aborted) setFailed(true) })
       return () => controller.abort()
     }, [])
@@ -257,7 +289,33 @@ export function createAccountView(React, primitives, { request, status, label })
       failed ? h('div', { className: 'dsho-account-body' }, h('p', { className: 'dsho-alert', role: 'alert' }, tr('failedOptions'))) : !options
         ? h('div', { className: 'dsho-account-body' }, h('p', { role: 'status' }, tr('loading')))
         : h(Editor, {
-          account, options, allowCredentials, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
+          account: account && { ...account, agentsMd: assistant?.agentsMd ?? '', soulMd: assistant?.soulMd ?? '' },
+          management: h(React.Fragment, null,
+              account && account.botKind !== 'app' && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
+                perform: action => perform('POST', endpoint(account.id) + '/commands', { action, revision: revision.current }) }),
+              account && account.botKind !== 'app' && h(WebhookView, { accountId: account.id, accountLabel: account.label, lang, busy, disabled: !data.canManage || !account.config,
+                chatEnabled: account.enabled && account.groupCommands === 'safe' && !!account.permission
+                  && !['text-only', 'read-only'].includes(account.permission) && account.config?.apiBase?.startsWith('https:'),
+                perform: async (input, signal) => {
+                  let result
+                  try {
+                    result = await request(endpoint(account.id) + '/webhooks', {
+                      method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
+                      body: JSON.stringify({ ...input, revision: revision.current }),
+                    })
+                  } catch (error) {
+                    if (!signal.aborted && ['webhook_outcome_unknown', 'account_changed'].includes(error?.message)) refresh()
+                    throw error
+                  }
+                  if (!signal.aborted && result.accountId === account.id) {
+                    revision.current = result.accountRevision
+                    // Refresh ordinary account metadata separately; the protected result
+                    // is never passed to publish() or the shared client snapshot.
+                    if (result.webhook || result.deleted || result.test) refresh()
+                  }
+                  return result
+                } })),
+          options, allowCredentials, lang, onCancel: closeDialog, errorMessage: error => tr(error?.message),
           connectionStatus: account && status(account.enabled === false ? 'disabled' : account.status, lang),
           onVerify: ({ token }) => perform('POST', '/accounts/verify', { token }),
           onSave: fields => perform(account ? 'PUT' : 'POST', account ? endpoint(account.id) : '/accounts',
@@ -267,30 +325,6 @@ export function createAccountView(React, primitives, { request, status, label })
             { revision: revision.current })),
           onRemove: account && (() => { setConfirming(true); return false }),
         }),
-      account && account.botKind !== 'app' && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
-        perform: action => perform('POST', endpoint(account.id) + '/commands', { action, revision: revision.current }) }),
-      account && account.botKind !== 'app' && h(WebhookView, { accountId: account.id, accountLabel: account.label, lang, busy, disabled: !data.canManage || !account.config,
-        chatEnabled: account.enabled && account.groupCommands === 'safe' && !!account.permission
-          && !['text-only', 'read-only'].includes(account.permission) && account.config?.apiBase?.startsWith('https:'),
-        perform: async (input, signal) => {
-          let result
-          try {
-            result = await request(endpoint(account.id) + '/webhooks', {
-              method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
-              body: JSON.stringify({ ...input, revision: revision.current }),
-            })
-          } catch (error) {
-            if (!signal.aborted && ['webhook_outcome_unknown', 'account_changed'].includes(error?.message)) refresh()
-            throw error
-          }
-          if (!signal.aborted && result.accountId === account.id) {
-            revision.current = result.accountRevision
-            // Refresh ordinary account metadata separately; the protected result
-            // is never passed to publish() or the shared client snapshot.
-            if (result.webhook || result.deleted || result.test) refresh()
-          }
-          return result
-        } }),
       confirming && h(ConfirmRemove, { tr, onClose: () => setConfirming(false),
         remove: () => perform('POST', endpoint(account.id) + '/remove', { revision: revision.current }, true) }))
   }

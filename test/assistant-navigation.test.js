@@ -36,6 +36,11 @@ test('main is above newer topics; task projection hides empty owned directories 
     { id: 'main', type: 2, group: 'g', address: 'g', groupName: 'Group', updatedAt: 10 }]
   const folders = octoFolders(routes, { byId: { topic: {}, main: {} } }, false, x => x, false, [])
   assert.deepEqual(folders.map(row => row.title), ['group', 'Group', 'mainArea', 'Documents'])
+  const botRoutes = routes.map(row => ({ ...row, accountId: 'one', accountLabel: 'First bot' }))
+  botRoutes.push({ ...botRoutes[1], id: 'other', accountId: 'two', accountLabel: 'Second bot' })
+  const grouped = octoFolders(botRoutes, { byId: { topic: {}, main: {}, other: {} } }, true, x => x, false, [])
+  assert.deepEqual(grouped.filter(row => row.path.split('/').length === 2).map(row => row.title), ['First bot', 'Second bot'])
+  assert.equal(grouped.find(row => row.sessionIds.includes('other')).path.includes('bot%3Atwo'), true)
   const rows = { items: [{ path: '/srv/agents/dsh/octo', sessionIds: [] }, { path: '/other', sessionIds: [] }] }
   const phase = 'ready', paths = new Set(['/srv/agents/dsh/octo']), known = new Set(['topic','main'])
   assert.deepEqual(taskWorkspaceProjection(rows, known, paths, { phase, ids: [], byId: {} }).items, [rows.items[1]])

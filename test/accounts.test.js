@@ -115,6 +115,16 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(restored.toolScope, 'admitted')
     assert.equal(accounts.overview().accounts.find(row => row.id === secondId).toolScope, 'private')
     assert.equal(accounts.assistantDetail(aid).boundAccountId, secondId)
+    const beforeDocsProfile = accounts.runtimeConfig(accounts.record(secondId), {}).sessionProfile
+    await accounts.save(secondId, { revision: accounts.revision, account: { agentsMd: 'UPDATED SECOND ONLY', soulMd: 'Kind' } })
+    assert.equal(accounts.record(secondId).assistantId, aid)
+    assert.equal(accounts.assistantDetail(aid).agentsMd, 'UPDATED SECOND ONLY')
+    assert.equal(accounts.hostFor(accounts.record(firstId), { cwd: root }).profile.agentsMd, '')
+    assert.equal(accounts.runtimeConfig(accounts.record(secondId), {}).sessionProfile, beforeDocsProfile)
+    assert.ok(!JSON.stringify(accounts.overview()).includes('UPDATED SECOND ONLY'))
+    await assert.rejects(accounts.save(secondId, { revision: accounts.revision, account: { soulMd: 'x'.repeat(8193) } }), /invalid_assistant/)
+    assert.equal(accounts.assistantDetail(aid).soulMd, 'Kind')
+
     assert.ok(accounts.runtimes.get(secondId).store.knownSessions().includes(existing.session_id))
     assert.deepEqual(await accounts.diagnose(firstId), { botUid: 'bot-fixture', spaceId: 'fixture-space' })
     await accounts.remove(secondId, { revision: accounts.overview().accountRevision })
