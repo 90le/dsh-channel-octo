@@ -1,4 +1,4 @@
-import { createAssistantInstructionHelp } from './assistant-view.js'
+import { createWorkspaceInstructionEditor } from './assistant-view.js'
 
 const builtinPolicy = {
   'text-only': ['仅文字（无工具）', 'Text only (no tools)'],
@@ -26,11 +26,6 @@ const copy = {
   accountTab: ['账号连接', 'Connection'], assistantTab: ['专属助理', 'Assistant'],
   messagesTab: ['消息行为', 'Messages'], advancedTab: ['高级管理', 'Advanced'],
   assistantIntro: ['每个 Bot 自动拥有一位专属助理，以下设置仅用于此 Bot。', 'Each bot has its own assistant. These settings apply only to this bot.'],
-  documents: ['Octo 附加指令', 'Extra Octo instructions'],
-  agentsMd: ['AGENTS.md', 'AGENTS.md'], soulMd: ['SOUL.md', 'SOUL.md'],
-  agentsPlaceholder: ['可选：仅此助理的操作约定，不自动读取工作区 AGENTS.md。', 'Optional: conventions for this assistant only. Workspace AGENTS.md is not imported.'],
-  soulPlaceholder: ['可选：仅此助理的角色与语气，不自动读取工作区 SOUL.md。', 'Optional: role and tone for this assistant only. Workspace SOUL.md is not imported.'],
-  documentsTooLarge: ['每份助理指令最多 8 KB，请缩短后保存。', 'Each instruction document can contain up to 8 KB.'],
   setupHint: ['验证 Bot 令牌，并在「专属助理」选择工作区，即可创建账号。', 'Verify the bot token and choose a workspace under Assistant to create the account.'],
   savedHint: ['设置自动保存，后续消息生效。', 'Changes save automatically and apply to subsequent messages.'],
   assistant: ['专属助理', 'Assistant'],
@@ -146,7 +141,6 @@ const userIds = text => [...new Set(text.split(/\r?\n/).map(uid => uid.trim()).f
 export function accountFields(account) {
   return {
     label: account?.label ?? '',
-    agentsMd: account?.agentsMd ?? '', soulMd: account?.soulMd ?? '',
     cwd: account?.cwd ?? '',
     provider: account?.provider ?? '',
     model: account?.model ?? '',
@@ -168,10 +162,10 @@ export function accountFields(account) {
 
 export function createAccountEditor(React, { Button, Input }) {
   const { createElement: h, useEffect, useId, useRef, useState } = React
-  const InstructionHelp = createAssistantInstructionHelp(React)
+  const WorkspaceInstructions = createWorkspaceInstructionEditor(React, { Button })
 
   function AccountForm({ account, options, allowCredentials, onVerify, onSave, onCancel,
-    onDiagnose, onReconnect, onRemove, t, lang = 'zh', connectionStatus, errorMessage, management }) {
+    onDiagnose, onReconnect, onRemove, t, lang = 'zh', connectionStatus, errorMessage, management, request, canManage }) {
     const tr = key => {
       const id = 'octo.accountEditor.' + key
       const translated = t?.(id)
@@ -318,11 +312,10 @@ export function createAccountEditor(React, { Button, Input }) {
         label: settings.label.trim(),
         allowedUids: settings.senderPolicy === 'allowlist' ? userIds(uids) : [],
       }
-      const problem = [fields.agentsMd, fields.soulMd].some(text => new TextEncoder().encode(text).length > 8192)
-        ? 'documentsTooLarge' : validate(fields)
+      const problem = validate(fields)
       if (problem) {
         queued.current = null
-        if (['pickWorkspace', 'noWorkspaces', 'pickModel', 'pickPolicy', 'noPolicies', 'documentsTooLarge'].includes(problem)) setPage('assistant')
+        if (['pickWorkspace', 'noWorkspaces', 'pickModel', 'pickPolicy', 'noPolicies'].includes(problem)) setPage('assistant')
         setFeedback({ text: tr(problem), error: true })
         return
       }
@@ -445,15 +438,8 @@ export function createAccountEditor(React, { Button, Input }) {
       h('details', { className: 'dsho-account-help' }, h('summary', null, tr('toolScope')),
         hint(app ? 'appToolScopeHint' : 'toolScopeHint'),
         policies.some(item => item.disabled) && hint('policyDisabled')),
-      h('section', { className: 'dsho-account-section' },
-        h('h3', null, tr('documents')), h(InstructionHelp, { lang, id: id + '-instruction-source' }),
-        ...['agentsMd', 'soulMd'].map(key => field(key, key, h('textarea', {
-          id: id + '-' + key, rows: 4, maxLength: 8192, value: draft[key], disabled: locked,
-          'aria-describedby': id + '-instruction-source',
-          placeholder: tr(key === 'agentsMd' ? 'agentsPlaceholder' : 'soulPlaceholder'),
-          onChange: event => update({ [key]: event.target.value }, false),
-          onBlur: () => { if (editing) void save(draft, uidText) },
-        })))))
+      h(WorkspaceInstructions, { key: account?.cwd, lang, request, assistantId: account?.assistantId,
+        cwd: account?.cwd, disabled: !canManage || draft.cwd !== account?.cwd }))
     const messageSettings = h(React.Fragment, null,
       h('div', { className: 'dsho-account-settings' },
         select('sender', 'senderPolicy', senderItems, draft.senderPolicy, senderPolicy => update({ senderPolicy })),

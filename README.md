@@ -32,7 +32,7 @@
 
 在「设置 → Octo 渠道 → Bot 账号 → 设置」使用「账号连接 / 专属助理 / 消息行为 / 高级管理」页签。创建 Bot 时自动创建一位专属助理，工作区、模型、Agent 预设、权限和工具范围在「专属助理」直接编辑。现有账号与历史会话保留。更改执行权限等运行配置可能开启新会话，旧会话仍可查看。
 
-「专属助理 → Octo 附加指令」中的 AGENTS.md / SOUL.md 是插件独立保存的补充提示，不是工作区文件编辑器。空框不代表文件不存在或未加载，也不会自动回填或覆盖文件。DSH 0.2.2-rc.1 的标准、PTC、创造模式默认按工作目录和项目范围加载 AGENTS.md；SOUL.md 不在默认自动加载名单。共享工作约定可保留在工作区 AGENTS.md；仅此 Bot 使用的角色语气可放入 SOUL.md 附加指令，无需两处重复填写。自定义及极简预设以实际加载规则为准；指令不赋予工具权限。
+「专属助理 → 工作区指令」直接编辑绑定工作区的 `AGENTS.md` 和 `SOUL.md`，每个文件单独创建或保存。重新读取可查看磁盘上的最新内容，保存前比较文件版本。DSH 预设负责加载 `AGENTS.md`，Octo 不重复注入；Octo 每项新任务读取 `SOUL.md` 作为角色说明。旧版附加文字保留为可查看的归档。详见[配置说明及产品对比](ASSISTANT-CONFIG.md)。
 
 「更换 Bot 令牌」仅用于同一个 Bot 的令牌轮换。要连接另一个 Bot，请使用「添加账号」。令牌有效但与当前 Bot 不一致时，验证会明确提示；验证不会替换当前保存的凭据。
 
@@ -51,7 +51,7 @@ npm pack --dry-run
 以 DSH `0.2.2-rc.1` 或 `0.2.1-rc.5` 为兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.12.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.13.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。

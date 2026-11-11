@@ -15,6 +15,7 @@ import { botCommandMenu, setBotCommands } from './bot-commands.js'
 import { administerWebhooks, validateWebhookInput, webhookWrites } from './webhook-admin.js'
 import { createWebhookChat, isWebhookChatAction, validateWebhookChatInput } from './webhook-chat.js'
 import { directoryRecoveryEnabled } from './directory-discovery.js'
+import { instructionFiles, readInstruction, saveInstruction } from './workspace-instructions.js'
 
 const legacy = 'legacy'
 const textOnly = 'text-only'
@@ -652,9 +653,7 @@ export class Accounts {
   }
 
   hostFor(record, config) {
-    const assistant = this.assistants.get(assistantId(record))
-    return new DshHost(this.ctx, config.cwd, config.timeoutMs, { ...record,
-      agentsMd: assistant?.agentsMd, soulMd: assistant?.soulMd })
+    return new DshHost(this.ctx, config.cwd, config.timeoutMs, record)
   }
 
   assistantDetail(key) {
@@ -664,16 +663,41 @@ export class Accounts {
     return { ...profile, boundAccountId: record?.id }
   }
 
+  instructionWorkspace(key) {
+    if (!this.ready || this.lifetime.signal.aborted) fail('accounts_unavailable')
+    const profile = this.assistantDetail(key)
+    const cwd = profile.boundAccountId ? this.record(profile.boundAccountId).cwd : profile.cwd
+    if (cwd !== profile.cwd || !this.workspaces().some(workspace => workspace.path === cwd)) fail('workspace_unavailable')
+    return { cwd, profile }
+  }
+
+  workspaceInstructions(key) {
+    const { cwd, profile } = this.instructionWorkspace(key)
+    return { cwd, files: Object.fromEntries(instructionFiles.map((name, index) => {
+      const legacy = profile[assistantDocKeys[index]]
+      return [name, { ...readInstruction(cwd, name), ...(legacy?.trim() && { legacy }) }]
+    })) }
+  }
+
+  saveWorkspaceInstruction(key, name, input) {
+    return this.locked(() => {
+      const { cwd, profile } = this.instructionWorkspace(key)
+      if (input?.cwd !== cwd) fail('instruction_changed')
+      const file = saveInstruction(cwd, name, input)
+      const legacy = profile[assistantDocKeys[instructionFiles.indexOf(name)]]
+      return { ...file, ...(legacy?.trim() && { legacy }) }
+    })
+  }
+
   saveAssistant(key, input) {
     return this.locked(async () => {
       this.checkRevision(input)
       const old = key ? this.assistantDetail(key) : undefined
       const data = input?.assistant
       if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data)
-        .some(name => !['name', ...assistantRuntimeKeys, ...assistantDocKeys].includes(name))
+        .some(name => !['name', ...assistantRuntimeKeys].includes(name))
         || !str(data.name, 80) || !data.name.trim() || (!old && this.assistants.size >= 64)) fail('invalid_assistant')
-      const docs = Object.fromEntries(assistantDocKeys.map(name => [name, data[name] ?? old?.[name] ?? '']))
-      if (Object.values(docs).some(value => !validAssistantDoc(value))) fail('invalid_assistant')
+      const docs = Object.fromEntries(assistantDocKeys.map(name => [name, old?.[name] ?? '']))
       if (old?.boundAccountId && input.accountId && old.boundAccountId !== input.accountId) fail('assistant_bound')
       const recordId = old?.boundAccountId ?? input.accountId
       const record = recordId ? this.record(recordId) : undefined
@@ -750,13 +774,10 @@ export class Accounts {
       const old = accountId ? this.record(accountId) : null
       const payload = input.account
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)) fail('invalid_account')
-      const docs = Object.fromEntries(assistantDocKeys.filter(key => Object.hasOwn(payload, key)).map(key => [key, payload[key]]))
-      if (Object.values(docs).some(value => !validAssistantDoc(value))) fail('invalid_assistant')
-      const data = Object.fromEntries(Object.entries(payload).filter(([key]) => !assistantDocKeys.includes(key)))
+      const data = payload
       const fields = await this.editFields(data, old)
       const previous = old && this.publicAccount(old)
       const presentationOnly = !!old && !Object.hasOwn(data, 'token')
-        && Object.keys(docs).length === 0
         && Object.entries(fields).every(([key, value]) => key === 'progressExpansion' || JSON.stringify(value) === JSON.stringify(previous[key]))
       const changedToken = Object.hasOwn(data, 'token')
       if (!old && !changedToken) fail('invalid_bot_token')
@@ -779,7 +800,7 @@ export class Accounts {
       record.assistantId = selectedAssistant
       const profile = this.assistants.get(selectedAssistant) ?? legacyAssistant(record)
       if (!this.assistants.has(selectedAssistant) && this.assistants.size >= 64) fail('invalid_assistant')
-      const profiles = new Map(this.assistants).set(selectedAssistant, { ...profile, name: record.label, ...assistantRuntime(record), ...docs })
+      const profiles = new Map(this.assistants).set(selectedAssistant, { ...profile, name: record.label, ...assistantRuntime(record) })
       const active = this.runtimes.get(record.id)
       if (active?.changing) fail('account_transition')
       const rotate = !!active && (changedToken || active.record.enabled !== record.enabled)

@@ -11,7 +11,8 @@ const view = readFileSync(new URL('./account-view.js', import.meta.url), 'utf8')
 const webhookView = readFileSync(new URL('./webhook-view.js', import.meta.url), 'utf8')
 const webhookChatView = readFileSync(new URL('./webhook-chat-view.js', import.meta.url), 'utf8')
 const uiVersion = createHash('sha256').update(assistantView).update(editor).update(view).update(webhookView).update(webhookChatView).digest('hex').slice(0, 16)
-const modules = new Map([[path + '/assistant-view.js', assistantView], [path + '/account-editor.js', editor],
+const modules = new Map([[path + '/assistant-view.js', assistantView],
+  [path + '/account-editor.js', editor.replace('./assistant-view.js', './assistant-view.js?v=' + uiVersion)],
   [path + '/webhook-chat-view.js', webhookChatView],
   [path + '/webhook-view.js', webhookView.replace('./webhook-chat-view.js', './webhook-chat-view.js?v=' + uiVersion)],
   [path + '/account-view.js', view.replace('./account-editor.js', './account-editor.js?v=' + uiVersion)
@@ -90,6 +91,7 @@ const accountErrors = {
   ...webhookErrors,
   accounts_unavailable: 503, credential_provider_unavailable: 503,
   assistant_not_found: 404, assistant_bound: 409, invalid_assistant: 400,
+  invalid_instruction: 400, instruction_changed: 409, instruction_unavailable: 500,
   account_not_found: 404, account_changed: 409, account_transition: 409, duplicate_bot: 409,
   invalid_account: 400, invalid_bot_token: 400, bot_identity_mismatch: 400, bot_verification_failed: 400,
   workspace_unavailable: 400, model_unavailable: 400, reasoning_unavailable: 400, permission_unavailable: 400,
@@ -123,14 +125,32 @@ export function registerWeb(ctx, accounts) {
       }
       if (req.method === 'GET' && target === path + '/account-options') return send(200, await accounts.options())
       const assistant = /^\/api\/dsh-channel-octo\/assistants\/(legacy|[a-f0-9-]{36})$/.exec(target)
+      const instructions = /^\/api\/dsh-channel-octo\/assistants\/(legacy|[a-f0-9-]{36})\/instructions(?:\/(AGENTS\.md|SOUL\.md))?$/.exec(target)
+      const trustedEditor = req.headers['x-dsh-octo-client'] === '1' && !['cross-site', 'same-site'].includes(req.headers['sec-fetch-site'])
+      if (req.method === 'GET' && instructions && !instructions[2]) {
+        if (!trustedEditor) return send(403, { error: 'forbidden' })
+        try { return send(200, accounts.workspaceInstructions(instructions[1])) }
+        catch (error) {
+          const code = Object.hasOwn(accountErrors, error?.message) ? error.message : 'instruction_unavailable'
+          return send(accountErrors[code], { error: code })
+        }
+      }
       if (req.method === 'GET' && assistant) {
         try { return send(200, accounts.assistantDetail(assistant[1])) }
         catch { return send(404, { error: 'assistant_not_found' }) }
       }
       if (!['POST', 'PUT'].includes(req.method)) return send(404, { error: 'not_found' })
-      if (req.headers['x-dsh-octo-client'] !== '1' || ['cross-site', 'same-site'].includes(req.headers['sec-fetch-site'])
+      if (!trustedEditor
         || !/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) return send(403, { error: 'forbidden' })
       try {
+        if (req.method === 'PUT' && instructions?.[2]) {
+          const input = await body(req, 210_000)
+          try { return send(200, await accounts.saveWorkspaceInstruction(instructions[1], instructions[2], input)) }
+          catch (error) {
+            const code = Object.hasOwn(accountErrors, error?.message) ? error.message : 'instruction_unavailable'
+            return send(accountErrors[code], { error: code })
+          }
+        }
         const creatingAssistant = req.method === 'POST' && target === path + '/assistants'
         const editingAssistant = req.method === 'PUT' && assistant
         const savingAccount = req.method === 'POST' && target === path + '/accounts'

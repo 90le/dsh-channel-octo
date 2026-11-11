@@ -102,19 +102,25 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     const existing = initialStore.session('fixture-user')
     initialStore.sessionCreated('fixture-user')
     const unbound = await accounts.saveAssistant(null, { revision: accounts.revision, assistant: {
-      name: 'Independent assistant', cwd: root, agentPreset: 'standard', agentsMd: 'SECOND ONLY', soulMd: 'Calm',
+      name: 'Independent assistant', cwd: root, agentPreset: 'standard',
     } })
     const aid = unbound.assistantId
     assert.equal(unbound.assistants.find(item => item.id === aid).boundAccountId, undefined)
     const profile = accounts.assistantDetail(aid)
-    const { id: _id, boundAccountId, ...assistant } = profile
+    const { id: _id, boundAccountId, agentsMd, soulMd, ...assistant } = profile
     await accounts.saveAssistant(aid, { revision: accounts.revision, accountId: secondId, assistant })
     assert.equal(accounts.record(secondId).assistantId, aid)
     assert.equal(accounts.runtimes.get(secondId).store, initialStore)
     assert.ok(initialStore.knownSessions().includes(existing.session_id))
-    assert.equal(accounts.hostFor(accounts.record(firstId), { cwd: root }).profile.agentsMd, '')
-    assert.equal(accounts.hostFor(accounts.record(secondId), { cwd: root }).profile.agentsMd, 'SECOND ONLY')
-    assert.ok(!JSON.stringify(accounts.overview()).includes('SECOND ONLY'))
+    const instructions = accounts.workspaceInstructions(aid)
+    assert.equal(instructions.files['AGENTS.md'].state, 'missing')
+    const file = await accounts.saveWorkspaceInstruction(aid, 'AGENTS.md', {
+      cwd: root, revision: instructions.files['AGENTS.md'].revision, text: 'FIXTURE WORKSPACE RULES',
+    })
+    assert.equal(file.state, 'present')
+    assert.equal(readFileSync(join(root, 'AGENTS.md'), 'utf8'), 'FIXTURE WORKSPACE RULES')
+    assert.equal(accounts.workspaceInstructions(accounts.record(firstId).assistantId).files['AGENTS.md'].text, 'FIXTURE WORKSPACE RULES')
+    assert.ok(!JSON.stringify(accounts.overview()).includes('FIXTURE WORKSPACE RULES'))
     await assert.rejects(accounts.saveAssistant(aid, { revision: accounts.revision, accountId: firstId, assistant }), /assistant_bound/)
     const publicAndDisk = JSON.stringify(accounts.overview()) + readFileSync(join(root, 'accounts.json'), 'utf8')
     for (const secret of ['bf_first_fixture', 'bf_other_fixture', 'bf_rotated_fixture']) {
@@ -122,6 +128,11 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     }
     assert.ok(!JSON.stringify(accounts.overview()).includes('DSH_OCTO_ACCOUNT_'))
     await accounts.dispose()
+    // Simulate a deployment upgrading from an account with old inline text.
+    const stateFile = join(root, 'accounts.json')
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'))
+    state.assistants.find(item => item.id === aid).agentsMd = 'ARCHIVED OLD RULES'
+    writeFileSync(stateFile, JSON.stringify(state))
     accounts = make()
     await accounts.initialize()
     const restored = accounts.overview().accounts.find(row => row.id === firstId)
@@ -133,14 +144,17 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     assert.equal(accounts.overview().accounts.find(row => row.id === secondId).toolScope, 'private')
     assert.equal(accounts.assistantDetail(aid).boundAccountId, secondId)
     const beforeDocsProfile = accounts.runtimeConfig(accounts.record(secondId), {}).sessionProfile
-    await accounts.save(secondId, { revision: accounts.revision, account: { agentsMd: 'UPDATED SECOND ONLY', soulMd: 'Kind' } })
+    await accounts.save(secondId, { revision: accounts.revision, account: { label: 'Second renamed' } })
     assert.equal(accounts.record(secondId).assistantId, aid)
-    assert.equal(accounts.assistantDetail(aid).agentsMd, 'UPDATED SECOND ONLY')
-    assert.equal(accounts.hostFor(accounts.record(firstId), { cwd: root }).profile.agentsMd, '')
+    const current = accounts.workspaceInstructions(aid).files['AGENTS.md']
+    assert.equal(current.text, 'FIXTURE WORKSPACE RULES')
+    assert.equal(current.legacy, 'ARCHIVED OLD RULES')
+    assert.equal(accounts.hostFor(accounts.record(secondId), { cwd: root }).profile.agentsMd, undefined)
     assert.equal(accounts.runtimeConfig(accounts.record(secondId), {}).sessionProfile, beforeDocsProfile)
-    assert.ok(!JSON.stringify(accounts.overview()).includes('UPDATED SECOND ONLY'))
-    await assert.rejects(accounts.save(secondId, { revision: accounts.revision, account: { soulMd: 'x'.repeat(8193) } }), /invalid_assistant/)
-    assert.equal(accounts.assistantDetail(aid).soulMd, 'Kind')
+    assert.ok(!JSON.stringify(accounts.overview()).includes('ARCHIVED OLD RULES'))
+    await assert.rejects(accounts.save(secondId, { revision: accounts.revision, account: { soulMd: 'duplicate source' } }), /invalid_account/)
+    await assert.rejects(accounts.saveWorkspaceInstruction(aid, 'AGENTS.md', { cwd: root + '-other',
+      revision: current.revision, text: 'WRONG WORKSPACE' }), /instruction_changed/)
 
     assert.ok(accounts.runtimes.get(secondId).store.knownSessions().includes(existing.session_id))
     assert.deepEqual(await accounts.diagnose(firstId), { botUid: 'bot-fixture', spaceId: 'fixture-space' })
@@ -160,7 +174,15 @@ test('authenticated HTTP can manage credentials; forged origins and anonymous re
     webServer: { register(value) { route = value; return () => {} } },
     get: () => ({ requestRejection: request => request.headers.authorization === 'fixture-session' ? undefined : 401 }),
   }
-  registerWeb(ctx, { async verify(token, accountId) {
+  let writes = 0
+  registerWeb(ctx, { workspaceInstructions(id) {
+    assert.equal(id, 'legacy')
+    return { files: { 'AGENTS.md': { text: 'private test instructions' } } }
+  }, async saveWorkspaceInstruction(id, name, input) {
+    assert.deepEqual([id, name, input], ['legacy', 'SOUL.md', { cwd: '/fixture', revision: 'missing', text: 'role' }])
+    writes++
+    return { text: 'role' }
+  }, async verify(token, accountId) {
     verified++
     assert.equal(token, 'bf_synthetic')
     if (accountId === 'legacy') throw new Error('bot_identity_mismatch')
@@ -184,6 +206,18 @@ test('authenticated HTTP can manage credentials; forged origins and anonymous re
     assert.equal(mismatch.status, 400)
     assert.deepEqual(await mismatch.json(), { error: 'bot_identity_mismatch' })
     assert.equal(verified, 2)
+    const files = base + '/api/dsh-channel-octo/assistants/legacy/instructions'
+    assert.equal((await fetch(files, { headers: { 'x-dsh-octo-client': '1' } })).status, 401)
+    assert.equal((await fetch(files, { headers: { authorization: 'fixture-session' } })).status, 403)
+    assert.equal((await fetch(files, { headers: { ...headers, 'sec-fetch-site': 'cross-site' } })).status, 403)
+    const loaded = await fetch(files, { headers })
+    assert.equal(loaded.headers.get('cache-control'), 'no-store')
+    assert.equal((await loaded.json()).files['AGENTS.md'].text, 'private test instructions')
+    const write = { method: 'PUT', body: JSON.stringify({ cwd: '/fixture', revision: 'missing', text: 'role' }) }
+    assert.equal((await fetch(files + '/SOUL.md', { ...write, headers: { ...headers, 'sec-fetch-site': 'same-site' } })).status, 403)
+    assert.equal((await fetch(files + '/OTHER.md', { ...write, headers })).status, 404)
+    assert.equal((await fetch(files + '/SOUL.md', { ...write, headers })).status, 200)
+    assert.equal(writes, 1)
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) }
 })
 

@@ -244,7 +244,6 @@ export function createAccountView(React, primitives, { request, status, label })
     const revision = useRef(data.accountRevision)
     const pending = useRef(false)
     const [options, setOptions] = useState(null)
-    const [assistant, setAssistant] = useState(null)
     const [failed, setFailed] = useState(false)
     const [busy, setBusy] = useState(false)
     const [confirming, setConfirming] = useState(false)
@@ -252,9 +251,8 @@ export function createAccountView(React, primitives, { request, status, label })
     useEffect(() => {
       if (!dialog.current.open) dialog.current.showModal()
       const controller = new AbortController()
-      Promise.all([request('/account-options', { signal: controller.signal }),
-        account?.assistantId ? request('/assistants/' + account.assistantId, { signal: controller.signal }) : null]).then(([result, profile]) => {
-        if (!controller.signal.aborted) { setAssistant(profile); setOptions(result) }
+      request('/account-options', { signal: controller.signal }).then(result => {
+        if (!controller.signal.aborted) setOptions(result)
       }).catch(() => { if (!controller.signal.aborted) setFailed(true) })
       return () => controller.abort()
     }, [])
@@ -296,7 +294,7 @@ export function createAccountView(React, primitives, { request, status, label })
       failed ? h('div', { className: 'dsho-account-body' }, h('p', { className: 'dsho-alert', role: 'alert' }, tr('failedOptions'))) : !options
         ? h('div', { className: 'dsho-account-body' }, h('p', { role: 'status' }, tr('loading')))
         : h(Editor, {
-          account: account && { ...account, agentsMd: assistant?.agentsMd ?? '', soulMd: assistant?.soulMd ?? '' },
+          account, request, canManage: data.canManage,
           management: h(React.Fragment, null,
               account && account.botKind !== 'app' && h(BotCommandMenu, { lang, busy, disabled: !data.canManage || !account.config,
                 perform: action => perform('POST', endpoint(account.id) + '/commands', { action, revision: revision.current }) }),

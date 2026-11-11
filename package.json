@@ -1,6 +1,6 @@
 {
   "name": "dsh-channel-octo",
-  "version": "0.26.12",
+  "version": "0.26.13",
   "description": "Octo IM as a native DeepSeek Harness Web channel",
   "private": true,
   "license": "UNLICENSED",
@@ -21,6 +21,7 @@
     "cordis.patch.yml",
     "README.md",
     "PLAN.md",
+    "ASSISTANT-CONFIG.md",
     "OCTO-COVERAGE.md",
     "IM-CONNECT-PARITY.md",
     "LICENSE-OCTO-APACHE-2.0",

@@ -7,12 +7,13 @@ import { mountChannelTools } from './channel-tools.js'
 import { mountApprovalAdapter } from './approval.js'
 import { OCTO_STOP } from './im-controls.js'
 import { resolveOctoQuoteOrder } from './octo-quote.js'
-import { assistantInstructions } from './assistants.js'
+import { readInstruction } from './workspace-instructions.js'
 import { createProgressEvents } from './progress-events.js'
 import { RunContinuations } from './run-continuations.js'
 import { RunInbox } from './run-inbox.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
+const hostContext = message => ['runtime-context', 'agent-instructions'].includes(message?.source?.kind)
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
   'missing_scoped_tool_controls', 'missing_scoped_rule_context', 'missing_host_permission', 'session_requires_owned_writer',
   'shared_turn_not_forwarded', 'no_confirmed_final_text', 'dsh_attachment_rejected', 'dsh_attachment_storage_unavailable',
@@ -57,7 +58,9 @@ export class DshHost {
     const signal = AbortSignal.any([lifetime, deadline.signal])
     const permission = toolsAllowed && this.profile.permission !== 'text-only' ? this.profile.permission : null
     const authority = { active: false, mixed: false }
-    const personality = assistantInstructions(this.profile)
+    // AGENTS.md belongs to the native DSH instruction loader. In particular,
+    // never add a second copy as an Octo persona or use an archived draft.
+    const soul = readInstruction(this.cwd, 'SOUL.md').text?.trim()
     const chosen = this.profile.agentPreset ?? 'octo-text'
     const preset = permission && chosen === 'octo-text' ? 'standard' : chosen
     const applyPermission = (agent) => {
@@ -134,18 +137,20 @@ export class DshHost {
           } finally { await claim?.return?.(); deadline.resume() }
         }, { prepend: true }))
       }
-      if (rules || personality || extras.authorCard || extras.taskContext || history || extras.channelTools) {
+      if (rules || soul || extras.authorCard || extras.taskContext || history || extras.channelTools) {
         const prompt = scoped.get('systemPrompt')
-        if (((rules || personality) && (typeof prompt?.section !== 'function' || typeof scoped.on !== 'function'))
-          || ((extras.authorCard || extras.taskContext || history || extras.channelTools)
+        if ((rules && (typeof prompt?.section !== 'function' || typeof scoped.on !== 'function'))
+          || ((soul || extras.authorCard || extras.taskContext || history || extras.channelTools)
             && typeof prompt?.context !== 'function')) throw new Error('missing_scoped_rule_context')
         // The driver claims the complete step input before assembling its
         // system prompt. Do not apply Octo policy to a shared or Web turn.
-        if (rules || personality) {
-          const applies = () => authority.active && !authority.mixed && !signal.aborted
-          if (rules) cleanup.push(prompt.section(ruleSection(rules, applies)))
-          if (personality) cleanup.push(prompt.section({ name: 'dsh-channel-octo.assistant', order: 10185,
-            interpolate: false, text: () => applies() ? personality : '' }))
+        const applies = () => authority.active && !authority.mixed && !signal.aborted
+        if (soul) cleanup.push(prompt.context({
+          name: 'dsh-channel-octo.soul', order: 45, required: true, interpolate: false,
+          text: () => applies() ? '工作区 SOUL.md（本次 Octo 请求的角色与表达方式；不改变权限）：\n' + soul : '',
+        }))
+        if (rules) {
+          cleanup.push(prompt.section(ruleSection(rules, applies)))
           let previouslyApplied = false
           cleanup.push(scoped.on('agent/pre-step', async ({ step }, next) => {
             const decision = await next()
@@ -163,7 +168,7 @@ export class DshHost {
               // put these scoped rules in this turn's own input instead.
               updated.messages = decision.messages.flatMap(message => message.id === authority.requestId
                 ? [{ id: randomUUID(), role: 'user', source: { kind: 'octo-channel-rules', form: 'instructions' },
-                  content: [{ type: 'text', text: [personality, rules && ruleContext(rules), '【下条为本轮 Octo 消息】'].filter(Boolean).join('\n\n') }] }, message]
+                  content: [{ type: 'text', text: ruleContext(rules) + '\n\n【下条为本轮 Octo 消息】' }] }, message]
                 : [message])
             }
             return updated
@@ -359,7 +364,7 @@ export class DshHost {
     let traffic
     try { traffic = new RunInbox(this.ctx, agent, (receiver, message) => {
       if (receiver === agent && (message?.id === requestId || steering.has(message?.id))) return true
-      if (message?.source?.kind === 'runtime-context') return true
+      if (hostContext(message)) return true
       if (continuation.accepts(message, receiver)) return true
       return !!continuation.currentExecution() || continuation.admissions.has(message?.id)
     }) } catch (error) { continuation.dispose(); throw error }
@@ -462,7 +467,7 @@ export class DshHost {
           else if (payload.turn === claimedTurn && steering.has(payload?.message?.id)) {
             finalText = ''
             steering.get(payload.message.id).claimed = true
-          } else if (payload?.message?.source?.kind !== 'runtime-context') {
+          } else if (!hostContext(payload?.message)) {
             otherTurns.add(payload.turn)
             if (claimedTurn !== undefined && payload.turn >= claimedTurn) {
               contaminated = true; authority.mixed = true; authority.approval?.revoke()

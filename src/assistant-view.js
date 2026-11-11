@@ -57,36 +57,107 @@ export function createCliGuide(React, { Button }) {
   }
 }
 
-// Shared by both assistant editors. Describes defaults, never claims file/runtime inspection.
-export function createAssistantInstructionHelp(React) {
-  const { createElement: h } = React
-  return function AssistantInstructionHelp({ lang = 'zh', id }) {
-    const chinese = lang === 'zh'
-    const paragraphs = chinese ? [
-      '来源：Octo 助理配置 · 独立保存',
-      '下方指令由 Octo 单独保存，仅用于此助理的 Octo 请求，不读取、回填或覆盖工作区文件。',
-      '留空仅表示未添加附加指令，不代表工作区文件为空、不存在或未加载。',
-    ] : [
-      'Source: Octo assistant configuration · stored separately',
-      'Octo stores these extra instructions for this assistant’s requests separately and does not read, auto-fill from or overwrite workspace files.',
-      'An empty field means no extra instructions; it does not mean a workspace file is empty, missing or not loaded.',
-    ]
-    const rules = chinese ? [
-      'AGENTS.md：DSH 0.2.2-rc.1 的标准、PTC、创造模式默认按实际工作目录与项目范围加载指令文件，也支持 CLAUDE.md 和对应的 .local.md 文件。',
-      '极简模式和无工具的 Octo 文字模式默认不加载工作区指令。Octo 文字模式在获准使用 DSH 工具的回合会转为标准模式；自定义预设以宿主配置为准。',
-      'SOUL.md：此版本默认不会自动加载。仅此 Bot 使用的角色与语气可写在下方 SOUL.md 附加指令中；共享约定可由你维护到工作区 AGENTS.md，无需在这里重复粘贴。',
-      '这里说明的是默认规则，未检查实际工作区文件或当前回合的加载结果。',
-    ] : [
-      'AGENTS.md: DSH 0.2.2-rc.1 standard, PTC and cordis presets load instructions within the actual working directory and project scope by default. CLAUDE.md and the matching .local.md files are also supported.',
-      'The minimal preset and Octo text mode without tools do not load workspace instructions by default. Octo text mode switches to standard for turns authorized to use DSH tools. Custom presets follow the host configuration.',
-      'SOUL.md is not automatically loaded by default in this version. Put bot-specific role and tone instructions in the extra SOUL.md field below. Maintain shared conventions in the workspace AGENTS.md yourself; there is no need to paste them here again.',
-      'These are default rules, not an inspection of workspace files or the instructions loaded in the current turn.',
-    ]
-    return h('div', { className: 'dsho-panel', id },
-      ...paragraphs.map((text, index) => h('p', { key: index, className: 'dsho-muted' }, index === 0 ? h('strong', null, text) : text)),
-      h('details', { className: 'dsho-account-help' },
-        h('summary', null, chinese ? '工作区文件如何生效？' : 'How do workspace files take effect?'),
-        h('div', { className: 'dsho-panel' }, ...rules.map((text, index) => h('p', { key: index, className: 'dsho-muted' }, text)))))
+// Both settings entry points edit the same two files. Each save is explicit
+// and independent of profile settings and of the other file.
+export function createWorkspaceInstructionEditor(React, { Button }) {
+  const { createElement: h, useEffect, useId, useRef, useState } = React
+  const headers = { 'x-dsh-octo-client': '1' }
+  const names = ['AGENTS.md', 'SOUL.md']
+  return function WorkspaceInstructions({ lang, request, assistantId, cwd, disabled }) {
+    const zh = lang === 'zh'
+    const tr = (cn, en) => zh ? cn : en
+    const prefix = useId(), live = useRef(null)
+    const [data, setData] = useState(null), [draft, setDraft] = useState({})
+    const [busy, setBusy] = useState(''), [notice, setNotice] = useState(null)
+    const url = '/assistants/' + assistantId + '/instructions'
+    const load = async (controller, name) => {
+      setBusy('load'); setNotice(null)
+      try {
+        const result = await request(url, { headers, signal: controller.signal })
+        if (controller.signal.aborted) return
+        if (result.cwd !== cwd) throw new Error('instruction_changed')
+        if (name) {
+          setData(current => ({ ...current, files: { ...current.files, [name]: result.files[name] } }))
+          setDraft(current => ({ ...current, [name]: result.files[name]?.text ?? '' }))
+        } else {
+          setData(result)
+          setDraft(Object.fromEntries(names.map(key => [key, result.files[key]?.text ?? ''])))
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) setNotice({ error: true, text: error?.message === 'instruction_changed'
+          ? tr('工作区已变更，请重新打开设置。', 'Workspace changed. Reopen settings.')
+          : tr('无法读取工作区指令。', 'Could not read workspace instructions.') })
+      } finally { if (!controller.signal.aborted) setBusy('') }
+    }
+    useEffect(() => {
+      const controller = new AbortController()
+      live.current = controller
+      if (assistantId && cwd && !disabled) void load(controller)
+      return () => controller.abort()
+    }, [assistantId, cwd, disabled])
+    const save = async name => {
+      const controller = live.current
+      if (busy || !controller || controller.signal.aborted) return
+      setBusy(name); setNotice(null)
+      try {
+        const saved = await request(url + '/' + name, { method: 'PUT', signal: controller.signal,
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cwd, revision: data.files[name].revision, text: draft[name] }) })
+        if (controller.signal.aborted) return
+        setData(current => ({ ...current, files: { ...current.files, [name]: saved } }))
+        setDraft(current => ({ ...current, [name]: saved.text ?? '' }))
+        setNotice({ text: name + tr(' 已保存到工作区。', ' saved to the workspace.') })
+      } catch (error) {
+        if (!controller.signal.aborted) setNotice({ error: true, text: error?.message === 'instruction_changed'
+          ? tr('磁盘文件或工作区已变更。草稿已保留；请先备份草稿，再重新读取文件。', 'The file or workspace changed. Keep a copy of your draft before reloading.')
+          : tr('未能保存。请检查工作区权限和文件格式。', 'Could not save. Check workspace access and file format.') })
+      } finally { if (!controller.signal.aborted) setBusy('') }
+    }
+    const problems = {
+      unsafe: tr('该路径不是可编辑的普通文件。', 'This path is not an editable regular file.'),
+      'too-large': tr('文件超过 32 KiB，请在工作区编辑。', 'File exceeds 32 KiB. Edit it in the workspace.'),
+      'invalid-text': tr('文件不是有效的 UTF-8 文本，请在工作区编辑。', 'File is not valid UTF-8 text. Edit it in the workspace.'),
+      unavailable: tr('无法读取此文件。', 'This file could not be read.'),
+    }
+    return h('section', { className: 'dsho-account-section' },
+      h('h3', null, tr('工作区指令', 'Workspace instructions')),
+      !assistantId || !cwd || disabled ? h('p', { className: 'dsho-muted' },
+        tr('请先保存工作区设置，再编辑指令文件。', 'Save the workspace selection before editing its instruction files.'))
+        : h(React.Fragment, null,
+          h('p', { className: 'dsho-muted' }, tr('保存会直接写入：', 'Save writes directly to: '), h('code', null, cwd)),
+          h('p', { className: 'dsho-muted' }, tr('共用此工作区的助理会看到同一份文件。每个文件单独保存。',
+            'Assistants that share this workspace see the same files. Save each file separately.')),
+          !data && busy && h('p', { role: 'status' }, tr('正在读取文件…', 'Reading files…')),
+          !data && !busy && notice && h(Button, { type: 'button', onClick: () => void load(live.current) }, tr('重试读取', 'Retry')),
+          data && names.map(name => {
+            const file = data.files[name], editable = !!file.revision
+            const dirty = editable && draft[name] !== file.text
+            const tooLarge = new TextEncoder().encode(draft[name] ?? '').length > 32768
+            const id = prefix + name
+            return h('div', { key: name, className: 'dsho-field' },
+              h('label', { htmlFor: id }, name),
+              h('p', { id: id + '-help', className: 'dsho-muted' }, name === 'AGENTS.md'
+                ? tr('工作规范。由支持工作区指令的 DSH 预设加载（如标准模式）；Octo 不重复加载。',
+                  'Work rules. Loaded by DSH presets with workspace instructions, such as Standard.')
+                : tr('角色和表达方式。Octo 在每项新任务开始时读取。', 'Role and tone. Octo reads this file when a new task starts.')),
+              editable ? h('textarea', { id, rows: 5, value: draft[name] ?? '', disabled: !!busy,
+                'aria-describedby': id + '-help', placeholder: file.state === 'missing' ? tr('尚未创建', 'File does not exist yet') : '',
+                onChange: event => setDraft(current => ({ ...current, [name]: event.target.value })) })
+                : h('p', { role: 'status' }, problems[file.state] ?? problems.unavailable),
+              tooLarge && h('p', { role: 'alert' }, tr('最多 32 KiB。', 'Maximum: 32 KiB.')),
+              h('div', { className: 'dsho-tools' },
+                editable && h(Button, { type: 'button', variant: 'outline',
+                  disabled: !!busy || tooLarge || (!dirty && file.state !== 'missing'), onClick: () => void save(name) },
+                  file.state === 'missing' ? tr('创建文件', 'Create file') : tr('保存文件', 'Save file')),
+                h(Button, { type: 'button', variant: 'outline', disabled: !!busy, onClick: () => void load(live.current, name) },
+                  dirty ? tr('舍弃草稿并重读', 'Discard draft and reload') : tr('重新读取', 'Reload'))),
+              file.legacy && h('details', { className: 'dsho-account-help' },
+                h('summary', null, tr('旧版附加指令（已归档）', 'Previous instructions (archived)')),
+                h('p', { className: 'dsho-muted' }, tr('旧内容已保留。可手动复制需要的段落到工作区文件。',
+                  'Previous text is preserved. Copy any portions you want into the workspace file.')),
+                h('textarea', { readOnly: true, rows: 4, value: file.legacy, 'aria-label': name + tr(' 旧版指令', ' archived instructions') })))
+          })),
+      notice && h('p', { className: notice.error ? 'dsho-alert' : 'dsho-account-success', role: notice.error ? 'alert' : 'status' }, notice.text))
   }
 }
 
@@ -96,13 +167,11 @@ const zh = {
   model: '模型', preset: 'Agent 预设', permission: '权限策略', scope: '工具使用范围', reasoning: '推理强度',
   default: '跟随宿主默认值', select: '请选择', save: '保存助理', cancel: '取消', loading: '正在读取助理设置…',
   failed: '读取助理设置失败。', success: '助理设置已保存，从后续消息起生效。',
-  invalid_assistant: '请检查助理名称和附加指令。每份指令最多 8 KB。',
+  invalid_assistant: '请检查助理名称和设置。',
   assistant_bound: '这位助理已经绑定其他 Bot。', account_changed: '设置已在别处更新，请关闭编辑后重新打开。',
   workspace_unavailable: '该工作区不可用。', model_unavailable: '该模型不可用。', reasoning_unavailable: '该推理强度不可用。',
   permission_unavailable: '该权限未在 DSH 开放。', invalid_account: '请检查工作区、模型、预设和权限。',
-  saveFailed: '助理设置未保存。', docs: 'Octo 附加指令',
-  agentsPlaceholder: '可选：仅此助理的操作约定，不自动读取工作区 AGENTS.md。',
-  soulPlaceholder: '可选：仅此助理的角色与语气，不自动读取工作区 SOUL.md。',
+  saveFailed: '助理设置未保存。',
   private: '获准的私聊用户', owner: 'Bot 所有者的全部会话', admitted: '所有已准入用户',
 }
 const en = {
@@ -111,14 +180,12 @@ const en = {
   model: 'Model', preset: 'Agent preset', permission: 'Permission', scope: 'Tool access scope', reasoning: 'Reasoning effort',
   default: 'Use host default', select: 'Select an option', save: 'Save assistant', cancel: 'Cancel', loading: 'Loading assistant settings…',
   failed: 'Could not load assistant settings.', success: 'Saved. Changes apply to subsequent messages.',
-  invalid_assistant: 'Check the name and extra instructions. Each instruction field can contain up to 8 KB.',
+  invalid_assistant: 'Check the assistant name and settings.',
   assistant_bound: 'This assistant is bound to a different bot.', account_changed: 'Settings changed elsewhere. Close and reopen the editor.',
   workspace_unavailable: 'The workspace is unavailable.', model_unavailable: 'The model is unavailable.',
   reasoning_unavailable: 'The reasoning effort is unavailable.', permission_unavailable: 'DSH has not enabled this permission.',
   invalid_account: 'Check workspace, model, preset and permission.', saveFailed: 'Could not save the assistant.',
   docs: 'Extra Octo instructions',
-  agentsPlaceholder: 'Optional: conventions for this assistant only. Workspace AGENTS.md is not imported.',
-  soulPlaceholder: 'Optional: role and tone for this assistant only. Workspace SOUL.md is not imported.',
   private: 'Authorized DM users', owner: 'All conversations from the bot owner', admitted: 'All admitted users',
 }
 const zhPresets = { standard: '标准模式', minimal: '极简模式', ptc: 'PTC 模式', cordis: '创造模式', 'octo-text': 'Octo 文字模式' }
@@ -126,7 +193,7 @@ const zhPolicies = { 'text-only': '仅文字（无工具）', 'read-only': '只�
 
 export function createAssistantView(React, { Button, Input }) {
   const { createElement: h, useEffect, useId, useState } = React
-  const InstructionHelp = createAssistantInstructionHelp(React)
+  const WorkspaceInstructions = createWorkspaceInstructionEditor(React, { Button })
   function Editor({ selection, data, request, publish, refresh, close, lang }) {
     const t = lang === 'zh' ? zh : en
     const prefix = useId(), [loaded, setLoaded] = useState(null), [draft, setDraft] = useState(null)
@@ -139,7 +206,7 @@ export function createAssistantView(React, { Button, Input }) {
         if (signal.aborted) return
         setLoaded({ options, profile })
         setDraft({ name: '', cwd: '', provider: '', model: '', reasoningEffort: '', agentPreset: 'octo-text',
-          permission: 'text-only', toolScope: 'private', agentsMd: '', soulMd: '', ...profile,
+          permission: 'text-only', toolScope: 'private', ...profile,
           accountId: profile.boundAccountId ?? '' })
       }).catch(() => { if (!signal.aborted) setError(t.failed) })
       return () => controller.abort()
@@ -157,19 +224,13 @@ export function createAssistantView(React, { Button, Input }) {
     }
     const modelKey = draft.provider ? JSON.stringify([draft.provider, draft.model]) : ''
     const chosen = options.models.find(model => model.provider === draft.provider && model.model === draft.model)
-    const text = key => h('textarea', { id: prefix + key, rows: 5, maxLength: 8192,
-      'aria-describedby': prefix + '-instruction-source', placeholder: t[key === 'agentsMd' ? 'agentsPlaceholder' : 'soulPlaceholder'],
-      value: draft[key], onChange: event => set({ [key]: event.target.value }) })
     const submit = async event => {
       event.preventDefault()
       if (busy) return
       setError('')
-      if ([draft.agentsMd, draft.soulMd].some(value => new TextEncoder().encode(value).length > 8192)) {
-        setError(t.invalid_assistant); return
-      }
       setBusy(true)
       try {
-        const { accountId, id, boundAccountId, ...assistant } = draft
+        const { accountId, id, boundAccountId, agentsMd, soulMd, ...assistant } = draft
         const result = await request('/assistants' + (selection.id ? '/' + selection.id : ''), {
           method: selection.id ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' },
@@ -202,9 +263,8 @@ export function createAssistantView(React, { Button, Input }) {
           label: (lang === 'zh' && zhPolicies[item.id]) || item.label })), permission => set({ permission })),
         select('scope', t.scope, draft.toolScope, ['private','owner','admitted'].map(value => ({ value, label: t[value] })),
           toolScope => set({ toolScope }))),
-      h('h3', null, t.docs),
-      h(InstructionHelp, { lang, id: prefix + '-instruction-source' }),
-      field('agentsMd', 'AGENTS.md', text('agentsMd')), field('soulMd', 'SOUL.md', text('soulMd')),
+      h(WorkspaceInstructions, { key: profile.cwd, lang, request,
+        assistantId: profile.id, cwd: profile.cwd, disabled: draft.cwd !== profile.cwd || !data.canManage }),
       error && h('p', { role: 'alert', className: 'dsho-alert' }, error),
       h('div', { className: 'dsho-tools' },
         h(Button, { type: 'submit', variant: 'primary', disabled: busy || !data.canManage }, t.save),
