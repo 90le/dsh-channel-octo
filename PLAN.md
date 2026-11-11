@@ -21,6 +21,8 @@
 
 ## 当前状态
 
+2026-11-11 已部署 [0.26.13](https://github.com/90le/dsh-channel-octo/releases/tag/v0.26.13)，源码 `0edb251`，包 SHA-256 `590db350a4fd28917b7db0786de2b06ef3cf7e2de5519638a8b2ff2fe85435dc`。Debian 校验 64 个安装文件，Web 与两个启用 Bot 的长连接恢复，账号、凭据、宿主配置和 IM Connect 文件保持一致。备份 `/root/dsh-octo-02613-rollout.1lMrs5`。89 项定向检查通过；同版本隔离 DSH 确认标准模式首次和续聊只加载一份未修改的 AGENTS.md，修改后的文件进入下一项任务，极简模式加载 SOUL.md。两处设置入口的中英文创建、冲突和重读通过隔离浏览器检查。部署后用服务账号只读核对现有文件；临时工作区通过 Linux 创建、更新与版本冲突检查。
+
 2026-11-11 0.26.13 候选：Bot 及独立助理设置直接读取和编辑绑定工作区的 AGENTS.md / SOUL.md。逐文件保存检查磁盘版本，防止旧页面覆盖外部修改；两个入口共享组件。AGENTS.md 仅由 DSH 原生预设处理；SOUL.md 每项 Octo 新任务读取，使用宿主的当前运行上下文。旧版配置文本只读归档，不自动迁移覆盖。隔离原生模型请求及浏览器两入口通过验证。参见[配置与产品对比](ASSISTANT-CONFIG.md)。
 
 2026-11-11 已部署 [0.26.12](https://github.com/90le/dsh-channel-octo/releases/tag/v0.26.12)，运行源码 `83f90b2`，包 SHA-256 `90d3daac80cd8fb60db62abe02d9ec617753c8b9282d4150a5db87e091305660`。Debian `/opt/dsh-channel-octo/releases/0.26.12-90d3daac80/` 的 62 个文件逐一匹配。部署前确认无待处理 Octo 工作，Web 就绪，两个启用 Bot 分别完成身份核验和 WebSocket 连接；账号、凭据、宿主配置、IM Connect 包与前端文件保持。备份 `/root/dsh-octo-02612-rollout.WFAokX`，可回退 0.26.11。正式所有者私聊的明确模拟验收卡创建 1 次、编辑 4 次，无错误或降级；等待子任务、5 秒刷新、续跑和结束全部折叠确认。实际主/子任务与 Web 隔离以 13 项同版本原生运行场景验证；正式接口卡片验证未调用真实模型，用户真实任务体验继续以使用反馈核实。
