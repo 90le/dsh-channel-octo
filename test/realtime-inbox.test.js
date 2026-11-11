@@ -18,8 +18,9 @@ test('real encrypted socket reconnect recovers missing messages before newly ACK
   const dir = mkdtempSync(join(tmpdir(), 'octo-recovery-wire-')), store = new Store(dir, 'fixture')
   const stop = new AbortController(), runs = [], requests = []
   const config = { botUid, spaceId: 'space', allowed: new Set(['human']), transport: 'websocket' }
+  const input = seq => seq === 10 || seq === 11 ? '/srv/agents/样例 消息 ' + seq : 'message ' + seq
   const row = seq => ({ message_id: String(seq), message_seq: seq, from_uid: 'human', channel_type: 1,
-    channel_id: 'internal-dm', payload: { type: 1, content: 'message ' + seq } })
+    channel_id: 'internal-dm', payload: { type: 1, content: input(seq) } })
   let rows = [row(10)]
   const client = new OctoClient({ ...config, apiBase: 'https://fixture.invalid', token: 'bf_fixture', fetchImpl: async (_url, options) => {
     const req = JSON.parse(options.body); requests.push(req)
@@ -41,9 +42,9 @@ test('real encrypted socket reconnect recovers missing messages before newly ACK
     send(13)
     await until(() => peer.acked.length === 2)
     assert.equal(store.stagedInbox({ channel_type: 1, channel_id: 'human' }).at(-1)?.message_id, '13')
-    assert.deepEqual(runs, ['message 10'])
+    assert.deepEqual(runs, [input(10)])
     await until(() => store.db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE state='sent'").get().n === 4)
-    assert.deepEqual(runs, [10, 11, 12, 13].map(n => 'message ' + n))
+    assert.deepEqual(runs, [10, 11, 12, 13].map(input))
     send(13); await until(() => peer.acked.length === 3)
     assert.equal(runs.length, 4)
     assert.ok(requests.some(req => req.pull_mode === 1 && req.end_message_seq === 14))

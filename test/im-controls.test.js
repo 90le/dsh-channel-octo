@@ -52,8 +52,8 @@ test('group and topic commands require the bot owner and a direct, unambiguous b
   assert.deepEqual(parseSafeCommand('@Octo /new', { dmCommands: 'safe' }, group), blocked)
 })
 
-test('slash-like input is either an exact safe command or consumed without prompting', () => {
-  for (const input of ['/shell whoami', '/reset', '/card', '/choose', '/stop another', '/new session', '/new;whoami', '/new/foo', '/help.md',
+test('malformed and unrecognized slash commands cannot become prompts', () => {
+  for (const input of ['/shell whoami', '/shell/foo', '/exec/bin', '/webhook/create', '/reset', '/card', '/choose', '/stop another', '/new session', '/new;whoami', '/NEW/foo', '/help.md',
     '/new\nrun this', '/new\r\n', '/help\u200b', '\u200b/help', '/status@octo_bot', '//new', '/']) {
     assert.deepEqual(parseSafeCommand(input, enabled, dm), blocked, input)
   }
@@ -61,5 +61,12 @@ test('slash-like input is either an exact safe command or consumed without promp
   assert.deepEqual(parseSafeCommand('@Octo\n/new', enabled, group), blocked)
   for (const input of ['How do I use /new?', '@Octo help with /new', '讨论 /status']) {
     assert.deepEqual(parseSafeCommand(input, enabled, group), { kind: 'text' }, input)
+  }
+})
+
+test('messages starting with an absolute workspace path are ordinary text', () => {
+  for (const input of ['/srv/agents/样例 的本地配置', '/tmp/sample.md\n请查看文件', '/home/user/workspace\r\n参考这一份']) {
+    assert.deepEqual(parseSafeCommand(input, defaults, dm), { kind: 'text' }, input)
+    assert.deepEqual(parseSafeCommand('@Octo ' + input, enabled, group), { kind: 'text' }, input)
   }
 })

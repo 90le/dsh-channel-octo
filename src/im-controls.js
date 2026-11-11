@@ -19,6 +19,8 @@ export function normalizeImControls(input) {
 }
 
 const safeCommands = new Set(['help', 'status', 'new', 'stop'])
+const reservedPathPrefixes = new Set([...safeCommands, 'webhook', 'shell', 'exec', 'reset', 'card', 'choose'])
+const absolutePathPrefix = /^\/([\p{L}\p{N}\p{M}._~+%-]+)\/(?=[\p{L}\p{N}\p{M}._~+%@-])/u
 export const OCTO_STOP = new Error('octo_user_stop')
 const mentionPrefix = /^(?:@\[[^\]\r\n]+\]|[@＠]\S+)\s+/u
 const structuredMention = /^@\[([\w.-]+):[^\]\r\n]+\]$/u
@@ -52,6 +54,12 @@ export function parseSafeCommand(text, controls, route) {
     body = body.slice(match[0].length)
   }
   if (!body.startsWith('/')) return { kind: 'text' }
+
+  // A nested POSIX path at the start of a message is normal conversation.
+  // Keep malformed variants of reserved slash commands out of the prompt.
+  const path = absolutePathPrefix.exec(body)
+  if (path && count <= 1 && visible === text.replace(/\r?\n/g, newline => ' '.repeat(newline.length))
+    && !reservedPathPrefixes.has(path[1].toLowerCase())) return { kind: 'text' }
 
   const blocked = { kind: 'blocked' }
   // A whole, single-line command only: no arguments, continuations, or

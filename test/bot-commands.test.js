@@ -337,21 +337,33 @@ test('HTTP response maps upstream failures to sanitized 502 and fails closed wit
   assert.equal((await web(accounts, null)({ id })).status, 503)
 })
 
-function renderer(factory) {
-  const slots = []
+function renderer(factory, effects) {
+  let slots = []
   let index = 0
   const React = {
-    useEffect() {}, useId: () => 'fixture',
+    useEffect(fn) { effects?.push(fn) }, useId: () => 'fixture',
     useState(initial) {
+      const state = slots
       const key = index++
-      if (!(key in slots)) slots[key] = typeof initial === 'function' ? initial() : initial
-      return [slots[key], next => { slots[key] = typeof next === 'function' ? next(slots[key]) : next }]
+      if (!(key in state)) state[key] = typeof initial === 'function' ? initial() : initial
+      return [state[key], next => { state[key] = typeof next === 'function' ? next(state[key]) : next }]
     },
     useRef(current) { const key = index++; return slots[key] ??= { current } },
     createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
   }
   const Component = factory(React)
-  return props => { index = 0; return Component(props) }
+  const render = props => { index = 0; return Component(props) }
+  render.child = Child => {
+    const childSlots = []
+    return props => {
+      const parentSlots = slots
+      slots = childSlots
+      index = 0
+      try { return Child(props) }
+      finally { slots = parentSlots }
+    }
+  }
+  return render
 }
 const nodes = node => node && typeof node === 'object' ? [node, ...node.children.flatMap(nodes)] : [node]
 const button = (tree, text) => nodes(tree).find(node => node?.type === 'button' && node.children.includes(text))
@@ -419,16 +431,26 @@ test('account modal connects menu to the authenticated request helper with curre
     requests.push({ suffix, options })
     return { accounts: [], accountRevision: 'next-revision' }
   }, status: () => null, label: () => '' }
-  const render = renderer(React => createAccountView(React, { Button: 'button', Switch: 'switch' }, services))
+  const effects = []
+  const render = renderer(React => createAccountView(React, { Button: 'button', Switch: 'switch' }, services), effects)
   const account = { id: 'legacy', label: 'Fixture', enabled: false, config: {} }
   const props = { lang: 'zh', data: { accounts: [account], canManage: true, accountRevision: 'original' },
     choose() {}, publish: next => { published = next }, refresh() {} }
   button(render(props), '设置').props.onClick()
   const modalNode = nodes(render(props)).find(node => typeof node?.type === 'function' && node.type.name === 'Modal')
   assert.ok(modalNode)
-  const renderModal = renderer(() => modalNode.type)
+  effects.length = 0
+  const renderModal = render.child(modalNode.type)
+  const loading = renderModal(modalNode.props)
+  loading.props.ref.current = { open: false, showModal() { this.open = true } }
+  const cleanup = effects.shift()()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(requests.map(r => r.suffix), ['/account-options'])
+  requests.length = 0
   const modal = renderModal(modalNode.props)
-  const menu = nodes(modal).find(node => typeof node?.type === 'function' && node.type.name === 'BotCommandMenu')
+  const editor = nodes(modal).find(node => node?.props?.management)
+  assert.ok(editor)
+  const menu = nodes(editor.props.management).find(node => typeof node?.type === 'function' && node.type.name === 'BotCommandMenu')
   assert.ok(menu)
   assert.equal(menu.props.disabled, false, 'paused configured account can still manage its menu')
   assert.equal(requests.length, 0)
@@ -440,4 +462,5 @@ test('account modal connects menu to the authenticated request helper with curre
     ['/accounts/legacy/commands', 'POST', { action: 'clear', revision: 'next-revision' }],
   ])
   assert.deepEqual(requests[0].options.headers, { 'Content-Type': 'application/json', 'x-dsh-octo-client': '1' })
+  cleanup()
 })
