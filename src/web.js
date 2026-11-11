@@ -98,6 +98,7 @@ const accountErrors = {
   permission_requires_allowlist: 400, settings_changed: 409, channel_not_configured: 409,
   transport_managed_by_host: 400, invalid_settings: 400, invalid_concurrent_turns: 400, settings_not_saved: 500,
   invalid_bot_commands: 400, bot_commands_failed: 502,
+  invalid_server: 400,
   app_bot_operation_unavailable: 400,
 }
 
@@ -156,6 +157,7 @@ export function registerWeb(ctx, accounts) {
         const savingAccount = req.method === 'POST' && target === path + '/accounts'
           || req.method === 'PUT' && /^\/api\/dsh-channel-octo\/accounts\/(legacy|[a-f0-9-]{36})$/.test(target)
         const input = await body(req, creatingAssistant || editingAssistant || savingAccount ? 110_000 : undefined)
+        if (req.method === 'PUT' && target === path + '/server') return send(200, await accounts.saveServer(input))
         if (creatingAssistant || editingAssistant) return send(200, await accounts.saveAssistant(assistant?.[1], input))
         if (req.method === 'POST' && target === path + '/accounts/verify') {
           return send(200, await accounts.verify(input?.token, input?.accountId))

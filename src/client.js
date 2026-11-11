@@ -33,6 +33,14 @@ window.__ModuleLoader__.load({
       serverManaged: ['服务器管理连接凭据', 'Connection credentials are managed on the server'],
       details: ['连接详情', 'Connection details'], botId: ['Bot ID', 'Bot ID'], space: ['空间 ID', 'Space ID'],
       endpoint: ['Octo 服务地址', 'Octo server'], directory: ['DSH 工作目录', 'DSH workspace'],
+      serverTitle: ['Octo 服务端', 'Octo server'],
+      serverHint: ['默认使用正式 Octo。使用自建服务时填写其 HTTPS API 地址。', 'Uses official Octo by default. Enter the HTTPS API address for a self-hosted server.'],
+      serverIsolation: ['不同服务端的 Bot、令牌和会话分别保存。切换后需要在对应服务端添加 Bot，切回时可恢复原账号。', 'Bots, credentials and conversations are kept separate for each server. Add bots for the selected server; switching back restores the previous accounts.'],
+      serverPending: ['地址已保存，重启 DSH Web 后生效。当前连接在重启前不变。', 'Saved. Restart DSH Web to activate the new address; current connections remain until restart.'],
+      serverCurrent: ['当前使用', 'Currently using'], serverSave: ['保存服务地址', 'Save server address'],
+      serverSavedCurrent: ['服务地址已保存。', 'Server address saved.'],
+      invalid_server: ['请输入有效的 HTTPS 服务地址，不要包含用户名、密码、查询或片段。', 'Enter a valid HTTPS address without credentials, query or fragment.'],
+      account_changed: ['设置已在别处更新，请刷新后重试。', 'Settings changed elsewhere. Refresh and try again.'],
       transport: ['连接方式', 'Transport'], websocket: ['WebSocket 长连接', 'WebSocket'], events: ['事件轮询', 'Event polling'],
       credential: ['令牌', 'Token'], masked: ['已配置 · 不显示原文', 'Configured · hidden'],
       processed: ['消息处理', 'Message processing'],
@@ -839,6 +847,35 @@ window.__ModuleLoader__.load({
         return View ? h(View) : hint('正在加载安装指南…')
       }
 
+      function ServerSettings({ data, t }) {
+        const [value, setValue] = useState(data.server?.pending ?? '')
+        const [notice, setNotice] = useState('')
+        const [busy, setBusy] = useState(false)
+        useEffect(() => { setValue(data.server?.pending ?? '') }, [data.server?.pending])
+        const saveServer = async event => {
+          event.preventDefault()
+          setBusy(true); setNotice('')
+          try {
+            const next = await api('/server', { method: 'PUT', headers: {
+              'Content-Type': 'application/json', 'X-DSH-Octo-Client': '1'
+            }, body: JSON.stringify({ endpoint: value.trim(), revision: data.accountRevision }) })
+            replaceSnapshot(next)
+            setNotice(next.server.pending === next.server.current ? t('serverSavedCurrent') : t('serverPending'))
+          } catch (error) { setNotice(t(error.message) || t('saveError')) }
+          finally { setBusy(false) }
+        }
+        return h('form', { className: 'dsho-panel', onSubmit: saveServer },
+          h('h3', null, t('serverTitle')), hint(t('serverHint')),
+          data.server?.current && hint(t('serverCurrent') + '：' + data.server.current),
+          h('div', { className: 'dsho-field' },
+            h('label', { htmlFor: 'dsho-server-address' }, t('endpoint')),
+            h('input', { id: 'dsho-server-address', type: 'url', required: true, value,
+              placeholder: data.server?.default, onChange: e => { setValue(e.target.value); setNotice('') } })),
+          hint(t('serverIsolation')),
+          data.server?.pending !== data.server?.current && hint(t('serverPending')),
+          h(Button, { type: 'submit', disabled: busy || !data.canManage }, t('serverSave')),
+          notice && h('p', { role: 'status' }, notice))
+      }
       function Settings({ close }) {
         const t = useT()
         const data = useSyncExternalStore(subscribe, read)
@@ -859,6 +896,7 @@ window.__ModuleLoader__.load({
             items: sections.map(key => ({ value: key, label: t(key), id: 'dsho-tab-' + key, panelId: 'dsho-panel-' + key })) }),
           data.error && h(ErrorNotice, { t, action: refresh, message: t(data.error) || t('unavailable') }),
           panel('account', h(Account, { data, t, current, choose: setSelected })),
+          data.server && h('div', { hidden: page !== 'account' }, h(ServerSettings, { data, t })),
           panel('rules',
             h('div', { className: 'dsho-panel' },
               accounts.length > 1 && h('div', { className: 'dsho-field' },

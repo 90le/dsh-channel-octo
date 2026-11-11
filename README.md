@@ -8,10 +8,10 @@
 
 准备 Node.js **24 或 26**、DSH Web **0.2.1-rc.5 或 0.2.2-rc.1**、可用的 DSH 模型和工作区，以及 Octo Bot 令牌。需要群聊或子区时，请使用 User Bot；App Bot 仅支持获授权的私聊。
 
-1. 在 DSH 所在设备安装。推荐下载 [v0.26.14 的安装包](https://github.com/90le/dsh-channel-octo/releases/download/v0.26.14/dsh-channel-octo-0.26.14.tgz)，将以下路径替换为下载位置：
+1. 在 DSH 所在设备安装。推荐下载[最新稳定版安装包](https://github.com/90le/dsh-channel-octo/releases/latest)，将以下路径替换为下载位置：
 
    ```sh
-   dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.14.tgz
+   dsh plugin --profile web add /absolute/path/dsh-channel-octo-<版本号>.tgz
    ```
 
    社区市场也提供从 GitHub 仓库安装的命令。当前通过 GitHub 分发；若 DSH 内置发现页搜不到，请使用以下命令或上面的安装包。
@@ -20,16 +20,10 @@
    dsh plugin --profile web add github:90le/dsh-channel-octo
    ```
 
-2. 在 DSH 的 `web` profile 中配置受信任的 Octo API 地址。默认文件位置为 `~/.dsh/profiles/web/cordis.patch.yml`；设置了 `DSH_HOME` 时，从该目录查找。将下方条目加入现有 YAML 列表（若已有同名条目，编辑该条目），将示例替换为实际 Octo HTTPS API 地址，然后重启 DSH Web。
-
-   ```yaml
-   - id: dsh-channel-octo
-     config:
-       apiBase: https://octo.example.invalid/api
-   ```
-
-3. 登录 DSH Web，进入「设置 → Octo 渠道 → Bot 账号 → 添加账号」。在「账号连接」验证令牌，在「专属助理」选择工作区和模型，检查「消息行为」中的私聊准入，保存并开启「接收消息」。令牌填在面板中，不要填入仓库或公开反馈。
-4. 先用符合准入规则的 Octo 账号发一条私聊，再在获准入的群或子区里明确 `@Bot` 试用。侧栏「Octo」会显示已建立的 DSH 会话。
+2. 安装后重启 DSH Web。新安装默认连接正式 Octo 的 `https://im.deepminer.com.cn/api`；已有部署配置的服务端地址会保留。
+3. 如使用自建 Octo，在「设置 → Octo 渠道 → Bot 账号 → Octo 服务端」填写 HTTPS API 地址并保存，重启 DSH Web 后生效。不同服务端的 Bot 账号、令牌和会话独立；切换后在对应服务端添加 Bot，切回后可恢复原账号。
+4. 在「Bot 账号 → 添加账号」验证令牌，在「专属助理」选择工作区和模型，检查「消息行为」中的私聊准入，保存并开启「接收消息」。令牌填在面板中，不要填入仓库或公开反馈。
+5. 先用符合准入规则的 Octo 账号发一条私聊，再在获准入的群或子区里明确 `@Bot` 试用。侧栏「Octo」会显示已建立的 DSH 会话。
 
 安装后默认不收发。添加账号时，私聊可选择名单准入或跟随 Octo 权限；名单模式下须填入获准用户。群聊和子区的准入、触发方式在「消息规则」配置。工具默认关闭；开启工具时，同时检查「权限策略」和「工具使用范围」。
 
@@ -46,7 +40,7 @@
 
 ## 常见问题
 
-- **已安装却不能添加账号**：检查 `web` profile 的 API 地址配置，并确认已重启正确的 DSH Web 实例。
+- **已安装却不能添加账号**：检查「Octo 服务端」地址和 DSH 凭据库，并确认已重启正确的 DSH Web 实例。
 - **Bot 显示在线但未回复**：先检查「接收消息」和私聊准入；群聊还要检查 Bot 成员身份、群/子区规则及是否需要明确 `@Bot`。可在「Bot 账号」查看连接诊断和近期处理问题。
 - **要暂停或更新**：在账号行关闭「接收消息」可暂停该 Bot。更新前先等任务结束，备份 Web profile 和插件状态，再用目标版本的安装包更新并重启。历史记录和功能边界见[能力清单](OCTO-COVERAGE.md)；遇到问题可在 [GitHub Issues](https://github.com/90le/dsh-channel-octo/issues) 提交版本和脱敏复现步骤。
 

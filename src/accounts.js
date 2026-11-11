@@ -19,6 +19,7 @@ import { instructionFiles, readInstruction, saveInstruction } from './workspace-
 
 const legacy = 'legacy'
 const textOnly = 'text-only'
+const defaultEndpoint = 'https://im.deepminer.com.cn/api'
 import { assistantId, assistantRuntime, assistantRuntimeKeys, assistantDocKeys, legacyAssistant, validAssistantDoc } from './assistants.js'
 
 const idPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
@@ -110,16 +111,35 @@ export class Accounts {
   get canStore() { return typeof this.vault?.set === 'function' && typeof this.vault?.resolve === 'function' }
 
   async initialize() {
-    // Old installs already declare an API endpoint. Fresh installs must pin it
-    // server-side before this surface can ever accept an Octo credential.
-    if (!this.deployment.apiBase) return
     this.status = 'connecting'
     try {
-      this.endpoint = apiEndpoint(this.deployment.apiBase)
-      this.root = privateStateDir(this.deployment, this.env)
-      if (!isAbsolute(this.root)) fail('accounts_unavailable')
+      this.baseRoot = privateStateDir(this.deployment, this.env)
+      if (!isAbsolute(this.baseRoot)) fail('accounts_unavailable')
+      privateDir(this.baseRoot)
+      this.serverFile = join(this.baseRoot, 'server.json')
+      const configured = apiEndpoint(this.deployment.apiBase ?? defaultEndpoint)
+      let preferred = configured
+      try {
+        const stat = lstatSync(this.serverFile)
+        if (!stat.isFile() || stat.size > 4096 || (process.getuid && (stat.uid !== process.getuid() || (stat.mode & 0o077)))) fail('accounts_unavailable')
+        const stored = JSON.parse(readFileSync(this.serverFile, 'utf8'))
+        if (stored?.version !== 1 || typeof stored.endpoint !== 'string') fail('accounts_unavailable')
+        preferred = apiEndpoint(stored.endpoint)
+      } catch (error) { if (error?.code !== 'ENOENT') throw error }
+      let original = configured
+      try {
+        const file = join(this.baseRoot, 'accounts.json')
+        const stat = lstatSync(file)
+        if (!stat.isFile() || stat.size > 3_000_000 || (process.getuid && (stat.uid !== process.getuid() || (stat.mode & 0o077)))) fail('accounts_unavailable')
+        const saved = JSON.parse(readFileSync(file, 'utf8'))
+        if (saved?.version !== 1 || typeof saved.endpoint !== 'string') fail('accounts_unavailable')
+        original = apiEndpoint(saved.endpoint)
+      } catch (error) { if (error?.code !== 'ENOENT') throw error }
+      this.endpoint = preferred
+      this.pendingEndpoint = preferred
+      this.root = preferred === original ? this.baseRoot : join(this.baseRoot, 'servers', createHash('sha256').update(preferred).digest('hex'))
       privateDir(this.root)
-      this.lease = new DatabaseSync(join(this.root, 'accounts-lease.sqlite'))
+      this.lease = new DatabaseSync(join(this.baseRoot, 'accounts-lease.sqlite'))
       this.lease.exec('BEGIN IMMEDIATE')
       this.file = join(this.root, 'accounts.json')
       const saved = savedRecords(this.file, this.endpoint)
@@ -129,7 +149,7 @@ export class Accounts {
       const botKind = this.deployment.botKind === undefined && this.env.DSH_OCTO_BOT_TOKEN?.startsWith('app_')
         ? 'app' : this.deployment.botKind
       const identity = { botUid, spaceId, botKind }
-      if (this.deployment.enabled === true && validBotIdentity(identity) && isAbsolute(cwd ?? '')) {
+      if (preferred === configured && this.deployment.enabled === true && validBotIdentity(identity) && isAbsolute(cwd ?? '')) {
         const existing = this.records.get(legacy)
         if (existing && !sameBot(existing, identity)) fail('bot_identity_mismatch')
         if (!existing) this.records.set(legacy, {
@@ -507,6 +527,7 @@ export class Accounts {
       })),
       channelWorkspacePaths: [...new Set(accounts.map(account => account.cwd))],
       accountRevision: this.revision, canManage: this.ready === true, credentialAvailable: this.ready && this.canStore,
+      server: { current: this.endpoint, pending: this.pendingEndpoint, default: defaultEndpoint },
       status: selected?.status ?? this.status, config: selected?.config ?? null, revision: selected?.revision,
       counts: selected?.counts ?? [], conversations: rows.flatMap(account => account.conversations).slice(0, 1000),
       sessionRoutes: rows.flatMap(account => {
@@ -524,6 +545,25 @@ export class Accounts {
         })
       }),
     }
+  }
+
+  saveServer(input) {
+    return this.locked(async () => {
+      if (!this.ready || !input || typeof input !== 'object' || Array.isArray(input)
+        || Object.keys(input).some(key => !['endpoint', 'revision'].includes(key))) fail('invalid_settings')
+      this.checkRevision(input)
+      if (typeof input.endpoint !== 'string' || input.endpoint.length > 2048 || /[\x00-\x20\x7f]/.test(input.endpoint)) fail('invalid_server')
+      let endpoint
+      try { endpoint = apiEndpoint(input.endpoint) } catch { fail('invalid_server') }
+      const pending = this.serverFile + '.' + id() + '.tmp'
+      try {
+        writeFileSync(pending, JSON.stringify({ version: 1, endpoint }) + '\n', { mode: 0o600, flag: 'wx' })
+        renameSync(pending, this.serverFile)
+      } finally { try { unlinkSync(pending) } catch {} }
+      this.pendingEndpoint = endpoint
+      this.revision = id()
+      return this.overview()
+    })
   }
 
   workspaces() {
