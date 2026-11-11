@@ -57,17 +57,52 @@ export function createCliGuide(React, { Button }) {
   }
 }
 
+// Shared by both assistant editors. Describes defaults, never claims file/runtime inspection.
+export function createAssistantInstructionHelp(React) {
+  const { createElement: h } = React
+  return function AssistantInstructionHelp({ lang = 'zh', id }) {
+    const chinese = lang === 'zh'
+    const paragraphs = chinese ? [
+      '来源：Octo 助理配置 · 独立保存',
+      '下方指令由 Octo 单独保存，仅用于此助理的 Octo 请求，不读取、回填或覆盖工作区文件。',
+      '留空仅表示未添加附加指令，不代表工作区文件为空、不存在或未加载。',
+    ] : [
+      'Source: Octo assistant configuration · stored separately',
+      'Octo stores these extra instructions for this assistant’s requests separately and does not read, auto-fill from or overwrite workspace files.',
+      'An empty field means no extra instructions; it does not mean a workspace file is empty, missing or not loaded.',
+    ]
+    const rules = chinese ? [
+      'AGENTS.md：DSH 0.2.2-rc.1 的标准、PTC、创造模式默认按实际工作目录与项目范围加载指令文件，也支持 CLAUDE.md 和对应的 .local.md 文件。',
+      '极简模式和无工具的 Octo 文字模式默认不加载工作区指令。Octo 文字模式在获准使用 DSH 工具的回合会转为标准模式；自定义预设以宿主配置为准。',
+      'SOUL.md：此版本默认不会自动加载。仅此 Bot 使用的角色与语气可写在下方 SOUL.md 附加指令中；共享约定可由你维护到工作区 AGENTS.md，无需在这里重复粘贴。',
+      '这里说明的是默认规则，未检查实际工作区文件或当前回合的加载结果。',
+    ] : [
+      'AGENTS.md: DSH 0.2.2-rc.1 standard, PTC and cordis presets load instructions within the actual working directory and project scope by default. CLAUDE.md and the matching .local.md files are also supported.',
+      'The minimal preset and Octo text mode without tools do not load workspace instructions by default. Octo text mode switches to standard for turns authorized to use DSH tools. Custom presets follow the host configuration.',
+      'SOUL.md is not automatically loaded by default in this version. Put bot-specific role and tone instructions in the extra SOUL.md field below. Maintain shared conventions in the workspace AGENTS.md yourself; there is no need to paste them here again.',
+      'These are default rules, not an inspection of workspace files or the instructions loaded in the current turn.',
+    ]
+    return h('div', { className: 'dsho-panel', id },
+      ...paragraphs.map((text, index) => h('p', { key: index, className: 'dsho-muted' }, index === 0 ? h('strong', null, text) : text)),
+      h('details', { className: 'dsho-account-help' },
+        h('summary', null, chinese ? '工作区文件如何生效？' : 'How do workspace files take effect?'),
+        h('div', { className: 'dsho-panel' }, ...rules.map((text, index) => h('p', { key: index, className: 'dsho-muted' }, text)))))
+  }
+}
+
 const zh = {
   title: '助理配置', intro: '每个 Bot 可绑定一位助理。工作区、模型、预设和权限在此统一管理。',
   add: '新建助理', edit: '编辑', unbound: '暂不绑定', bind: '绑定 Bot', name: '助理名称', cwd: '工作区',
   model: '模型', preset: 'Agent 预设', permission: '权限策略', scope: '工具使用范围', reasoning: '推理强度',
   default: '跟随宿主默认值', select: '请选择', save: '保存助理', cancel: '取消', loading: '正在读取助理设置…',
   failed: '读取助理设置失败。', success: '助理设置已保存，从后续消息起生效。',
-  invalid_assistant: '请检查助理名称和文件内容。每个文件最多 8 KB。',
+  invalid_assistant: '请检查助理名称和附加指令。每份指令最多 8 KB。',
   assistant_bound: '这位助理已经绑定其他 Bot。', account_changed: '设置已在别处更新，请关闭编辑后重新打开。',
   workspace_unavailable: '该工作区不可用。', model_unavailable: '该模型不可用。', reasoning_unavailable: '该推理强度不可用。',
   permission_unavailable: '该权限未在 DSH 开放。', invalid_account: '请检查工作区、模型、预设和权限。',
-  saveFailed: '助理设置未保存。', docs: '文件内容只应用于这位助理的 Octo 回合。不会覆盖实际工作区同名文件。',
+  saveFailed: '助理设置未保存。', docs: 'Octo 附加指令',
+  agentsPlaceholder: '可选：仅此助理的操作约定，不自动读取工作区 AGENTS.md。',
+  soulPlaceholder: '可选：仅此助理的角色与语气，不自动读取工作区 SOUL.md。',
   private: '获准的私聊用户', owner: 'Bot 所有者的全部会话', admitted: '所有已准入用户',
 }
 const en = {
@@ -76,12 +111,14 @@ const en = {
   model: 'Model', preset: 'Agent preset', permission: 'Permission', scope: 'Tool access scope', reasoning: 'Reasoning effort',
   default: 'Use host default', select: 'Select an option', save: 'Save assistant', cancel: 'Cancel', loading: 'Loading assistant settings…',
   failed: 'Could not load assistant settings.', success: 'Saved. Changes apply to subsequent messages.',
-  invalid_assistant: 'Check the name and documents. Each document can contain up to 8 KB.',
+  invalid_assistant: 'Check the name and extra instructions. Each instruction field can contain up to 8 KB.',
   assistant_bound: 'This assistant is bound to a different bot.', account_changed: 'Settings changed elsewhere. Close and reopen the editor.',
   workspace_unavailable: 'The workspace is unavailable.', model_unavailable: 'The model is unavailable.',
   reasoning_unavailable: 'The reasoning effort is unavailable.', permission_unavailable: 'DSH has not enabled this permission.',
   invalid_account: 'Check workspace, model, preset and permission.', saveFailed: 'Could not save the assistant.',
-  docs: 'These files apply only to this assistant’s Octo turns. They do not overwrite files in the workspace.',
+  docs: 'Extra Octo instructions',
+  agentsPlaceholder: 'Optional: conventions for this assistant only. Workspace AGENTS.md is not imported.',
+  soulPlaceholder: 'Optional: role and tone for this assistant only. Workspace SOUL.md is not imported.',
   private: 'Authorized DM users', owner: 'All conversations from the bot owner', admitted: 'All admitted users',
 }
 const zhPresets = { standard: '标准模式', minimal: '极简模式', ptc: 'PTC 模式', cordis: '创造模式', 'octo-text': 'Octo 文字模式' }
@@ -89,6 +126,7 @@ const zhPolicies = { 'text-only': '仅文字（无工具）', 'read-only': '只�
 
 export function createAssistantView(React, { Button, Input }) {
   const { createElement: h, useEffect, useId, useState } = React
+  const InstructionHelp = createAssistantInstructionHelp(React)
   function Editor({ selection, data, request, publish, refresh, close, lang }) {
     const t = lang === 'zh' ? zh : en
     const prefix = useId(), [loaded, setLoaded] = useState(null), [draft, setDraft] = useState(null)
@@ -120,6 +158,7 @@ export function createAssistantView(React, { Button, Input }) {
     const modelKey = draft.provider ? JSON.stringify([draft.provider, draft.model]) : ''
     const chosen = options.models.find(model => model.provider === draft.provider && model.model === draft.model)
     const text = key => h('textarea', { id: prefix + key, rows: 5, maxLength: 8192,
+      'aria-describedby': prefix + '-instruction-source', placeholder: t[key === 'agentsMd' ? 'agentsPlaceholder' : 'soulPlaceholder'],
       value: draft[key], onChange: event => set({ [key]: event.target.value }) })
     const submit = async event => {
       event.preventDefault()
@@ -163,7 +202,8 @@ export function createAssistantView(React, { Button, Input }) {
           label: (lang === 'zh' && zhPolicies[item.id]) || item.label })), permission => set({ permission })),
         select('scope', t.scope, draft.toolScope, ['private','owner','admitted'].map(value => ({ value, label: t[value] })),
           toolScope => set({ toolScope }))),
-      h('p', { className: 'dsho-muted' }, t.docs),
+      h('h3', null, t.docs),
+      h(InstructionHelp, { lang, id: prefix + '-instruction-source' }),
       field('agentsMd', 'AGENTS.md', text('agentsMd')), field('soulMd', 'SOUL.md', text('soulMd')),
       error && h('p', { role: 'alert', className: 'dsho-alert' }, error),
       h('div', { className: 'dsho-tools' },

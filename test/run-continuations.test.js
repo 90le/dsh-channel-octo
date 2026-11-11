@@ -7,7 +7,7 @@ function fixture(owned = false, previous = []) {
   const events = new EventEmitter(), children = new EventEmitter(), executions = new EventEmitter(), killed = []
   const agent = { id: 'parent', ctx: { on(name, fn) { children.on(name, fn); return () => children.off(name, fn) } } }
   const jobs = { list: () => previous, events: { subscribe(filter, fn) {
-    assert.equal(filter.owner, agent.id); events.on('job', fn); return () => events.off('job', fn)
+    assert.deepEqual(filter, {}); events.on('job', fn); return () => events.off('job', fn)
   } }, wait() { assert.fail('must not consume job completion') }, read() { assert.fail('must not consume job result') }, kill(id) { killed.push(id) } }
   const live = new Map([[agent.id, agent]])
   const ctx = { get: () => jobs, agents: { get: id => live.get(id) }, on(name, fn) {
@@ -77,7 +77,7 @@ test('an existing teammate joins only when new input is admitted from this reque
   f.observer.dispose()
 })
 
-test('quiet parked completions are detected without bypassing the host wake budget', async () => {
+test('inspecting parked completions does not mutate their native delivery', async () => {
   const f = fixture(true)
   await f.run('subagent', () => f.children.emit('subagent/start', { id: 'child' }))
   f.agent.status = 'idle'
@@ -102,5 +102,20 @@ test('owned root does not adopt external jobs without execution or call-id proof
   assert.deepEqual([...f.observer.jobs.keys()], ['ours'])
   assert.equal(f.observer.accepts({ source: { kind: 'tool-jobs' } }), false)
   f.observer.stop(); assert.deepEqual(f.killed, ['ours'])
+  f.observer.dispose()
+})
+
+test('quiet recovery wakes the original notification once without re-enqueue or consuming job results', async () => {
+  const f = fixture(true)
+  await f.run('subagent', () => f.children.emit('subagent/start', { id: 'child' }))
+  const original = { id: 'quiet-result', source: { kind: 'subagent-settled', senderSessionId: 'child' } }
+  let wakes = 0
+  f.agent.status = 'idle'
+  f.agent.inbox = { nextStep: [original] }
+  f.agent.wakeDriver = () => { wakes++ }
+  assert.equal(f.observer.resumeParked(), true)
+  assert.equal(f.observer.resumeParked(), false)
+  assert.equal(wakes, 1)
+  assert.equal(f.agent.inbox.nextStep[0], original)
   f.observer.dispose()
 })

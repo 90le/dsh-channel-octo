@@ -10,6 +10,7 @@ import { resolveOctoQuoteOrder } from './octo-quote.js'
 import { assistantInstructions } from './assistants.js'
 import { createProgressEvents } from './progress-events.js'
 import { RunContinuations } from './run-continuations.js'
+import { RunInbox } from './run-inbox.js'
 
 const denial = 'Octo IM sessions cannot execute tools'
 const classified = new Set(['session_preset_conflict', 'session_busy', 'prompt_discarded',
@@ -199,7 +200,7 @@ export class DshHost {
     const setup = async (scoped, agent) => {
       await ctx.agentPresets.mount(scoped, preset)
       applyPermission(agent)
-      controls(scoped, [], agent) // Automatically released with the owned agent scope.
+      controls(scoped, cleanup, agent)
     }
     const find = () => ctx.agents.get?.(session.session_id)
     let agent = session.created ? find() : undefined
@@ -228,7 +229,7 @@ export class DshHost {
         borrowed = agent
         const previous = this.#borrowed.get(agent)
         if (previous) await wait(previous, signal)
-        await wait(agent.whenIdle(), signal)
+        await this.#idleFamily(agent, signal)
         if (find() !== agent || agent.status !== 'idle' || agent.inbox?.hasPending ||
           agent.inbox?.nextTurn?.length || agent.inbox?.nextStep?.length) throw new Error('session_busy')
         // Reuse only the exact permission already saved in this Octo session.
@@ -269,7 +270,15 @@ export class DshHost {
       authority.approval?.dispose()
       extras.onApprovalControl?.(undefined)
       deadline.close()
-      if (handle) await handle.dispose()
+      if (handle) {
+        const handoff = authority.traffic?.deferred
+        release()
+        authority.traffic?.release()
+        // Web may have queued input on this otherwise Octo-owned writer.
+        // Keep the native preset/handle resident, with ALL Octo controls removed.
+        // The native agent service owns its shutdown just like a Web-created agent.
+        if (!handoff) await handle.dispose()
+      }
       else if (borrowed && cleanup.length) {
         // A timed out request can still be in DSH's inbox. Keep its safety
         // controls until the Web-owned driver has settled; never cancel Web work.
@@ -283,12 +292,54 @@ export class DshHost {
             const joined = join ? await join.call(children, borrowed) : false
             if (!joined && borrowed.status === 'idle' && borrowed.session?.seq === seq) return
           }
-        })().catch(() => {}).then(release)
+        })().catch(() => {}).then(() => { release(); authority.traffic?.release() })
         this.#borrowed.set(borrowed, settled)
         void settled.finally(() => {
           if (this.#borrowed.get(borrowed) === settled) this.#borrowed.delete(borrowed)
         }).catch(() => {})
       }
+      else { release(); authority.traffic?.release() }
+    }
+  }
+
+  async #idleFamily(agent, signal) {
+    const subagents = this.ctx.get?.('subagents')
+    const join = subagents?.waitForTreeWork ?? subagents?.waitForChildren
+    while (true) {
+      await wait(agent.whenIdle(), signal)
+      const seq = agent.session?.seq
+      const joined = join ? await wait(join.call(subagents, agent), signal) : false
+      if (joined || agent.status === 'running' || agent.session?.seq !== seq) continue
+      const family = new Set([agent.id])
+      let changed = true
+      const live = this.ctx.agents.list?.() ?? []
+      while (changed) {
+        changed = false
+        for (const child of live) if (family.has(child.session?.header?.parentSession) && !family.has(child.id)
+          && (!this.ctx.agents.isOwnedBy || this.ctx.agents.isOwnedBy(child.id, this.ctx.agents.get(child.session.header.parentSession)))) {
+          family.add(child.id); changed = true
+        }
+      }
+      const jobs = this.ctx.get?.('jobs')
+      const busy = () => [...family].some(id => (jobs?.list?.(id) ?? [])
+        .some(job => job.owner === id && ['running', 'stopping'].includes(job.status)))
+      if (busy() && jobs?.events?.subscribe) {
+        await new Promise((resolve, reject) => {
+          let off
+          const finish = error => { off?.(); signal.removeEventListener('abort', abort); error ? reject(error) : resolve() }
+          const abort = () => finish(signal.reason)
+          off = jobs.events.subscribe({}, () => { if (!busy()) finish() })
+          signal.addEventListener('abort', abort, { once: true })
+          if (signal.aborted) abort(); else if (!busy()) finish()
+        })
+        continue
+      }
+      // Finish a previous Web task's quiet notification before taking the
+      // session over. Its output remains exclusively in Web.
+      const parked = [agent, ...live.filter(child => child !== agent && family.has(child.id))]
+        .filter(member => member.inbox?.hasPending && typeof member.wakeDriver === 'function')
+      if (parked.length) { for (const member of parked) member.wakeDriver(); continue }
+      return
     }
   }
 
@@ -305,6 +356,14 @@ export class DshHost {
     const continuation = new RunContinuations(this.ctx, agent,
       () => open && authority.active && !authority.mixed && !signal.aborted, owned, ownedCalls)
     authority.continuation = continuation
+    let traffic
+    try { traffic = new RunInbox(this.ctx, agent, (receiver, message) => {
+      if (receiver === agent && (message?.id === requestId || steering.has(message?.id))) return true
+      if (message?.source?.kind === 'runtime-context') return true
+      if (continuation.accepts(message, receiver)) return true
+      return !!continuation.currentExecution() || continuation.admissions.has(message?.id)
+    }) } catch (error) { continuation.dispose(); throw error }
+    authority.traffic = traffic
     let draining
     const dispose = []
     try {
@@ -314,6 +373,7 @@ export class DshHost {
           settlement = (async () => {
             while (open) {
               await wait(agent.whenIdle?.(), observationSignal)
+              if (continuation.resumeParked()) { onStage('running'); continue }
               const seq = agent.session?.seq, revision = epoch
               const subagents = this.ctx.get?.('subagents')
               const join = owned || continuation.children.size ? subagents?.waitForTreeWork ?? subagents?.waitForChildren : undefined
@@ -323,6 +383,7 @@ export class DshHost {
               if (!open) return
               if (children || jobs || epoch !== revision || agent.session?.seq !== seq
                 || typeof agent.whenIdle === 'function' && agent.status === 'running') continue
+              if (continuation.resumeParked()) { onStage('running'); continue }
               open = false
               authority.active = false
               authority.turn = undefined
@@ -374,7 +435,7 @@ export class DshHost {
             // Teardown publishes child-settled notices before it resolves. Do
             // not let those notices wake a stopped task on a Web-owned writer.
             agent.inbox?.remove?.(payload.message.id)
-          } else continuation.inserted(payload)
+          } else { continuation.inserted(payload); traffic.admit(payload?.agent, payload?.message) }
         }, { global: true }))
         dispose.push(this.ctx.on('agent/inbox/claimed', (payload) => {
           if (payload?.agent?.id !== agent.id || !Number.isSafeInteger(payload.turn)) return
