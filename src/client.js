@@ -99,6 +99,8 @@ window.__ModuleLoader__.load({
       files_disabled: ['账号未开启附件', 'Attachments are disabled'],
       session_requires_owned_writer: ['会话权限与账号配置不一致', 'The session permission does not match the account'],
       file_delivery_not_confirmed: ['文件发送未确认', 'File delivery was not confirmed'],
+      media_upload_origin_blocked: ['附件上传域名未获允许', 'Attachment upload domain is not allowed'],
+      media_download_origin_blocked: ['附件下载域名未获允许', 'Attachment download domain is not allowed'],
       no_confirmed_final_text: ['没有可发送的正文', 'No reply text to send'],
       background_reply_pending: ['子任务已回传，等待继续处理', 'Background results are waiting to be processed'],
       shared_turn_not_forwarded: ['本次包含其他来源的输入', 'This turn includes input from another source'],

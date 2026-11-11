@@ -1,5 +1,5 @@
 import { isIP } from 'node:net'
-import { apiEndpoint, validToken, validUid } from './config.js'
+import { apiEndpoint, mediaOrigins, validToken, validUid } from './config.js'
 import { ruleScope } from './rules.js'
 
 const MiB = 1024 * 1024
@@ -137,9 +137,10 @@ function context(config, callerSignal) {
     || mediaMaxBytes < 1 || mediaMaxBytes > 100 * MiB || !Number.isSafeInteger(mediaTimeoutMs)
     || mediaTimeoutMs < 1 || mediaTimeoutMs > 300_000) throw error('media_invalid_config')
   const deadline = AbortSignal.timeout(mediaTimeoutMs)
+  const origins = mediaOrigins(config)
   return {
     base, api: new URL(base), auth: { Authorization: 'Bearer ' + token }, fetchImpl,
-    downloadOrigins: storageOrigins(config.mediaDownloadOrigins), uploadOrigins: storageOrigins(config.mediaUploadOrigins),
+    downloadOrigins: storageOrigins(origins.download), uploadOrigins: storageOrigins(origins.upload),
     limit: mediaMaxBytes, callerSignal, deadline,
     signal: callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline,
   }

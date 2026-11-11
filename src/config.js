@@ -12,6 +12,11 @@ export const validToken = (s) => typeof s === 'string' && /^(app|bf)_[A-Za-z0-9_
 export const validProgressExpansion = value => ['collapsed', 'list', 'all'].includes(value)
 export const validToolScope = (scope) => ['private', 'owner', 'admitted'].includes(scope)
 
+export const OFFICIAL_OCTO_API = 'https://im.deepminer.com.cn/api'
+const officialStorage = 'https://im-data-1255521909.cos.ap-beijing.myqcloud.com'
+const officialUploadOrigins = Object.freeze([officialStorage])
+const officialDownloadOrigins = Object.freeze(['https://cdn.deepminer.com.cn', officialStorage])
+
 function scopeList(value, type) {
   if (value === undefined) return new Set()
   if (!Array.isArray(value) || value.length > 50 || value.some(id => !ruleScope(type, id))) {
@@ -26,6 +31,16 @@ export function apiEndpoint(input) {
     throw new Error('api_base_must_be_https')
   }
   return url.href.replace(/\/+$/, '')
+}
+
+export function mediaOrigins(config) {
+  let official = false
+  try { official = apiEndpoint(config.apiBase) === OFFICIAL_OCTO_API } catch {}
+  // Each explicit list (even an empty one) replaces its own default.
+  return {
+    download: config.mediaDownloadOrigins === undefined && official ? officialDownloadOrigins : config.mediaDownloadOrigins,
+    upload: config.mediaUploadOrigins === undefined && official ? officialUploadOrigins : config.mediaUploadOrigins,
+  }
 }
 
 export function privateStateDir(config, env = process.env) {

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, isAbsolute, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { apiEndpoint, privateStateDir, validBotIdentity, validToken, validToolScope, validUid, validProgressExpansion } from './config.js'
+import { OFFICIAL_OCTO_API, apiEndpoint, privateStateDir, validBotIdentity, validToken, validToolScope, validUid, validProgressExpansion } from './config.js'
 import { DshHost } from './dsh.js'
 import { OctoClient, OctoError } from './octo.js'
 import { Store } from './store.js'
@@ -19,7 +19,6 @@ import { instructionFiles, readInstruction, saveInstruction } from './workspace-
 
 const legacy = 'legacy'
 const textOnly = 'text-only'
-const defaultEndpoint = 'https://im.deepminer.com.cn/api'
 import { assistantId, assistantRuntime, assistantRuntimeKeys, assistantDocKeys, legacyAssistant, validAssistantDoc } from './assistants.js'
 
 const idPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
@@ -117,7 +116,7 @@ export class Accounts {
       if (!isAbsolute(this.baseRoot)) fail('accounts_unavailable')
       privateDir(this.baseRoot)
       this.serverFile = join(this.baseRoot, 'server.json')
-      const configured = apiEndpoint(this.deployment.apiBase ?? defaultEndpoint)
+      const configured = apiEndpoint(this.deployment.apiBase ?? OFFICIAL_OCTO_API)
       let preferred = configured
       try {
         const stat = lstatSync(this.serverFile)
@@ -528,7 +527,7 @@ export class Accounts {
       })),
       channelWorkspacePaths: [...new Set(accounts.map(account => account.cwd))],
       accountRevision: this.revision, canManage: this.ready === true, credentialAvailable: this.ready && this.canStore,
-      server: { current: this.endpoint, pending: this.pendingEndpoint, default: defaultEndpoint },
+      server: { current: this.endpoint, pending: this.pendingEndpoint, default: OFFICIAL_OCTO_API },
       status: selected?.status ?? this.status, config: selected?.config ?? null, revision: selected?.revision,
       counts: selected?.counts ?? [], conversations: rows.flatMap(account => account.conversations).slice(0, 1000),
       sessionRoutes: rows.flatMap(account => {

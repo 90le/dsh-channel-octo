@@ -28,7 +28,10 @@ const manifest = {
 // Keep the real Worker, SQLite store, workspace reads and OctoClient. Only HTTP
 // is synthetic; no assertion runs inside a host/transport callback that the
 // production error handlers could catch and disguise as a successful test.
-function fixture(t, options = {}) {
+function fixture(t, options = {}, upstream = {}) {
+  const apiOrigin = new URL(options.apiBase ?? endpoint).origin
+  const uploadOrigin = upstream.storage ?? storage
+  const downloadOrigin = upstream.cdn ?? cdn
   const root = mkdtempSync(join(tmpdir(), 'octo-delivery-authority-'))
   const cwd = join(root, 'workspace'), stateDir = join(root, 'state')
   const otherCwd = join(root, 'other-workspace')
@@ -46,60 +49,64 @@ function fixture(t, options = {}) {
     const call = { method: init.method ?? 'GET', path: url.pathname,
       body: typeof init.body === 'string' ? JSON.parse(init.body) : init.body }
     f.requests.push(call)
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/auth/verify-bot')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/auth/verify-bot')) {
       f.verifications.push(call)
       return Response.json({ bot_uid: 'bot', space_id: 'space', owner_uid: f.verifiedOwner })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname === '/api/v1/bot/groups') {
+    if (url.origin === apiOrigin && url.pathname === '/api/v1/bot/groups') {
       return Response.json({ groups: [{ group_no: group, space_id: 'space' }] })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname === '/api/v1/bot/groups/' + group + '/members') {
+    if (url.origin === apiOrigin && url.pathname === '/api/v1/bot/groups/' + group + '/members') {
       return Response.json({ members: [{ uid: 'alice', name: 'Alice', robot: 0 }, { uid: 'bot', name: 'Bot', robot: 1 }] })
     }
-    if (url.origin === new URL(endpoint).origin && [
+    if (url.origin === apiOrigin && url.pathname === '/api/v1/bot/groups/' + group + '/threads/123456789012345678') {
+      return Response.json({ group_no: group, short_id: '123456789012345678', channel_id: topic,
+        channel_type: 5, status: 1, name: 'Fixture topic' })
+    }
+    if (url.origin === apiOrigin && [
       '/api/v1/bot/groups/' + group + '/md',
       '/api/v1/bot/groups/' + group + '/threads/123456789012345678/md',
     ].includes(url.pathname)) {
       await f.hooks.rules?.(call)
       return Response.json({ content: 'Fixture channel policy.', version: 1 })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/messages/sync')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/messages/sync')) {
       f.syncs.push(call)
       await f.hooks.sync?.(call)
       return f.syncDenied ? new Response(null, { status: 403 }) : Response.json({ messages: [] })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/readReceipt')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/readReceipt')) {
       return Response.json({ status: 200 })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/upload/presigned')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/upload/presigned')) {
       f.presigns.push(call)
       await f.hooks.presign?.(call)
       const name = url.searchParams.get('filename')
-      return Response.json({ method: 'PUT', uploadUrl: storage + '/' + name + '?signature=fixture',
-        downloadUrl: cdn + '/' + name, contentType: 'text/plain' })
+      return Response.json({ method: 'PUT', uploadUrl: uploadOrigin + '/' + name + '?signature=fixture',
+        downloadUrl: downloadOrigin + '/' + name, contentType: 'text/plain' })
     }
-    if (url.origin === storage && call.method === 'PUT') {
+    if (url.origin === uploadOrigin && call.method === 'PUT') {
       f.puts.push(call)
       await f.hooks.put?.(call)
       return new Response(null, { status: 200 })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/card/profile')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/card/profile')) {
       f.profiles.push(call)
       await f.hooks.profile?.(call)
       return Response.json(f.cardProfile)
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/sendMessage')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/sendMessage')) {
       f.posts.push(call)
       const messageId = String(900 + f.posts.length)
       await f.hooks.post?.(call)
       return Response.json({ message_id: messageId })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/message/edit')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/message/edit')) {
       f.edits.push(call)
       await f.hooks.edit?.(call)
       return Response.json({ status: 200 })
     }
-    if (url.origin === new URL(endpoint).origin && url.pathname.endsWith('/typing')) {
+    if (url.origin === apiOrigin && url.pathname.endsWith('/typing')) {
       f.typings.push(call)
       await f.hooks.typing?.(call)
       return Response.json({ status: 200 })
@@ -199,6 +206,35 @@ function stopped(f, receipt = null, issue = 'delivery_access_changed') {
   assert.equal(f.store.next(Date.now() + 86_400_000), undefined, 'revoked delivery must not auto-retry')
   assert.ok(!f.finishes.some(item => item.outcome === 'completed'), 'revoked delivery must not report success')
 }
+
+test('fresh official Octo configuration delivers workspace bytes without a custom media policy', async t => {
+  const f = fixture(t, {
+    apiBase: 'https://im.deepminer.com.cn/api', mediaUploadOrigins: undefined, mediaDownloadOrigins: undefined,
+  }, { storage: 'https://im-data-1255521909.cos.ap-beijing.myqcloud.com', cdn: 'https://cdn.deepminer.com.cn' })
+  f.files = ['first.txt']
+  f.enqueue()
+  await f.process()
+  healthy(f)
+  assert.equal(f.job().state, 'sent')
+  assert.equal(f.presigns.length, 1)
+  assert.equal(f.puts.length, 1)
+  assert.deepEqual(f.puts[0].body, Buffer.from(fileContent))
+  assert.deepEqual(f.posts.map(call => call.body.payload.type), [8, 1])
+  assert.equal(f.posts[0].body.payload.url, 'https://cdn.deepminer.com.cn/first.txt')
+})
+
+test('blocked attachment domain is reported without a signed URL or any upload attempt', async t => {
+  const f = fixture(t, { mediaUploadOrigins: [] })
+  f.files = ['first.txt']
+  f.enqueue()
+  await f.process()
+  stopped(f, null, 'media_upload_origin_blocked')
+  assert.equal(f.presigns.length, 1)
+  assert.equal(f.puts.length, 0)
+  assert.equal(f.posts.length, 0)
+  assert.deepEqual(f.finishes, [{ outcome: 'stopped',
+    details: { detail: 'Octo 返回的附件上传域名未获允许，请检查附件上传域名配置。' } }])
+})
 
 const revocations = [
   ['allowFiles mutation', f => { f.config.allowFiles = false }],

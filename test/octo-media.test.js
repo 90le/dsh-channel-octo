@@ -5,6 +5,9 @@ import { downloadAttachment, normalizeAttachment, uploadAttachment, prepareAttac
 const api = 'https://api.example.invalid/gateway'
 const cdn = 'https://cdn.example.invalid'
 const storage = 'https://objects.example.invalid:9443'
+const officialApi = 'https://im.deepminer.com.cn/api'
+const officialStorage = 'https://im-data-1255521909.cos.ap-beijing.myqcloud.com'
+const officialCdn = 'https://cdn.deepminer.com.cn'
 const token = 'bf_test_media'
 const config = {
   apiBase: api, token, mediaMaxBytes: 128,
@@ -32,6 +35,36 @@ function mocked(responses, overrides) {
   }
   return { calls, config: { ...config, ...overrides, fetchImpl } }
 }
+
+test('a default official account can read CDN and object storage downloads without forwarding its token', async () => {
+  const mock = mocked([
+    redirect(officialCdn + '/files/report.pdf'), redirect(officialStorage + '/files/report.pdf'),
+    new Response(file.bytes, { headers: { 'Content-Type': 'application/pdf' } }),
+  ], { apiBase: officialApi + '/', mediaDownloadOrigins: undefined, mediaUploadOrigins: undefined })
+  const attachment = normalizeAttachment(filePayload)
+  assert.deepEqual(await downloadAttachment(mock.config, attachment), file)
+  assert.deepEqual(mock.calls.map(call => call.url.origin), [new URL(officialApi).origin, officialCdn, officialStorage])
+  assert.deepEqual(mock.calls.map(call => call.headers.Authorization), ['Bearer ' + token, undefined, undefined])
+})
+
+test('self-hosted endpoints and explicit lists do not gain implicit attachment origins', async () => {
+  const officialSigned = {
+    ...signed, uploadUrl: officialStorage + '/file.pdf?signature=synthetic', downloadUrl: officialCdn + '/file.pdf',
+  }
+  for (const [overrides, code] of [
+    [{ apiBase: api }, 'media_upload_origin_blocked'],
+    [{ apiBase: officialApi.replace('/api', '/other') }, 'media_upload_origin_blocked'],
+    [{ apiBase: officialApi, mediaUploadOrigins: [] }, 'media_upload_origin_blocked'],
+    [{ apiBase: officialApi, mediaDownloadOrigins: [] }, 'media_download_origin_blocked'],
+    [{ apiBase: officialApi, mediaDownloadOrigins: [cdn] }, 'media_download_origin_blocked'],
+  ]) {
+    const mock = mocked([Response.json(officialSigned)], {
+      mediaUploadOrigins: undefined, mediaDownloadOrigins: undefined, ...overrides,
+    })
+    await assert.rejects(uploadAttachment(mock.config, route, file), invalid(code))
+    assert.deepEqual(mock.calls.map(call => call.method), ['GET'])
+  }
+})
 
 test('upload preparation rechecks caller authorization before presigning and before object storage', async () => {
   for (const stopAt of [1, 2, 3]) {

@@ -9,3 +9,5 @@ Connect Octo to DeepSeek Harness Web. Each bot has a dedicated assistant with it
 3. In **Settings → Octo Channel → Bot Accounts**, add a bot, verify its token, select a workspace and model, and enable receiving messages. Start with a direct message from a permitted account. Use a User Bot for groups and topics; App Bots are limited to authorized direct messages.
 
 The plugin starts without receiving messages or granting tools. New bots default to text-only. Available permission presets come from DSH; an explicitly configured `hostPermissions` list continues to restrict them, including an empty list. Review direct-message access, group and topic rules, and tool permissions before enabling a bot. Keep tokens out of public issues and screenshots. See the [capability matrix](OCTO-COVERAGE.md) for platform limits.
+
+Enable **Allow file attachments** for the bot to handle files. The official Octo endpoint uses built-in storage origins; no manual domain setup is required. For self-hosted Octo, configure exact HTTPS origins via `mediaUploadOrigins` and `mediaDownloadOrigins`. Each explicit list replaces its default, even when empty.

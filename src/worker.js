@@ -22,6 +22,7 @@ import { octoQuoteFromHistory } from './octo-quote.js'
 import { operationAvailable } from './channel-operation-policy.js'
 import { OBO_SEND_CONTRACT, OBO_SEND_TOOL } from './obo-send.js'
 import { webhookChatReceipt } from './webhook-chat-command.js'
+import { mediaOrigins } from './config.js'
 
 const safeCommand = (config, job) => (job.channel_type === 1
   ? config.dmCommands === 'safe' && (job.sender === config.ownerUid || config.allowed.has(job.sender))
@@ -45,10 +46,13 @@ const deliveryProfile = (config, job) => createHash('sha256').update(JSON.string
   config.ownerUid, config.toolPermission, config.toolScope, authorizedTools(config, job),
   job.channel_type === 5 ? config.threadRuleMode : null,
 ])).digest('hex')
-const deliveryMediaProfile = config => createHash('sha256').update(JSON.stringify([
-  1, [...new Set(config.mediaDownloadOrigins ?? [])].sort(), [...new Set(config.mediaUploadOrigins ?? [])].sort(),
-  config.mediaMaxBytes ?? 16 * 1024 * 1024,
-])).digest('hex')
+const deliveryMediaProfile = config => {
+  const { download, upload } = mediaOrigins(config)
+  return createHash('sha256').update(JSON.stringify([
+    1, [...new Set(download ?? [])].sort(), [...new Set(upload ?? [])].sort(),
+    config.mediaMaxBytes ?? 16 * 1024 * 1024,
+  ])).digest('hex')
+}
 async function materializeInput(config, meta, signal) {
   const descriptors = meta.attachments ?? (meta.attachment ? [meta.attachment] : [])
   if (!descriptors.length) return { attachments: [], order: meta.parts }
@@ -120,6 +124,10 @@ const failureDetails = {
   api_rate_limited: 'Octo 暂时限制了请求频率，请先核对处理状态后再继续。',
 }
 const unknownFailure = '本次回复未完成。请先在 DSH 查看执行状态，再决定是否继续，避免重复操作。'
+const blockedFileOrigins = new Map([
+  ['media_upload_origin_blocked', 'Octo 返回的附件上传域名未获允许，请检查附件上传域名配置。'],
+  ['media_download_origin_blocked', 'Octo 返回的附件下载域名未获允许，请检查附件下载域名配置。'],
+])
 
 const jobRoute = job => [job.channel_type, job.channel_id ?? job.sender]
 const routeKey = route => JSON.stringify(route)
@@ -1194,19 +1202,21 @@ export class Worker {
       await progress?.finish('completed')
     } catch (error) {
       if (signal.reason === OCTO_STOP) throw OCTO_STOP
+      const blockedOrigin = meta.deliverables?.length && blockedFileOrigins.get(error?.code)
       // Do not replay a text/card or any already sent file if delivery failed mid-batch.
       if (!confirmed && !meta.deliverables?.length && !merged.length && error instanceof OctoError && error.status === 429 && job.attempts < 3) {
         this.store.retry(job.seq, Date.now() + Math.max(error.retryAfterMs, 3000 * (2 ** job.attempts)))
       } else {
         const issue = error?.message === 'delivery_access_changed' ? 'delivery_access_changed'
-          : meta.deliverables?.length ? 'file_delivery_not_confirmed' : confirmed ? 'partial_delivery' : 'delivery_not_confirmed'
+          : blockedOrigin ? error.code
+            : meta.deliverables?.length ? 'file_delivery_not_confirmed' : confirmed ? 'partial_delivery' : 'delivery_not_confirmed'
         this.store.review(job.seq, issue)
         for (const seq of merged) this.store.review(seq, issue)
         this.log(issue)
       }
       await progress?.finish('stopped', error?.message === 'delivery_access_changed'
         ? { detail: '账号设置或频道权限已变更，剩余交付已停止' }
-        : meta.deliverables?.length ? { detail: '文件或正文尚未确认全部送达' } : undefined)
+        : meta.deliverables?.length ? { detail: blockedOrigin || '文件或正文尚未确认全部送达' } : undefined)
     }
   }
 
