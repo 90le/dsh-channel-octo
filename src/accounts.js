@@ -256,7 +256,8 @@ export class Accounts {
     // The host can restore accounts before permissionPresets has loaded.
     // Check the deployment policy now; edits check the live catalog and
     // DshHost requires a live permission service before granting any tools.
-    if (!Array.isArray(this.deployment.hostPermissions) || !this.deployment.hostPermissions.includes(record.permission)) {
+    if (this.deployment.hostPermissions !== undefined
+      && (!Array.isArray(this.deployment.hostPermissions) || !this.deployment.hostPermissions.includes(record.permission))) {
       fail('permission_unavailable')
     }
   }
@@ -582,10 +583,12 @@ export class Accounts {
 
   policies() {
     const service = this.ctx.get('permissionPresets')
-    const allowed = Array.isArray(this.deployment.hostPermissions) ? this.deployment.hostPermissions : []
+    const configured = this.deployment.hostPermissions
+    const allowed = Array.isArray(configured) ? configured : []
     return [{ id: textOnly, label: '仅文字（无工具）' }, ...(service?.names ?? []).map(name => {
       const option = service.optionOf?.(name)
-      return { id: name, label: str(option?.name) ? option.name : name, disabled: !allowed.includes(name) }
+      return { id: name, label: str(option?.name) ? option.name : name,
+        disabled: configured !== undefined && !allowed.includes(name) }
     })]
   }
 

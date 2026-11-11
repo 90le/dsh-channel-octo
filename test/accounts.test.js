@@ -32,7 +32,7 @@ test('Bot credentials stay out of account JSON, rotation keeps identity and acco
     },
   }
   const ctx = { get: name => services[name], logger: () => ({ info() {}, error() {} }) }
-  const config = { apiBase: 'https://octo.invalid/api', stateDir: root, cwd: root }
+  const config = { apiBase: 'https://octo.invalid/api', stateDir: root, cwd: root, hostPermissions: [] }
   const fetchImpl = async (url, options) => {
     const parsed = new URL(url)
     assert.equal(parsed.origin, 'https://octo.invalid')
