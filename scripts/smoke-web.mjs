@@ -1,4 +1,4 @@
-// Opt-in: uses an installed, exact-version DSH CLI and a temporary Web profile.
+// Opt-in: uses the supplied DSH CLI and a temporary Web profile.
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -165,7 +165,8 @@ async function assertAppBotSmoke(child, output, deadline) {
 let child, browser
 const sidebarComplete = Symbol('sidebar smoke passed')
 try {
-  if (!['0.2.1-rc.5', '0.2.2-rc.1'].includes(node([cli, '--version']).trim())) throw new Error('Expected a supported DSH host')
+  // The plugin install below checks engines.dsh through the real host.
+  console.log('DSH host:', node([cli, '--version']).trim())
   const packed = JSON.parse(node([npm, 'pack', '--json', '--pack-destination', home]))
   const { filename } = Array.isArray(packed) ? packed[0] : packed['dsh-channel-octo']
   if (typeof filename !== 'string' || !/^dsh-channel-octo-\d+\.\d+\.\d+\.tgz$/.test(filename)) throw new Error('Unexpected fixture package')

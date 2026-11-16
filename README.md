@@ -6,7 +6,7 @@
 
 ## 安装与首次连接
 
-准备 Node.js **24 或 26**、DSH Web **0.2.1-rc.5 或 0.2.2-rc.1**、可用的 DSH 模型和工作区，以及 Octo Bot 令牌。需要群聊或子区时，请使用 User Bot；App Bot 仅支持获授权的私聊。
+准备 Node.js **24 或 26**、DSH Web **0.2.1-rc.5 或更高版本**、可用的 DSH 模型和工作区，以及 Octo Bot 令牌。插件仅声明 DSH 的最低版本，不设版本上限。需要群聊或子区时，请使用 User Bot；App Bot 仅支持获授权的私聊。
 
 1. 在 DSH 所在设备安装。推荐下载[最新稳定版安装包](https://github.com/90le/dsh-channel-octo/releases/latest)，将以下路径替换为下载位置：
 
@@ -92,10 +92,10 @@ npm pack --dry-run
 
 ## 开发者：隔离试用与旧式配置
 
-以 DSH `0.2.2-rc.1` 或 `0.2.1-rc.5` 为兼容目标。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
+使用 DSH `0.2.1-rc.5` 或更高版本。在临时 `DSH_HOME` 的 `web` profile 中，从已验证的工作树 `npm pack`，再执行：
 
 ```sh
-dsh plugin --profile web add /absolute/path/dsh-channel-octo-0.26.14.tgz
+dsh plugin --profile web add /absolute/path/dsh-channel-octo-<版本号>.tgz
 ```
 
 包安装后默认关闭 Octo 收发。若使用专用测试 Bot，给 DSH 进程注入 `DSH_OCTO_BOT_TOKEN`，在测试 profile 的 `cordis.patch.yml` 中追加以下覆盖。确保工作目录已存在，状态目录仅服务账号可读写（Linux 上模式 0700）。使用实际 Octo API 前缀，例如以 `/api` 结尾的 HTTPS 地址；Bot 和 Space 必须与校验接口返回值一致。
